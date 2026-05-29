@@ -7,4 +7,11 @@ services:
       - ./config.yaml:/app/config.yaml:ro
     environment:
       ICLOUD_CRUNCHER_CONFIG: /app/config.yaml
+      # Optional: used only for startup logs showing answered external URLs.
+      # ICLOUDCRUNCHER.BASE_URL: https://calendar.example.com
+      # Optional env-only calendars. Quote keys because they contain dots.
+      # ICLOUDCRUNCHER.0.token: your-secret-token
+      # ICLOUDCRUNCHER.0.URL: webcal://p106-caldav.icloud.com/published/2/...
+      # ICLOUDCRUNCHER.1.token: another-secret-token
+      # ICLOUDCRUNCHER.1.URL: webcal://p106-caldav.icloud.com/published/2/...
     restart: unless-stopped

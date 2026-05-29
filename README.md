@@ -42,6 +42,30 @@ calendars:
 
 If `token` is omitted, the app generates a temporary UUID4 at startup and logs it. Add that token to `config.yaml` if the public URL must survive restarts.
 
+You can also configure calendars via environment variables. The numeric part groups one calendar:
+
+```bash
+ICLOUDCRUNCHER.0.token="your-secret-token"
+ICLOUDCRUNCHER.0.URL="webcal://p106-caldav.icloud.com/published/2/..."
+ICLOUDCRUNCHER.1.token="another-secret-token"
+ICLOUDCRUNCHER.1.URL="webcal://p106-caldav.icloud.com/published/2/..."
+```
+
+YAML and environment calendars are combined. Set `ICLOUDCRUNCHER.BASE_URL` if startup logs should show full external URLs instead of only `/<token>`.
+
+Because dots are not valid in normal shell variable assignment, use one of these forms for env-only local testing:
+
+```bash
+env \
+  'ICLOUDCRUNCHER.0.token=first-token' \
+  'ICLOUDCRUNCHER.0.URL=webcal://p106-caldav.icloud.com/published/2/...' \
+  'ICLOUDCRUNCHER.1.token=second-token' \
+  'ICLOUDCRUNCHER.1.URL=webcal://p106-caldav.icloud.com/published/2/...' \
+  uv run uvicorn app.main:app --host 127.0.0.1 --port 8080
+```
+
+For Docker Compose, put the numbered keys under `environment` as quoted YAML keys.
+
 ## Docker
 
 ```bash
@@ -61,6 +85,8 @@ There is no calendar listing endpoint. Unknown tokens return a neutral `404`.
 ## Logging
 
 The app uses `loguru` and logs incoming requests plus upstream iCloud fetch results. Upstream logs include token, status, duration, content type, and response size, but not the configured iCloud source URL.
+
+At startup, the app logs every URL path it answers. With `ICLOUDCRUNCHER.BASE_URL=https://calendar.example.com`, it logs full external URLs.
 
 ## VS Code
 

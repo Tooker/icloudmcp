@@ -10,6 +10,7 @@ import yaml
 from loguru import logger
 
 DEFAULT_CONFIG_PATH = Path(os.environ.get("ICLOUD_CRUNCHER_CONFIG", "config.yaml"))
+ENV_PREFIX = "ICLOUDCRUNCHER."
 
 
 @dataclass(frozen=True)
@@ -26,22 +27,30 @@ def normalize_source_url(source_url: str) -> str:
     return source_url
 
 
-def load_calendars(config_path: Path = DEFAULT_CONFIG_PATH) -> dict[str, CalendarConfig]:
-    if not config_path.exists():
+def load_calendars(
+    config_path: Path = DEFAULT_CONFIG_PATH,
+    environ: dict[str, str] | None = None,
+) -> dict[str, CalendarConfig]:
+    env_calendars = _load_env_calendars(os.environ if environ is None else environ)
+    yaml_calendars: list[Any] = []
+
+    if config_path.exists():
+        raw_config = _load_yaml(config_path)
+        calendars = raw_config.get("calendars")
+
+        if not isinstance(calendars, list) or not calendars:
+            raise ValueError("config.yaml must define a non-empty 'calendars' list")
+
+        yaml_calendars = calendars
+    elif not env_calendars:
         logger.error(
             "Configuration file not found: {}. Copy config.example.yaml to config.yaml and add your calendars.",
             config_path,
         )
         return {}
 
-    raw_config = _load_yaml(config_path)
-    calendars = raw_config.get("calendars")
-
-    if not isinstance(calendars, list) or not calendars:
-        raise ValueError("config.yaml must define a non-empty 'calendars' list")
-
     result: dict[str, CalendarConfig] = {}
-    for index, raw_calendar in enumerate(calendars, start=1):
+    for index, raw_calendar in enumerate([*yaml_calendars, *env_calendars], start=1):
         if not isinstance(raw_calendar, dict):
             raise ValueError(f"calendar #{index} must be an object")
 
@@ -77,6 +86,14 @@ def load_calendars(config_path: Path = DEFAULT_CONFIG_PATH) -> dict[str, Calenda
     return result
 
 
+def public_url_for_token(token: str, environ: dict[str, str] | None = None) -> str:
+    env = os.environ if environ is None else environ
+    base_url = env.get("ICLOUDCRUNCHER.BASE_URL") or env.get("ICLOUD_CRUNCHER_BASE_URL")
+    if not base_url:
+        return f"/{token}"
+    return f"{base_url.rstrip('/')}/{token}"
+
+
 def _load_yaml(config_path: Path) -> dict[str, Any]:
     with config_path.open("r", encoding="utf-8") as file:
         raw_config = yaml.safe_load(file) or {}
@@ -85,3 +102,24 @@ def _load_yaml(config_path: Path) -> dict[str, Any]:
         raise ValueError("config.yaml must contain a YAML object")
 
     return raw_config
+
+
+def _load_env_calendars(environ: dict[str, str]) -> list[dict[str, str]]:
+    grouped: dict[int, dict[str, str]] = {}
+    for key, value in environ.items():
+        if not key.startswith(ENV_PREFIX):
+            continue
+
+        parts = key.split(".", 2)
+        if len(parts) != 3 or not parts[1].isdigit():
+            continue
+
+        field = parts[2].lower()
+        if field == "url":
+            field = "source_url"
+        if field not in {"token", "source_url"}:
+            continue
+
+        grouped.setdefault(int(parts[1]), {})[field] = value
+
+    return [grouped[index] for index in sorted(grouped)]

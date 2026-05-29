@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from loguru import logger
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
-from app.config import CalendarConfig, load_calendars
+from app.config import CalendarConfig, load_calendars, public_url_for_token
 
 
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
@@ -35,6 +35,8 @@ def create_app() -> FastAPI:
     app.add_middleware(RequestLoggingMiddleware)
     calendars = load_calendars()
     app.state.calendars = calendars
+    for token in calendars:
+        logger.info("answering_calendar url={}", public_url_for_token(token))
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:

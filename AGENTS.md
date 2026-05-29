@@ -17,6 +17,8 @@
 - `webcal://` source URLs are normalized to `https://`; plain `http://` sources are rejected.
 - Public calendar URLs are `/<token>` only. Do not add routes or docs that expose calendar names, `ical`, `ics`, or source URL details in paths.
 - Missing tokens are allowed but temporary: startup generates a UUID4 and logs a warning to persist it in `config.yaml`.
+- Calendars may come from `config.yaml` or env vars shaped as `ICLOUDCRUNCHER.0.token` and `ICLOUDCRUNCHER.0.URL`; YAML and env calendars are combined.
+- `ICLOUDCRUNCHER.BASE_URL` is only for startup logs that show answered external URLs.
 - Unknown tokens must stay neutral `404`; do not add calendar listing endpoints.
 
 ## Local Testing Notes
