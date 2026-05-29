@@ -1,0 +1,7 @@
+calendars:
+  - token: "11111111-1111-4111-8111-111111111111"
+    source_url: "webcal://p106-caldav.icloud.com/published/2/replace-with-your-shared-calendar-id"
+
+  # If token is omitted, the app generates a temporary UUID4 at startup.
+  # Persist generated tokens here if URLs must survive restarts.
+  - source_url: "webcal://p106-caldav.icloud.com/published/2/replace-with-another-shared-calendar-id"

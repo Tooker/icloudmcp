@@ -1,0 +1,10 @@
+services:
+  icloud-cruncher:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    environment:
+      ICLOUD_CRUNCHER_CONFIG: /app/config.yaml
+    restart: unless-stopped
