@@ -53,6 +53,8 @@ ICLOUDCRUNCHER.1.URL="webcal://p106-caldav.icloud.com/published/2/..."
 
 YAML and environment calendars are combined. Set `ICLOUDCRUNCHER.BASE_URL` if startup logs should show full external URLs instead of only `/<token>`.
 
+Calendar responses are cached in memory for 300 seconds by default. Override with `ICLOUDCRUNCHER.CACHE_TTL_SECONDS`. Set it to `0` to disable fresh cache hits while still keeping the last successful response as an upstream-error fallback.
+
 Because dots are not valid in normal shell variable assignment, use one of these forms for env-only local testing:
 
 ```bash
@@ -90,6 +92,7 @@ There is no calendar listing endpoint. Unknown tokens return a neutral `404`.
 The app uses `loguru` and logs incoming requests plus upstream iCloud fetch results. Upstream logs include token, status, duration, content type, and response size, but not the configured iCloud source URL.
 
 At startup, the app logs every URL path it answers. With `ICLOUDCRUNCHER.BASE_URL=https://calendar.example.com`, it logs full external URLs.
+Cache logs include `cache_hit` for fresh cached responses and `cache_stale_fallback` when iCloud is unavailable but a previous response can still be served.
 
 ## VS Code
 

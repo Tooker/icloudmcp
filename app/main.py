@@ -7,7 +7,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from loguru import logger
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
-from app.config import CalendarConfig, load_calendars, public_url_for_token
+from app.cache import CachedCalendarResponse, CalendarResponseCache
+from app.config import CalendarConfig, cache_ttl_seconds, load_calendars, public_url_for_token
 
 
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
@@ -34,7 +35,10 @@ def create_app() -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.add_middleware(RequestLoggingMiddleware)
     calendars = load_calendars()
+    cache = CalendarResponseCache(ttl_seconds=cache_ttl_seconds())
     app.state.calendars = calendars
+    app.state.calendar_cache = cache
+    logger.info("calendar_cache ttl_seconds={}", cache.ttl_seconds)
     for token in calendars:
         logger.info("answering_calendar url={}", public_url_for_token(token))
 
@@ -47,6 +51,11 @@ def create_app() -> FastAPI:
         calendar: CalendarConfig | None = app.state.calendars.get(token)
         if calendar is None:
             raise HTTPException(status_code=404, detail="Not found")
+
+        cached_response = app.state.calendar_cache.get_fresh(token)
+        if cached_response is not None:
+            logger.info("cache_hit token={} bytes={}", token, len(cached_response.content))
+            return calendar_response(cached_response, cache_status="HIT")
 
         try:
             async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
@@ -67,15 +76,28 @@ def create_app() -> FastAPI:
                 upstream_response.raise_for_status()
         except httpx.HTTPError as exc:
             logger.warning("upstream_failed token={} error={}", token, exc.__class__.__name__)
+            stale_response = app.state.calendar_cache.get_stale(token)
+            if stale_response is not None:
+                logger.warning("cache_stale_fallback token={} bytes={}", token, len(stale_response.content))
+                return calendar_response(stale_response, cache_status="STALE")
             raise HTTPException(status_code=502, detail="Upstream unavailable") from exc
 
-        return Response(
+        cached_response = app.state.calendar_cache.set(
+            token=token,
             content=upstream_response.content,
-            media_type="text/calendar; charset=utf-8",
-            headers={"Cache-Control": "no-store"},
+            content_type=upstream_response.headers.get("content-type", "text/calendar; charset=utf-8"),
         )
+        return calendar_response(cached_response, cache_status="MISS")
 
     return app
+
+
+def calendar_response(cached_response: CachedCalendarResponse, cache_status: str) -> Response:
+    return Response(
+        content=cached_response.content,
+        media_type=cached_response.content_type,
+        headers={"Cache-Control": "no-store", "X-Calendar-Cache": cache_status},
+    )
 
 
 app = create_app()

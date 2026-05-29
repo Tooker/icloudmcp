@@ -3,7 +3,7 @@ from uuid import UUID
 
 import pytest
 
-from app.config import load_calendars, normalize_source_url, public_url_for_token
+from app.config import cache_ttl_seconds, load_calendars, normalize_source_url, public_url_for_token
 
 
 def write_config(tmp_path: Path, content: str) -> Path:
@@ -106,6 +106,16 @@ calendars:
 def test_public_url_for_token_uses_optional_base_url() -> None:
     assert public_url_for_token("abc", environ={}) == "/abc"
     assert public_url_for_token("abc", environ={"ICLOUDCRUNCHER.BASE_URL": "https://example.com/root/"}) == "https://example.com/root/abc"
+
+
+def test_cache_ttl_seconds_defaults_and_reads_environment() -> None:
+    assert cache_ttl_seconds(environ={}) == 300
+    assert cache_ttl_seconds(environ={"ICLOUDCRUNCHER.CACHE_TTL_SECONDS": "60"}) == 60
+
+
+def test_cache_ttl_seconds_rejects_negative_values() -> None:
+    with pytest.raises(ValueError, match="must not be negative"):
+        cache_ttl_seconds(environ={"ICLOUDCRUNCHER.CACHE_TTL_SECONDS": "-1"})
 
 
 def test_rejects_duplicate_tokens(tmp_path: Path) -> None:

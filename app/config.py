@@ -11,6 +11,7 @@ from loguru import logger
 
 DEFAULT_CONFIG_PATH = Path(os.environ.get("ICLOUD_CRUNCHER_CONFIG", "config.yaml"))
 ENV_PREFIX = "ICLOUDCRUNCHER."
+DEFAULT_CACHE_TTL_SECONDS = 300
 
 
 @dataclass(frozen=True)
@@ -92,6 +93,22 @@ def public_url_for_token(token: str, environ: dict[str, str] | None = None) -> s
     if not base_url:
         return f"/{token}"
     return f"{base_url.rstrip('/')}/{token}"
+
+
+def cache_ttl_seconds(environ: dict[str, str] | None = None) -> int:
+    env = os.environ if environ is None else environ
+    raw_ttl = env.get("ICLOUDCRUNCHER.CACHE_TTL_SECONDS") or env.get("ICLOUD_CRUNCHER_CACHE_TTL_SECONDS")
+    if raw_ttl is None:
+        return DEFAULT_CACHE_TTL_SECONDS
+
+    try:
+        ttl = int(raw_ttl)
+    except ValueError as exc:
+        raise ValueError("ICLOUDCRUNCHER.CACHE_TTL_SECONDS must be an integer") from exc
+
+    if ttl < 0:
+        raise ValueError("ICLOUDCRUNCHER.CACHE_TTL_SECONDS must not be negative")
+    return ttl
 
 
 def _load_yaml(config_path: Path) -> dict[str, Any]:

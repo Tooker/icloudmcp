@@ -21,6 +21,7 @@
 - Missing tokens are allowed but temporary: startup generates a UUID4 and logs a warning to persist it in `config.yaml`.
 - Calendars may come from `config.yaml` or env vars shaped as `ICLOUDCRUNCHER.0.token` and `ICLOUDCRUNCHER.0.URL`; YAML and env calendars are combined.
 - `ICLOUDCRUNCHER.BASE_URL` is only for startup logs that show answered external URLs.
+- Calendar responses use an in-memory TTL cache; default is 300 seconds and can be changed with `ICLOUDCRUNCHER.CACHE_TTL_SECONDS`.
 - Unknown tokens must stay neutral `404`; do not add calendar listing endpoints.
 
 ## Local Testing Notes
