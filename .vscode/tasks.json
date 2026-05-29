@@ -25,7 +25,13 @@
     {
       "label": "docker: compose up",
       "type": "shell",
-      "command": "docker compose up --build",
+      "command": "docker compose up",
+      "problemMatcher": []
+    },
+    {
+      "label": "docker: compose build",
+      "type": "shell",
+      "command": "docker compose build",
       "problemMatcher": []
     },
     {

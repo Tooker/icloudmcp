@@ -11,7 +11,9 @@
 - Run tests: `uv run pytest`.
 - Run locally: `uv run uvicorn app.main:app --host 127.0.0.1 --port 8080`.
 - Validate Docker Compose config: `docker compose config`.
-- Run with Docker: create `config.yaml` first, then `docker compose up --build`.
+- Build Docker image after code/dependency/Dockerfile changes: `docker compose build`.
+- Run with Docker: create `config.yaml` first, then `docker compose up`.
+- After changing only `config.yaml`, restart the service with `docker compose restart icloud-cruncher`; no image rebuild is needed.
 
 ## Calendar Proxy Behavior
 - `webcal://` source URLs are normalized to `https://`; plain `http://` sources are rejected.

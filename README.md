@@ -70,10 +70,13 @@ For Docker Compose, put the numbered keys under `environment` as quoted YAML key
 
 ```bash
 cp config.example.yaml config.yaml
-docker compose up --build
+docker compose build
+docker compose up
 ```
 
 The container listens on port `8080`. Put TLS and public routing in front of it with your reverse proxy.
+
+Use `docker compose build` only after code, dependency, or Dockerfile changes. For changes in `config.yaml` or Compose environment values, use `docker compose up` to recreate the container without rebuilding the image. If only `config.yaml` changed and the service is already running, `docker compose restart icloud-cruncher` is enough because the app reads config at startup.
 
 ## Endpoints
 
@@ -95,4 +98,5 @@ Use `Terminal: Run Task` and choose:
 - `app: run local`
 - `app: test`
 - `docker: compose up`
+- `docker: compose build`
 - `docker: compose down`
