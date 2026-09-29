@@ -2,11 +2,17 @@ services:
   icloud-cruncher:
     build: .
     ports:
-      - "8080:8080"
+      # Keep the write-capable MCP endpoint local. The tunnel reaches it over
+      # the private Compose network; do not bind this to 0.0.0.0 without auth.
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./config.yaml:/app/config.yaml:ro
     environment:
       ICLOUD_CRUNCHER_CONFIG: /app/config.yaml
+      ICLOUD_USERNAME: ${ICLOUD_USERNAME:-}
+      ICLOUD_APP_PASSWORD: ${ICLOUD_APP_PASSWORD:-}
+      ICLOUD_DEFAULT_CALENDAR: ${ICLOUD_DEFAULT_CALENDAR:-}
+      ICLOUD_TIMEZONE: ${ICLOUD_TIMEZONE:-Europe/Berlin}
       # Optional: used only for startup logs showing answered external URLs.
       # ICLOUDCRUNCHER.BASE_URL: https://calendar.example.com
       # Optional: in-memory calendar cache TTL in seconds. Default: 300.
@@ -16,4 +22,19 @@ services:
       # ICLOUDCRUNCHER.0.URL: webcal://p106-caldav.icloud.com/published/2/...
       # ICLOUDCRUNCHER.1.token: another-secret-token
       # ICLOUDCRUNCHER.1.URL: webcal://p106-caldav.icloud.com/published/2/...
+    restart: unless-stopped
+
+  # OpenAI Secure MCP Tunnel keeps the MCP server private. It makes an
+  # outbound-only connection to OpenAI and forwards requests to /mcp.
+  openai-tunnel:
+    image: ghcr.io/openai/tunnel-client:${TUNNEL_CLIENT_VERSION:-v0.0.15}
+    depends_on:
+      - icloud-cruncher
+    environment:
+      CONTROL_PLANE_API_KEY: ${CONTROL_PLANE_API_KEY:-}
+      CONTROL_PLANE_TUNNEL_ID: ${CONTROL_PLANE_TUNNEL_ID:-}
+      MCP_SERVER_URL: http://icloud-cruncher:8080/mcp
+      LOG_LEVEL: info
+      LOG_FORMAT: json
+      HEALTH_LISTEN_ADDR: :8081
     restart: unless-stopped

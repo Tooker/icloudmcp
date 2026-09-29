@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 from loguru import logger
@@ -12,12 +13,23 @@ from loguru import logger
 DEFAULT_CONFIG_PATH = Path(os.environ.get("ICLOUD_CRUNCHER_CONFIG", "config.yaml"))
 ENV_PREFIX = "ICLOUDCRUNCHER."
 DEFAULT_CACHE_TTL_SECONDS = 300
+DEFAULT_ICLOUD_CALDAV_URL = "https://caldav.icloud.com/"
+DEFAULT_ICLOUD_TIMEZONE = "UTC"
 
 
 @dataclass(frozen=True)
 class CalendarConfig:
     token: str
     source_url: str
+
+
+@dataclass(frozen=True)
+class ICloudConfig:
+    username: str
+    app_specific_password: str
+    caldav_url: str = DEFAULT_ICLOUD_CALDAV_URL
+    default_calendar: str | None = None
+    timezone: str = DEFAULT_ICLOUD_TIMEZONE
 
 
 def normalize_source_url(source_url: str) -> str:
@@ -37,10 +49,13 @@ def load_calendars(
 
     if config_path.exists():
         raw_config = _load_yaml(config_path)
-        calendars = raw_config.get("calendars")
+        calendars = raw_config.get("calendars", [])
 
-        if not isinstance(calendars, list) or not calendars:
-            raise ValueError("config.yaml must define a non-empty 'calendars' list")
+        if calendars is None:
+            calendars = []
+
+        if not isinstance(calendars, list):
+            raise ValueError("config.yaml 'calendars' must be a list")
 
         yaml_calendars = calendars
     elif not env_calendars:
@@ -85,6 +100,86 @@ def load_calendars(
         )
 
     return result
+
+
+def load_icloud_config(
+    config_path: Path = DEFAULT_CONFIG_PATH,
+    environ: dict[str, str] | None = None,
+) -> ICloudConfig | None:
+    """Load iCloud CalDAV credentials without ever logging the password.
+
+    The YAML block is optional so the original public-calendar proxy remains
+    usable on its own. Environment variables take precedence over YAML and
+    are convenient for Docker deployments.
+    """
+
+    env = os.environ if environ is None else environ
+    raw_config: dict[str, Any] = {}
+    if config_path.exists():
+        raw_config = _load_yaml(config_path)
+
+    raw_icloud = raw_config.get("icloud", {})
+    if raw_icloud is None:
+        raw_icloud = {}
+    if not isinstance(raw_icloud, dict):
+        raise ValueError("config.yaml 'icloud' must be an object")
+
+    username = _first_non_empty(
+        env.get("ICLOUD_USERNAME"),
+        env.get("ICLOUDCRUNCHER.ICLOUD_USERNAME"),
+        env.get("ICLOUD_CRUNCHER_ICLOUD_USERNAME"),
+        raw_icloud.get("username"),
+        raw_icloud.get("apple_id"),
+    )
+    app_specific_password = _first_non_empty(
+        env.get("ICLOUD_APP_PASSWORD"),
+        env.get("ICLOUDCRUNCHER.ICLOUD_APP_PASSWORD"),
+        env.get("ICLOUD_CRUNCHER_ICLOUD_APP_PASSWORD"),
+        raw_icloud.get("app_specific_password"),
+        raw_icloud.get("password"),
+    )
+
+    if username is None and app_specific_password is None:
+        return None
+    if username is None or app_specific_password is None:
+        raise ValueError(
+            "iCloud configuration must define both username and app_specific_password"
+        )
+
+    caldav_url = _first_non_empty(
+        env.get("ICLOUD_CALDAV_URL"),
+        env.get("ICLOUDCRUNCHER.ICLOUD_CALDAV_URL"),
+        env.get("ICLOUD_CRUNCHER_ICLOUD_CALDAV_URL"),
+        raw_icloud.get("caldav_url"),
+    ) or DEFAULT_ICLOUD_CALDAV_URL
+    if not caldav_url.startswith("https://"):
+        raise ValueError("icloud.caldav_url must start with https://")
+    caldav_url = caldav_url.rstrip("/") + "/"
+
+    default_calendar = _first_non_empty(
+        env.get("ICLOUD_DEFAULT_CALENDAR"),
+        env.get("ICLOUDCRUNCHER.ICLOUD_DEFAULT_CALENDAR"),
+        env.get("ICLOUD_CRUNCHER_ICLOUD_DEFAULT_CALENDAR"),
+        raw_icloud.get("default_calendar"),
+    )
+    timezone = _first_non_empty(
+        env.get("ICLOUD_TIMEZONE"),
+        env.get("ICLOUDCRUNCHER.ICLOUD_TIMEZONE"),
+        env.get("ICLOUD_CRUNCHER_ICLOUD_TIMEZONE"),
+        raw_icloud.get("timezone"),
+    ) or DEFAULT_ICLOUD_TIMEZONE
+    try:
+        ZoneInfo(timezone)
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError(f"icloud.timezone is not a known IANA timezone: {timezone}") from exc
+
+    return ICloudConfig(
+        username=username,
+        app_specific_password=app_specific_password,
+        caldav_url=caldav_url,
+        default_calendar=default_calendar,
+        timezone=timezone,
+    )
 
 
 def public_url_for_token(token: str, environ: dict[str, str] | None = None) -> str:
@@ -140,3 +235,10 @@ def _load_env_calendars(environ: dict[str, str]) -> list[dict[str, str]]:
         grouped.setdefault(int(parts[1]), {})[field] = value
 
     return [grouped[index] for index in sorted(grouped)]
+
+
+def _first_non_empty(*values: Any) -> str | None:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None

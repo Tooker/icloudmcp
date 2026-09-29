@@ -3,7 +3,13 @@ from uuid import UUID
 
 import pytest
 
-from app.config import cache_ttl_seconds, load_calendars, normalize_source_url, public_url_for_token
+from app.config import (
+    cache_ttl_seconds,
+    load_calendars,
+    load_icloud_config,
+    normalize_source_url,
+    public_url_for_token,
+)
 
 
 def write_config(tmp_path: Path, content: str) -> Path:
@@ -146,3 +152,62 @@ calendars:
 
     with pytest.raises(ValueError, match="single path segment"):
         load_calendars(config_path)
+
+
+def test_loads_icloud_caldav_config_from_yaml(tmp_path: Path) -> None:
+    config_path = write_config(
+        tmp_path,
+        """
+icloud:
+  username: user@example.com
+  app_specific_password: xxxx-xxxx-xxxx-xxxx
+  default_calendar: Work
+  timezone: Europe/Berlin
+""",
+    )
+
+    config = load_icloud_config(config_path)
+
+    assert config is not None
+    assert config.username == "user@example.com"
+    assert config.app_specific_password == "xxxx-xxxx-xxxx-xxxx"
+    assert config.caldav_url == "https://caldav.icloud.com/"
+    assert config.default_calendar == "Work"
+    assert config.timezone == "Europe/Berlin"
+
+
+def test_icloud_environment_overrides_yaml(tmp_path: Path) -> None:
+    config_path = write_config(
+        tmp_path,
+        """
+icloud:
+  username: yaml@example.com
+  app_specific_password: yaml-password
+""",
+    )
+
+    config = load_icloud_config(
+        config_path,
+        environ={
+            "ICLOUD_USERNAME": "env@example.com",
+            "ICLOUD_APP_PASSWORD": "env-password",
+            "ICLOUD_TIMEZONE": "America/New_York",
+        },
+    )
+
+    assert config is not None
+    assert config.username == "env@example.com"
+    assert config.app_specific_password == "env-password"
+    assert config.timezone == "America/New_York"
+
+
+def test_missing_icloud_credentials_are_optional(tmp_path: Path) -> None:
+    assert load_icloud_config(tmp_path / "missing.yaml", environ={}) is None
+
+
+def test_partial_icloud_credentials_are_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="both username"):
+        load_icloud_config(
+            tmp_path / "missing.yaml",
+            environ={"ICLOUD_USERNAME": "user@example.com"},
+        )

@@ -6,3 +6,5 @@ __pycache__/
 
 # Local calendar sources are secrets.
 config.yaml
+.env
+secrets/

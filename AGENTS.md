@@ -28,3 +28,11 @@
 - Use `cp config.example.yaml config.yaml` before running the app manually or via Docker.
 - `config.example.yaml` intentionally contains placeholder iCloud URLs only; never paste real shared calendar URLs into committed files.
 - VS Code tasks are in `.vscode/tasks.json` for sync, local run, tests, and Docker compose.
+
+## iCloud Read/Write MCP
+- iCloud Calendar access uses CalDAV with an Apple Account email and app-specific password; never log or commit either credential.
+- `app/icloud.py` is synchronous because `caldav` is blocking; MCP tools call it through worker threads.
+- MCP Streamable HTTP is mounted at `/mcp` and `/mcp/`; the app owns the MCP session-manager lifespan because it is mounted inside FastAPI.
+- `list_calendars`, `list_events`, and `get_event` are read-only. `create_event` and `update_event` mutate iCloud; `delete_event` is destructive and requires `confirm=true`.
+- OpenAI Secure MCP Tunnel is a separate `openai-tunnel` Compose service. It connects to `http://icloud-cruncher:8080/mcp` over the private Compose network and needs `CONTROL_PLANE_API_KEY` plus `CONTROL_PLANE_TUNNEL_ID`.
+- Keep the write-capable MCP endpoint off the public internet. The default Compose binding is loopback-only.

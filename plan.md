@@ -1,11 +1,15 @@
-# MVP Plan
+# IcloudCruncher Plan
 
 ## Goal
-- Build a stateless Python web application that forwards multiple shared iCloud calendar URLs as hard-to-guess public calendar URLs.
+- Keep the existing stateless proxy for shared iCloud calendar URLs.
+- Add a read/write MCP server for iCloud Calendar events through authenticated CalDAV.
+- Run the MCP server privately in Docker and connect it to OpenAI products with Secure MCP Tunnel.
 - Keep the output paths opaque: no calendar names, `ical`, `ics`, or calendar-related words in the token path.
 
 ## Stack
 - Python with FastAPI.
+- `caldav` for iCloud Calendar CalDAV access.
+- MCP Python SDK with Streamable HTTP at `/mcp`.
 - Dependency and lockfile management with `uv`.
 - YAML configuration for multiple source calendars.
 - Docker deployment on internal port `8080`; TLS is handled by an external reverse proxy.
@@ -18,6 +22,10 @@
 - Unknown tokens return a neutral `404`.
 - Do not expose a calendar listing endpoint.
 - Provide `GET /healthz` for local and container health checks.
+- Provide MCP tools for listing calendars, listing/getting events, creating events, updating events, and deleting events.
+- Require `confirm=true` for destructive event deletion.
+- Keep Apple Account and OpenAI tunnel credentials out of tool results and logs.
+- Keep the MCP service bound to the private Docker network; tunnel-client provides outbound-only OpenAI connectivity.
 
 ## Local Testing
 - Use `uv sync` to install dependencies.
@@ -31,3 +39,4 @@
 - `Dockerfile` and `docker-compose.yml`.
 - `.vscode/tasks.json` for local and Docker runs.
 - `.gitignore`, `config.example.yaml`, `README.md`, and updated `AGENTS.md`.
+- `.env.example` and a Compose `openai-tunnel` service.

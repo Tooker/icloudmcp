@@ -5,3 +5,15 @@ calendars:
   # If token is omitted, the app generates a temporary UUID4 at startup.
   # Persist generated tokens here if URLs must survive restarts.
   - source_url: "webcal://p106-caldav.icloud.com/published/2/replace-with-another-shared-calendar-id"
+
+# Read/write iCloud Calendar access for the MCP endpoint.
+# Use an Apple app-specific password, not the primary Apple Account password.
+# This block can be replaced by the ICLOUD_* environment variables documented
+# in README.md, which is recommended for Docker.
+icloud:
+  username: "your-apple-id@example.com"
+  app_specific_password: "xxxx-xxxx-xxxx-xxxx"
+  caldav_url: "https://caldav.icloud.com/"
+  # Name or id from list_calendars. Leave null when the account has one calendar.
+  default_calendar: null
+  timezone: "Europe/Berlin"
