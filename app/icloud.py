@@ -434,7 +434,9 @@ class ICloudCalendarService:
         if not summaries:
             raise CalendarNotFoundError("No iCloud calendars are available")
 
-        effective_selector = (selector or self.config.default_calendar or "").strip()
+        # Read searches without a selector span every calendar, including
+        # when a default calendar is configured for writes.
+        effective_selector = (selector or "").strip()
         if not effective_selector:
             return summaries
 

@@ -226,3 +226,31 @@ def test_multiple_calendars_require_selector_for_writes() -> None:
             start="2026-01-02T09:00:00Z",
             end="2026-01-02T10:00:00Z",
         )
+
+
+@pytest.mark.parametrize("selector", [None, "", "   "])
+def test_cached_and_live_event_searches_span_all_calendars_with_a_write_default(tmp_path, selector) -> None:
+    client = FakeClient([FakeCalendar("work", "Work"), FakeCalendar("home", "Home")])
+    service = ICloudCalendarService(
+        ICloudConfig(username="user@example.com", app_specific_password="password", default_calendar="Work"),
+        client_factory=lambda **kwargs: client,
+        cache=SQLiteICloudCalendarCache(tmp_path / "cache.sqlite3"),
+    )
+    for calendar in ("Work", "Home"):
+        service.create_event(
+            calendar=calendar, title=calendar,
+            start="2026-01-02T09:00:00Z", end="2026-01-02T10:00:00Z",
+        )
+    args = {"calendar": selector, "start": "2026-01-01", "end": "2026-02-01"}
+    live = service.list_events(**args)
+    calls = client.get_calendars_calls
+    cached = service.list_events(**args)
+    assert {event["calendar_name"] for event in live} == {"Work", "Home"}
+    assert cached == live
+    assert client.get_calendars_calls == calls
+    assert {event["calendar_name"] for event in service.list_events(**(args | {"calendar": "Work"}))} == {"Work"}
+    created = service.create_event(
+        calendar=None, title="Uses write default",
+        start="2026-01-02T11:00:00Z", end="2026-01-02T12:00:00Z",
+    )
+    assert created["calendar_name"] == "Work"
