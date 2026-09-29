@@ -45,7 +45,10 @@ class ICloudCalendarService:
     ) -> None:
         self.config = config
         self._client_factory = client_factory
-        self._cache = cache
+        self._cache = (
+            cache.for_account("caldav", config.caldav_url.rstrip("/"), config.username)
+            if cache is not None else None
+        )
 
     @contextmanager
     def _connected_client(self) -> Iterator[Any]:

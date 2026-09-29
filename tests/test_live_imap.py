@@ -45,7 +45,7 @@ def test_live_imap_login_mailboxes_and_header_search(tmp_path: Path) -> None:
 
     assert len(results) <= 5
     assert all("body" not in result and "raw" not in result for result in results)
-    cached = cache.get_emails(mailbox)
+    cached = service._cache.get_emails(mailbox)
     assert cached is not None and cached.fresh
 
     cached_results = service.search_emails(mailbox=mailbox, limit=5)

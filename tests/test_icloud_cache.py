@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from app.icloud_cache import SQLiteICloudCalendarCache
 
 
@@ -116,3 +118,76 @@ def test_sqlite_cache_persists_mailboxes_and_full_messages(tmp_path: Path) -> No
 
     assert cache.invalidate_email_messages("INBOX") == 1
     assert cache.get_email_message("INBOX", "42") is None
+
+
+def populate_account_cache(cache: SQLiteICloudCalendarCache, label: str) -> None:
+    cache.set_calendars([{"id": "calendar", "name": label}])
+    cache.set_mailboxes([{"name": label}])
+    cache.set_events("calendar", "start", "end", [
+        {"calendar_id": "calendar", "calendar_name": label, "uid": "event", "summary": label}
+    ])
+    cache.set_emails("INBOX", [{"uid": "42", "subject": label}], "2026-01-01")
+    cache.set_email_messages([{
+        "mailbox": "INBOX", "uid": "42", "summary": {"subject": label},
+        "raw_message": label.encode(),
+    }])
+
+
+@pytest.mark.parametrize("other_identity", [
+    ("imap", "mail.example.com:993", "bob@example.com"),
+    ("imap", "other.example.com:993", "alice@example.com"),
+    ("caldav", "mail.example.com:993", "alice@example.com"),
+])
+def test_account_namespaces_isolate_all_read_results_and_persist(tmp_path, other_identity) -> None:
+    path = tmp_path / "cache.sqlite3"
+    cache = SQLiteICloudCalendarCache(path)
+    alice = cache.for_account("imap", "mail.example.com:993", "alice@example.com")
+    populate_account_cache(alice, "Alice")
+    other = cache.for_account(*other_identity)
+    assert other.get_calendars() is None
+    assert other.get_mailboxes() is None
+    assert other.get_events("calendar", "start", "end") is None
+    assert other.get_event("Alice", "event") is None
+    assert other.get_emails("INBOX") is None
+    assert other.get_email_message("INBOX", "42") is None
+    assert other.cached_email_uids("INBOX", ["42"]) == set()
+    assert other.email_cache_stats()["messages"] == 0
+    populate_account_cache(other, "Other")
+
+    reopened = SQLiteICloudCalendarCache(path).for_account(
+        "imap", "mail.example.com:993", "alice@example.com"
+    )
+    assert reopened.get_calendars().value[0]["name"] == "Alice"
+    assert reopened.get_events("calendar", "start", "end").value[0]["summary"] == "Alice"
+    assert reopened.get_event("Alice", "event").value["summary"] == "Alice"
+    assert reopened.get_emails("INBOX").value["emails"][0]["subject"] == "Alice"
+    assert reopened.get_email_message("INBOX", "42").value["raw_message"] == b"Alice"
+
+
+@pytest.mark.parametrize("mailboxes", [(), ("INBOX",)])
+def test_account_invalidation_does_not_remove_another_accounts_entries(tmp_path, mailboxes) -> None:
+    cache = SQLiteICloudCalendarCache(tmp_path / "cache.sqlite3")
+    alice = cache.for_account("imap", "server", "alice@example.com")
+    bob = cache.for_account("imap", "server", "bob@example.com")
+    populate_account_cache(alice, "Alice")
+    populate_account_cache(bob, "Bob")
+    alice.invalidate_events()
+    alice.invalidate_emails(*mailboxes)
+    alice.invalidate_email_messages(*mailboxes)
+    assert alice.get_event("Alice", "event") is None
+    assert alice.get_emails("INBOX") is None
+    assert alice.get_email_message("INBOX", "42") is None
+    assert bob.get_event("Bob", "event") is not None
+    assert bob.get_emails("INBOX") is not None
+    assert bob.get_email_message("INBOX", "42") is not None
+
+
+def test_account_scope_does_not_reuse_legacy_entries_with_unknown_owner(tmp_path) -> None:
+    cache = SQLiteICloudCalendarCache(tmp_path / "cache.sqlite3")
+    populate_account_cache(cache, "Unknown")
+    scoped = cache.for_account("imap", "server", "alice@example.com")
+    assert scoped.get_calendars() is None
+    assert scoped.get_mailboxes() is None
+    assert scoped.get_event("Unknown", "event") is None
+    assert scoped.get_emails("INBOX") is None
+    assert scoped.get_email_message("INBOX", "42") is None

@@ -161,6 +161,23 @@ def test_list_calendars_uses_persistent_cache(tmp_path) -> None:
     assert client.get_calendars_calls == 1
 
 
+def test_switching_caldav_account_does_not_reuse_previous_calendar_list(tmp_path) -> None:
+    cache = SQLiteICloudCalendarCache(tmp_path / "cache.sqlite3")
+    first_client = FakeClient([FakeCalendar("first", "First account")])
+    second_client = FakeClient([FakeCalendar("second", "Second account")])
+    first = ICloudCalendarService(
+        ICloudConfig(username="first@example.com", app_specific_password="password"),
+        client_factory=lambda **kwargs: first_client, cache=cache,
+    )
+    second = ICloudCalendarService(
+        ICloudConfig(username="second@example.com", app_specific_password="password"),
+        client_factory=lambda **kwargs: second_client, cache=cache,
+    )
+    assert first.list_calendars()[0]["id"] == "first"
+    assert second.list_calendars()[0]["id"] == "second"
+    assert second_client.get_calendars_calls == 1
+
+
 def test_list_events_filters_query_and_serializes_all_day() -> None:
     calendar = FakeCalendar("personal-id", "Personal")
     service = service_with(calendar)

@@ -77,7 +77,10 @@ class ICloudIMAPService:
             raise ValueError("max_cached_message_bytes must be positive")
         self.config = config
         self._client_factory = client_factory
-        self._cache = cache
+        self._cache = (
+            cache.for_account("imap", f"{config.host.casefold()}:{config.port}", config.username)
+            if cache is not None else None
+        )
         self._email_cache_days = email_cache_days
         self._email_cache_max_messages = email_cache_max_messages
         self._crawl_batch_size = crawl_batch_size

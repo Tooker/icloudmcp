@@ -142,6 +142,32 @@ def test_list_mailboxes_and_get_email_use_persistent_cache(tmp_path) -> None:
     assert sum(call[0] == "FETCH" for call in client.calls) == 1
 
 
+def test_switching_imap_account_fetches_its_own_message(tmp_path) -> None:
+    cache = SQLiteICloudCalendarCache(tmp_path / "cache.sqlite3")
+    first = service_with(FakeIMAP(), cache=cache)
+    first.get_email("INBOX", "42")
+
+    class OtherAccountIMAP(FakeIMAP):
+        def uid(self, command: str, *args: Any) -> tuple[str, list[Any]]:
+            status, fetched = super().uid(command, *args)
+            if command == "FETCH":
+                fetched = [
+                    (item[0], item[1].replace(b"Hello from iCloud.", b"Other account msg."))
+                    if isinstance(item, tuple) else item for item in fetched
+                ]
+            return status, fetched
+
+    second_client = OtherAccountIMAP()
+    second = ICloudIMAPService(
+        IMAPConfig(username="other@example.com", app_specific_password="other-password"),
+        client_factory=lambda *args, **kwargs: second_client,
+        cache=cache,
+    )
+    assert second.get_email("INBOX", "42")["body"] == "Other account msg.\r\n"
+    assert any(call[0] == "LOGIN" for call in second_client.calls)
+    assert first.get_email("INBOX", "42")["body"] == "Hello from iCloud.\r\n"
+
+
 def test_utf8_search_values_are_sent_as_bytes() -> None:
     assert ICloudIMAPService._quote_search_value("Straße", "query") == (
         b'"Stra' + bytes((0xC3, 0x9F)) + b'e"'
@@ -156,8 +182,8 @@ def test_crawler_stores_full_messages_newest_first(tmp_path) -> None:
     stats = mail.crawl_email_cache()
 
     assert stats["messages"] == 4
-    assert cache.get_email_message("INBOX", "42") is not None
-    assert cache.get_email_message("Übersicht", "41") is not None
+    assert mail._cache.get_email_message("INBOX", "42") is not None
+    assert mail._cache.get_email_message("Übersicht", "41") is not None
 
 
 def test_login_failure_is_safe_and_actionable() -> None:
@@ -235,9 +261,9 @@ def test_email_write_invalidates_mailbox_cache(tmp_path) -> None:
     mail = service_with(client, cache=cache)
     mail.search_emails(limit=1)
 
-    assert cache.get_emails("INBOX") is not None
+    assert mail._cache.get_emails("INBOX") is not None
     mail.mark_email_read("INBOX", "42", read=False)
-    assert cache.get_emails("INBOX") is None
+    assert mail._cache.get_emails("INBOX") is None
 
 
 def test_create_draft_appends_mime_message_with_attachment() -> None:

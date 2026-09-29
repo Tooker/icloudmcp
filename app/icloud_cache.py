@@ -5,6 +5,7 @@ import json
 import sqlite3
 import time
 from contextlib import contextmanager
+from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -61,10 +62,25 @@ class SQLiteICloudCalendarCache:
         self.email_content_ttl_seconds = email_content_ttl_seconds
         self.email_max_messages = email_max_messages
         self._clock = clock
+        self._namespace = ""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.touch(exist_ok=True)
         self.path.chmod(0o600)
         self._initialize()
+
+    def for_account(self, protocol: str, server: str, username: str) -> SQLiteICloudCalendarCache:
+        """Share the database with an opaque namespace for one remote account.
+
+        Legacy entries without an account namespace are intentionally not
+        reused: their owner cannot be determined safely.
+        """
+
+        scoped = copy(self)
+        scoped._namespace = "account:" + self._digest(protocol, server, username.strip().casefold()) + ":"
+        return scoped
+
+    def _scoped_key(self, key: str) -> str:
+        return self._namespace + key
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -141,7 +157,7 @@ class SQLiteICloudCalendarCache:
         fetched_at = self._clock()
         rows = [
             (
-                self._events_key(calendar_id, start, end),
+                self._scoped_key(self._events_key(calendar_id, start, end)),
                 json.dumps(events, ensure_ascii=False),
                 fetched_at,
             )
@@ -151,7 +167,7 @@ class SQLiteICloudCalendarCache:
             if uid:
                 rows.append(
                     (
-                        self._event_key(str(event.get("calendar_id") or calendar_id), uid),
+                        self._scoped_key(self._event_key(str(event.get("calendar_id") or calendar_id), uid)),
                         json.dumps(event, ensure_ascii=False),
                         fetched_at,
                     )
@@ -177,7 +193,8 @@ class SQLiteICloudCalendarCache:
         with self._connection() as connection:
             rows = connection.execute(
                 "SELECT value_json, fetched_at FROM cache_entries "
-                "WHERE cache_key LIKE 'event:%'"
+                "WHERE cache_key LIKE ?",
+                (self._scoped_key("event:") + "%",),
             ).fetchall()
 
         newest: tuple[float, dict[str, Any]] | None = None
@@ -207,8 +224,8 @@ class SQLiteICloudCalendarCache:
     def invalidate_events(self) -> int:
         with self._connection() as connection:
             cursor = connection.execute(
-                "DELETE FROM cache_entries WHERE cache_key LIKE 'events:%' "
-                "OR cache_key LIKE 'event:%'"
+                "DELETE FROM cache_entries WHERE cache_key LIKE ? OR cache_key LIKE ?",
+                (self._scoped_key("events:") + "%", self._scoped_key("event:") + "%"),
             )
             return max(cursor.rowcount, 0)
 
@@ -240,20 +257,21 @@ class SQLiteICloudCalendarCache:
         with self._connection() as connection:
             if not mailboxes:
                 cursor = connection.execute(
-                    "DELETE FROM cache_entries WHERE cache_key LIKE 'emails:%'"
+                    "DELETE FROM cache_entries WHERE cache_key LIKE ?",
+                    (self._scoped_key("emails:") + "%",),
                 )
                 return max(cursor.rowcount, 0)
             total = 0
             for mailbox in mailboxes:
                 cursor = connection.execute(
                     "DELETE FROM cache_entries WHERE cache_key = ?",
-                    (self._email_key(mailbox),),
+                    (self._scoped_key(self._email_key(mailbox)),),
                 )
                 total += max(cursor.rowcount, 0)
             return total
 
     def get_email_message(self, mailbox: str, uid: str) -> CacheEntry | None:
-        mailbox_key = mailbox.casefold()
+        mailbox_key = self._scoped_key(mailbox.casefold())
         with self._connection() as connection:
             row = connection.execute(
                 "SELECT summary_json, raw_message, uid_validity, fetched_at "
@@ -293,8 +311,8 @@ class SQLiteICloudCalendarCache:
                 continue
             rows.append(
                 (
-                    self._email_message_key(mailbox, uid),
-                    mailbox.casefold(),
+                    self._scoped_key(self._email_message_key(mailbox, uid)),
+                    self._scoped_key(mailbox.casefold()),
                     mailbox,
                     uid,
                     str(message.get("uid_validity") or ""),
@@ -320,7 +338,8 @@ class SQLiteICloudCalendarCache:
         with self._connection() as connection:
             row = connection.execute(
                 "SELECT COUNT(*), COALESCE(SUM(length(raw_message)), 0), "
-                "COUNT(DISTINCT mailbox_key) FROM email_messages"
+                "COUNT(DISTINCT mailbox_key) FROM email_messages WHERE cache_key LIKE ?",
+                (self._scoped_key("email_message:") + "%",),
             ).fetchone()
         return {
             "messages": int(row[0] or 0),
@@ -337,7 +356,7 @@ class SQLiteICloudCalendarCache:
     ) -> set[str]:
         if not uids:
             return set()
-        mailbox_key = mailbox.casefold()
+        mailbox_key = self._scoped_key(mailbox.casefold())
         cached: set[str] = set()
         with self._connection() as connection:
             for offset in range(0, len(uids), 900):
@@ -358,13 +377,16 @@ class SQLiteICloudCalendarCache:
     def invalidate_email_messages(self, *mailboxes: str) -> int:
         with self._connection() as connection:
             if not mailboxes:
-                cursor = connection.execute("DELETE FROM email_messages")
+                cursor = connection.execute(
+                    "DELETE FROM email_messages WHERE cache_key LIKE ?",
+                    (self._scoped_key("email_message:") + "%",),
+                )
                 return max(cursor.rowcount, 0)
             total = 0
             for mailbox in mailboxes:
                 cursor = connection.execute(
                     "DELETE FROM email_messages WHERE mailbox_key = ?",
-                    (mailbox.casefold(),),
+                    (self._scoped_key(mailbox.casefold()),),
                 )
                 total += max(cursor.rowcount, 0)
             return total
@@ -373,7 +395,7 @@ class SQLiteICloudCalendarCache:
         with self._connection() as connection:
             row = connection.execute(
                 "SELECT value_json, fetched_at FROM cache_entries WHERE cache_key = ?",
-                (key,),
+                (self._scoped_key(key),),
             ).fetchone()
         if row is None:
             return None
@@ -393,7 +415,7 @@ class SQLiteICloudCalendarCache:
             connection.execute(
                 "INSERT OR REPLACE INTO cache_entries(cache_key, value_json, fetched_at) "
                 "VALUES (?, ?, ?)",
-                (key, json.dumps(value, ensure_ascii=False), self._clock()),
+                (self._scoped_key(key), json.dumps(value, ensure_ascii=False), self._clock()),
             )
 
     def _is_fresh(self, fetched_at: float, ttl_seconds: int) -> bool:

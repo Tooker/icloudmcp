@@ -133,6 +133,10 @@ the source of truth, and the cache stores only normalized calendar/event data,
 not credentials. The Docker Compose setup stores the database in the named
 `icloud-cache` volume so it survives container restarts.
 
+Persistent cache entries are isolated by protocol, server, and account using
+opaque hashed namespaces. Changing an account or server does not reuse another
+account's data. Legacy cache entries without an owner are ignored and refreshed.
+
 ## Configuration
 
 `config.yaml` is intentionally ignored by git because shared calendar URLs and
