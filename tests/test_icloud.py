@@ -71,9 +71,19 @@ class ICloudUIDReportCalendar(FakeCalendar):
         raise ReportError("412 Precondition Failed")
 
 
+class FakeSession:
+    def __init__(self, disable_http3: bool = False) -> None:
+        self.disable_http3 = disable_http3
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class FakeClient:
     def __init__(self, calendars: list[FakeCalendar]) -> None:
         self.calendars = calendars
+        self.session = FakeSession()
 
     def get_calendars(self) -> list[FakeCalendar]:
         return self.calendars
@@ -121,6 +131,13 @@ def test_create_update_and_delete_event() -> None:
     deleted = service.delete_event("Work", created["uid"])
     assert deleted["deleted"] is True
     assert service.list_events(calendar="Work") == []
+
+
+def test_connected_client_disables_http3() -> None:
+    service = service_with(FakeCalendar("work-id", "Work"))
+
+    with service._connected_client() as client:
+        assert client.session.disable_http3 is True
 
 
 def test_list_events_filters_query_and_serializes_all_day() -> None:

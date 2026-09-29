@@ -54,11 +54,37 @@ class ICloudCalendarService:
             enable_rfc6764=False,
         )
         try:
+            self._disable_http3(client)
             yield client
         finally:
             close = getattr(client, "close", None)
             if callable(close):
                 close()
+
+    @staticmethod
+    def _disable_http3(client: Any) -> None:
+        """Avoid QUIC/HTTP3 on CalDAV connections.
+
+        iCloud advertises HTTP/3, but the UDP receive path used by the
+        container can fail with ``OSError: [Errno 90] Message too long``.
+        ``caldav`` exposes its Niquests session on the client, so replace it
+        with the same session type while disabling HTTP/3. Older session
+        implementations that do not accept this option are left unchanged.
+        """
+
+        session = getattr(client, "session", None)
+        if session is None:
+            return
+
+        try:
+            safe_session = type(session)(disable_http3=True)
+        except TypeError:
+            return
+
+        client.session = safe_session
+        close = getattr(session, "close", None)
+        if callable(close):
+            close()
 
     def list_calendars(self) -> list[dict[str, Any]]:
         with self._connected_client() as client:
