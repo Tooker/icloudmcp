@@ -80,6 +80,16 @@ IMAP operations use mailbox-local UIDs, so callers should use the UID together w
 mailbox returned by `search_emails`. IMAP is not an outgoing mail protocol; sending is
 intentionally not implemented.
 
+An opt-in live smoke test is available for diagnosing real mailbox access. It logs no
+credentials and checks only login, mailbox listing, and message headers:
+
+```bash
+set -a; source .env; set +a
+RUN_LIVE_IMAP_TESTS=1 uv run pytest -m live tests/test_live_imap.py -q
+```
+
+Normal `uv run pytest` runs only the fake-client tests and skips this live test.
+
 Apple's documented iCloud Mail settings are `imap.mail.me.com` on port `993` with SSL
 and an app-specific password. The username may be the full iCloud Mail address or the
 address name, depending on the client. See Apple's [iCloud Mail server settings](https://support.apple.com/en-us/102525).

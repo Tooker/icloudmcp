@@ -54,10 +54,15 @@ class ICloudIMAPService:
     def _connected(self) -> Iterator[Any]:
         client = self._client_factory(self.config.host, self.config.port, timeout=30)
         try:
-            status, _ = client.login(
-                self.config.username,
-                self.config.app_specific_password,
-            )
+            try:
+                status, _ = client.login(
+                    self.config.username,
+                    self.config.app_specific_password,
+                )
+            except imaplib.IMAP4.error as exc:
+                raise IMAPServiceError(
+                    "IMAP login failed; check the iCloud Mail address and app-specific password"
+                ) from exc
             self._ensure_ok(status, "IMAP login failed")
             yield client
         finally:

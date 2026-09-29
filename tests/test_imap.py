@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import imaplib
 from typing import Any
 
+import pytest
+
 from app.config import IMAPConfig
-from app.imap import ICloudIMAPService
+from app.imap import ICloudIMAPService, IMAPServiceError
 
 
 MESSAGE = (
@@ -63,6 +66,11 @@ class FakeIMAP:
         return "OK", [b"expunged"]
 
 
+class FailingLoginIMAP(FakeIMAP):
+    def login(self, username: str, password: str) -> tuple[str, list[bytes]]:
+        raise imaplib.IMAP4.error(b"[AUTHENTICATIONFAILED] Authentication Failed")
+
+
 def service_with(client: FakeIMAP) -> ICloudIMAPService:
     config = IMAPConfig(
         username="user@example.com",
@@ -79,6 +87,13 @@ def test_lists_mailboxes_and_decodes_modified_utf7() -> None:
 
     assert mailboxes[0]["name"] == "INBOX"
     assert mailboxes[1]["name"] == "Übersicht"
+
+
+def test_login_failure_is_safe_and_actionable() -> None:
+    mail = service_with(FailingLoginIMAP())
+
+    with pytest.raises(IMAPServiceError, match="iCloud Mail address and app-specific password"):
+        mail.list_mailboxes()
 
 
 def test_search_and_read_use_uid_and_peek() -> None:

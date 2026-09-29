@@ -21,3 +21,6 @@ dev = [
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+markers = [
+    "live: accesses the configured external iCloud service; opt-in only",
+]
