@@ -92,15 +92,21 @@ intentionally not implemented; send the uploaded draft manually from a mail clie
 
 The IMAP read cache keeps up to the 1,000 newest message headers per mailbox from the
 last 100 days in the same persistent SQLite volume as the calendar cache. It refreshes
-every 300 seconds by default. Search filters for sender, recipient, subject, dates, and
-unread status can use the cache; free-text searches and `get_email` still query iCloud
-because they may require message bodies. Bodies and attachments are not stored in the
-cache. Successful flag, move, and delete operations invalidate the affected mailbox
-cache. Set `IMAP_EMAIL_CACHE_TTL_SECONDS=0` to disable it.
+every 300 seconds by default. Mailbox listings are cached for 30 minutes by default.
+Full `.eml` messages, including message bodies and attachment bytes, are stored in a
+separate SQLite BLOB table for 24 hours by default. On startup, a background crawler
+walks configured mailboxes from newest to oldest in batches and skips already cached
+messages. Large messages above `IMAP_EMAIL_CACHE_MAX_MESSAGE_BYTES` are skipped.
+Successful flag, move, and delete operations invalidate the affected mailbox headers
+and full-message entries. Set `IMAP_EMAIL_CACHE_CRAWL_ENABLED=false` to disable the
+background crawler, or set `IMAP_EMAIL_CONTENT_TTL_SECONDS=0` to force full-message
+refreshes.
 
 IMAP uses a small reusable connection pool (4 connections by default) so sequential
 requests do not repeat the TLS login/logout roundtrip. Set `IMAP_CONNECTION_POOL_SIZE`
-to tune it; use `1` to serialize IMAP operations or `0` is not valid.
+to tune it; use `1` to serialize IMAP operations or `0` is not valid. Crawler batches
+and pacing are controlled with `IMAP_EMAIL_CACHE_CRAWL_BATCH_SIZE` and
+`IMAP_EMAIL_CACHE_CRAWL_INTERVAL_SECONDS`.
 
 An opt-in live smoke test is available for diagnosing real mailbox access. It logs no
 credentials and checks only login, mailbox listing, and message headers:

@@ -127,6 +127,38 @@ def test_reuses_a_successful_connection_for_sequential_operations() -> None:
     assert sum(call[0] == "LOGOUT" for call in client.calls) == 0
 
 
+def test_list_mailboxes_and_get_email_use_persistent_cache(tmp_path) -> None:
+    client = FakeIMAP()
+    cache = SQLiteICloudCalendarCache(tmp_path / "cache.sqlite3")
+    mail = service_with(client, cache=cache)
+
+    mail.list_mailboxes()
+    mail.list_mailboxes()
+    mail.get_email("INBOX", "42")
+    mail.get_email("INBOX", "42")
+
+    assert sum(call[0] == "LOGIN" for call in client.calls) == 1
+    assert sum(call[0] == "FETCH" for call in client.calls) == 1
+
+
+def test_utf8_search_values_are_sent_as_bytes() -> None:
+    assert ICloudIMAPService._quote_search_value("Straße", "query") == (
+        b'"Stra' + bytes((0xC3, 0x9F)) + b'e"'
+    )
+
+
+def test_crawler_stores_full_messages_newest_first(tmp_path) -> None:
+    client = FakeIMAP()
+    cache = SQLiteICloudCalendarCache(tmp_path / "cache.sqlite3")
+    mail = service_with(client, cache=cache)
+
+    stats = mail.crawl_email_cache()
+
+    assert stats["messages"] == 4
+    assert cache.get_email_message("INBOX", "42") is not None
+    assert cache.get_email_message("Übersicht", "41") is not None
+
+
 def test_login_failure_is_safe_and_actionable() -> None:
     mail = service_with(FailingLoginIMAP())
 

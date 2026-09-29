@@ -84,3 +84,34 @@ def test_sqlite_cache_keeps_latest_email_headers_with_a_bound(tmp_path: Path) ->
 
     cache.invalidate_emails("INBOX")
     assert cache.get_emails("INBOX") is None
+
+
+def test_sqlite_cache_persists_mailboxes_and_full_messages(tmp_path: Path) -> None:
+    cache = SQLiteICloudCalendarCache(
+        tmp_path / "cache.sqlite3",
+        mailboxes_ttl_seconds=300,
+        email_content_ttl_seconds=300,
+        clock=lambda: 100.0,
+    )
+    mailboxes = [{"name": "INBOX", "flags": []}]
+    cache.set_mailboxes(mailboxes)
+    cache.set_email_messages(
+        [
+            {
+                "mailbox": "INBOX",
+                "uid": "42",
+                "uid_validity": "7",
+                "summary": {"uid": "42", "message_id": "<one@example.com>"},
+                "raw_message": b"Subject: Cached\r\n\r\nBody",
+            }
+        ]
+    )
+
+    assert cache.get_mailboxes().value == mailboxes
+    cached = cache.get_email_message("INBOX", "42")
+    assert cached is not None and cached.fresh
+    assert cached.value["raw_message"] == b"Subject: Cached\r\n\r\nBody"
+    assert cache.cached_email_uids("INBOX", ["41", "42"]) == {"42"}
+
+    assert cache.invalidate_email_messages("INBOX") == 1
+    assert cache.get_email_message("INBOX", "42") is None

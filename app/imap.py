@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import imaplib
 import re
+import threading
 from contextlib import contextmanager
 from collections.abc import Callable, Iterator
 from datetime import date, datetime, timedelta, timezone
@@ -12,7 +13,7 @@ from email.parser import BytesParser
 from email.utils import parsedate_to_datetime
 from loguru import logger
 from queue import LifoQueue
-from time import perf_counter
+from time import perf_counter, sleep
 from typing import Any
 
 from app.config import IMAPConfig
@@ -57,6 +58,9 @@ class ICloudIMAPService:
         email_cache_days: int = 100,
         email_cache_max_messages: int = 1000,
         connection_pool_size: int = 4,
+        crawl_batch_size: int = 25,
+        crawl_interval_seconds: float = 0.1,
+        max_cached_message_bytes: int = 25_000_000,
     ) -> None:
         if email_cache_days < 0:
             raise ValueError("email_cache_days must not be negative")
@@ -64,11 +68,23 @@ class ICloudIMAPService:
             raise ValueError(f"email_cache_max_messages must be between 0 and {self._MAX_LIMIT}")
         if connection_pool_size < 1 or connection_pool_size > 16:
             raise ValueError("connection_pool_size must be between 1 and 16")
+        if crawl_batch_size < 1 or crawl_batch_size > 100:
+            raise ValueError("crawl_batch_size must be between 1 and 100")
+        if crawl_interval_seconds < 0:
+            raise ValueError("crawl_interval_seconds must not be negative")
+        if max_cached_message_bytes < 1:
+            raise ValueError("max_cached_message_bytes must be positive")
         self.config = config
         self._client_factory = client_factory
         self._cache = cache
         self._email_cache_days = email_cache_days
         self._email_cache_max_messages = email_cache_max_messages
+        self._crawl_batch_size = crawl_batch_size
+        self._crawl_interval_seconds = crawl_interval_seconds
+        self._max_cached_message_bytes = max_cached_message_bytes
+        self._refresh_locks_guard = threading.Lock()
+        self._refresh_locks: dict[str, threading.Lock] = {}
+        self._crawl_stop_event = threading.Event()
         self._connection_pool: LifoQueue[Any | None] = LifoQueue(maxsize=connection_pool_size)
         for _ in range(connection_pool_size):
             self._connection_pool.put_nowait(None)
@@ -111,6 +127,7 @@ class ICloudIMAPService:
                 self.config.app_specific_password,
             )
             self._ensure_ok(status, "IMAP login failed")
+            self._enable_utf8(client, operation)
         except imaplib.IMAP4.error as exc:
             self._close_connection(client)
             raise IMAPServiceError(
@@ -125,6 +142,36 @@ class ICloudIMAPService:
             (perf_counter() - started) * 1000,
         )
         return client
+
+    @staticmethod
+    def _enable_utf8(client: Any, operation: str) -> None:
+        enable = getattr(client, "enable", None)
+        if not callable(enable):
+            # Test doubles and a few IMAP-compatible clients do not expose
+            # ENABLE. imaplib accepts bytes search arguments as a fallback.
+            return
+        started = perf_counter()
+        try:
+            status, _ = enable("UTF8=ACCEPT")
+        except Exception:
+            logger.info("imap_phase tool={} phase=utf8_enable status=unsupported", operation)
+            return
+        if ICloudIMAPService._is_ok(status):
+            # imaplib defaults to ASCII when encoding string command
+            # arguments. UTF8=ACCEPT allows UTF-8 search criteria.
+            try:
+                client._encoding = "utf-8"
+            except Exception:
+                pass
+            state = "enabled"
+        else:
+            state = "unsupported"
+        logger.info(
+            "imap_phase tool={} phase=utf8_enable status={} duration_ms={:.1f}",
+            operation,
+            state,
+            (perf_counter() - started) * 1000,
+        )
 
     @staticmethod
     def _close_connection(client: Any | None) -> None:
@@ -147,6 +194,7 @@ class ICloudIMAPService:
     def close(self) -> None:
         """Close idle pooled IMAP connections during application shutdown."""
 
+        self._crawl_stop_event.set()
         while True:
             try:
                 client = self._connection_pool.get_nowait()
@@ -154,19 +202,63 @@ class ICloudIMAPService:
                 return
             self._close_connection(client)
 
-    def list_mailboxes(self) -> list[dict[str, Any]]:
-        logger.info(
-            "imap_cache tool=list_mailboxes action=read status=bypass reason=mailbox_listing_live"
-        )
-        with self._connected("list_mailboxes") as client:
-            status, rows = client.list()
-            self._ensure_ok(status, "IMAP mailbox listing failed")
+    def stop_crawl(self) -> None:
+        self._crawl_stop_event.set()
 
-            result: list[dict[str, Any]] = []
-            for row in rows or []:
-                parsed = self._parse_list_row(row)
-                if parsed is not None:
-                    result.append(parsed)
+    @contextmanager
+    def _refresh_lock(self, key: str) -> Iterator[None]:
+        with self._refresh_locks_guard:
+            lock = self._refresh_locks.setdefault(key, threading.Lock())
+        with lock:
+            yield
+
+    def list_mailboxes(self) -> list[dict[str, Any]]:
+        if self._cache is not None:
+            cached = self._cache.get_mailboxes()
+            if cached is not None and cached.fresh:
+                logger.info(
+                    "imap_cache tool=list_mailboxes action=read status=hit entries={}",
+                    len(cached.value),
+                )
+                return cached.value
+            logger.info(
+                "imap_cache tool=list_mailboxes action=read status={}",
+                "stale" if cached is not None else "miss",
+            )
+
+        lock_key = "mailboxes"
+        with self._refresh_lock(lock_key):
+            if self._cache is not None:
+                cached = self._cache.get_mailboxes()
+                if cached is not None and cached.fresh:
+                    logger.info(
+                        "imap_cache tool=list_mailboxes action=read status=coalesced_hit entries={}",
+                        len(cached.value),
+                    )
+                    return cached.value
+            logger.info(
+                "imap_cache tool=list_mailboxes action=read status=refresh reason=mailbox_listing_live"
+            )
+            with self._connected("list_mailboxes") as client:
+                started = perf_counter()
+                status, rows = client.list()
+                self._ensure_ok(status, "IMAP mailbox listing failed")
+                logger.info(
+                    "imap_phase tool=list_mailboxes phase=list duration_ms={:.1f}",
+                    (perf_counter() - started) * 1000,
+                )
+
+                result: list[dict[str, Any]] = []
+                for row in rows or []:
+                    parsed = self._parse_list_row(row)
+                    if parsed is not None:
+                        result.append(parsed)
+            if self._cache is not None:
+                self._cache.set_mailboxes(result)
+                logger.info(
+                    "imap_cache tool=list_mailboxes action=write status=refresh entries={}",
+                    len(result),
+                )
             return result
 
     def search_emails(
@@ -210,33 +302,53 @@ class ICloudIMAPService:
                 )
                 return result
 
-            logger.info(
-                "imap_cache tool=search_emails action=read status={}",
-                "stale" if cached is not None else "miss",
-            )
-            coverage_since = self._email_cache_since()
-            recent_emails = self._search_live(
-                selected_mailbox,
-                since=coverage_since,
-                limit=self._email_cache_max_messages,
-            )
-            self._cache.set_emails(selected_mailbox, recent_emails, coverage_since)
-            logger.info(
-                "imap_cache tool=search_emails action=write status=refresh entries={} coverage_days={} max_messages={}",
-                len(recent_emails),
-                self._email_cache_days,
-                self._email_cache_max_messages,
-            )
-            return self._filter_cached_emails(
-                recent_emails,
-                from_address=from_address,
-                to_address=to_address,
-                subject=subject,
-                since=since,
-                before=before,
-                unread_only=unread_only,
-                limit=limit,
-            )
+            with self._refresh_lock(f"headers:{selected_mailbox.casefold()}"):
+                cached = self._cache.get_emails(selected_mailbox)
+                cached_emails = self._cached_emails(cached)
+                if cached is not None and cached.fresh and cached_emails is not None:
+                    result = self._filter_cached_emails(
+                        cached_emails,
+                        from_address=from_address,
+                        to_address=to_address,
+                        subject=subject,
+                        since=since,
+                        before=before,
+                        unread_only=unread_only,
+                        limit=limit,
+                    )
+                    logger.info(
+                        "imap_cache tool=search_emails action=read status=coalesced_hit entries={}",
+                        len(result),
+                    )
+                    return result
+
+                logger.info(
+                    "imap_cache tool=search_emails action=read status={}",
+                    "stale" if cached is not None else "miss",
+                )
+                coverage_since = self._email_cache_since()
+                recent_emails = self._search_live(
+                    selected_mailbox,
+                    since=coverage_since,
+                    limit=self._email_cache_max_messages,
+                )
+                self._cache.set_emails(selected_mailbox, recent_emails, coverage_since)
+                logger.info(
+                    "imap_cache tool=search_emails action=write status=refresh entries={} coverage_days={} max_messages={}",
+                    len(recent_emails),
+                    self._email_cache_days,
+                    self._email_cache_max_messages,
+                )
+                return self._filter_cached_emails(
+                    recent_emails,
+                    from_address=from_address,
+                    to_address=to_address,
+                    subject=subject,
+                    since=since,
+                    before=before,
+                    unread_only=unread_only,
+                    limit=limit,
+                )
 
         bypass_reason = (
             "full_text_query"
@@ -273,7 +385,7 @@ class ICloudIMAPService:
         unread_only: bool = False,
         limit: int = 50,
     ) -> list[dict[str, Any]]:
-        criteria: list[str] = []
+        criteria: list[str | bytes] = []
         if from_address:
             criteria.extend(("FROM", self._quote_search_value(from_address, "from_address")))
         if to_address:
@@ -292,10 +404,16 @@ class ICloudIMAPService:
             criteria.append("ALL")
 
         with self._connected("search_emails") as client:
-            self._select(client, selected_mailbox, readonly=True)
+            self._select(client, selected_mailbox, readonly=True, operation="search_emails")
+            started = perf_counter()
             status, data = client.uid("SEARCH", None, *criteria)
             self._ensure_ok(status, "IMAP search failed")
             uids = self._parse_uids(data)
+            logger.info(
+                "imap_phase tool=search_emails phase=search duration_ms={:.1f} uid_count={}",
+                (perf_counter() - started) * 1000,
+                len(uids),
+            )
 
             # IMAP SEARCH normally returns ascending UIDs. Returning newest
             # candidates first makes the limit useful for large inboxes.
@@ -303,17 +421,29 @@ class ICloudIMAPService:
             result_by_uid: dict[str, dict[str, Any]] = {}
             for offset in range(0, len(selected_uids), self._HEADER_FETCH_BATCH_SIZE):
                 batch = selected_uids[offset : offset + self._HEADER_FETCH_BATCH_SIZE]
+                started = perf_counter()
                 status, fetched = client.uid(
                     "FETCH",
                     ",".join(batch),
                     self._FETCH_HEADERS,
                 )
                 self._ensure_ok(status, "IMAP header fetch failed")
+                logger.info(
+                    "imap_phase tool=search_emails phase=header_fetch duration_ms={:.1f} batch_entries={}",
+                    (perf_counter() - started) * 1000,
+                    len(batch),
+                )
+                parse_started = perf_counter()
                 result_by_uid.update(
                     self._parse_header_fetch(
                         fetched,
                         mailbox=selected_mailbox,
                     )
+                )
+                logger.info(
+                    "imap_phase tool=search_emails phase=header_parse duration_ms={:.1f} entries={}",
+                    (perf_counter() - parse_started) * 1000,
+                    len(batch),
                 )
             return [result_by_uid[uid] for uid in selected_uids if uid in result_by_uid]
 
@@ -440,6 +570,65 @@ class ICloudIMAPService:
             )
         return result
 
+    @classmethod
+    def _parse_full_fetch(
+        cls,
+        data: Any,
+        *,
+        mailbox: str,
+    ) -> dict[str, tuple[dict[str, Any], bytes]]:
+        result: dict[str, tuple[dict[str, Any], bytes]] = {}
+        for item in data or []:
+            if not isinstance(item, tuple):
+                continue
+            metadata = next(
+                (
+                    part
+                    for part in item
+                    if isinstance(part, bytes) and re.search(rb"\bUID\s+\d+\b", part)
+                ),
+                b"",
+            )
+            match = re.search(rb"\bUID\s+(\d+)\b", metadata)
+            if match is None:
+                continue
+            uid = match.group(1).decode("ascii")
+            raw_message = cls._literal_bytes(item)
+            if not raw_message:
+                continue
+            message = cls._parse_message(raw_message)
+            result[uid] = (
+                cls._message_summary(
+                    message,
+                    uid=uid,
+                    mailbox=mailbox,
+                    flags=cls._fetch_flags(item),
+                ),
+                raw_message,
+            )
+        return result
+
+    @staticmethod
+    def _uid_validity(client: Any, selected_data: Any) -> str:
+        for item in selected_data or []:
+            if isinstance(item, bytes):
+                match = re.search(rb"UIDVALIDITY\s+(\d+)", item, re.IGNORECASE)
+                if match:
+                    return match.group(1).decode("ascii")
+        response = getattr(client, "response", None)
+        if callable(response):
+            try:
+                status, data = response("UIDVALIDITY")
+                if ICloudIMAPService._is_ok(status):
+                    for item in data or []:
+                        if isinstance(item, bytes):
+                            match = re.search(rb"\d+", item)
+                            if match:
+                                return match.group(0).decode("ascii")
+            except Exception:
+                pass
+        return ""
+
     def get_email(
         self,
         mailbox: str | None,
@@ -452,26 +641,203 @@ class ICloudIMAPService:
                 f"max_body_chars must be between 1 and {self._MAX_BODY_CHARS}"
             )
         selected_mailbox = self._mailbox(mailbox)
-        logger.info(
-            "imap_cache tool=get_email action=read status=bypass reason=body_required"
-        )
-
-        with self._connected("get_email") as client:
-            self._select(client, selected_mailbox, readonly=True)
-            status, fetched = client.uid("FETCH", uid, "(UID FLAGS BODY.PEEK[])")
-            self._ensure_ok(status, "IMAP message fetch failed")
-            raw_message = self._literal_bytes(fetched)
-            if not raw_message:
-                raise EmailNotFoundError(f"Email not found: {uid}")
-            message = self._parse_message(raw_message)
-            result = self._message_summary(
-                message,
-                uid=uid,
-                mailbox=selected_mailbox,
-                flags=self._fetch_flags(fetched),
+        if self._cache is not None:
+            cached = self._cache.get_email_message(selected_mailbox, uid)
+            if cached is not None and cached.fresh:
+                logger.info(
+                    "imap_cache tool=get_email action=read status=hit bytes={}",
+                    len(cached.value.get("raw_message", b"")),
+                )
+                return self._render_cached_email(cached.value, max_body_chars)
+            logger.info(
+                "imap_cache tool=get_email action=read status={}",
+                "stale" if cached is not None else "miss",
             )
+
+        lock_key = f"message:{selected_mailbox.casefold()}:{uid}"
+        with self._refresh_lock(lock_key):
+            if self._cache is not None:
+                cached = self._cache.get_email_message(selected_mailbox, uid)
+                if cached is not None and cached.fresh:
+                    logger.info(
+                        "imap_cache tool=get_email action=read status=coalesced_hit bytes={}",
+                        len(cached.value.get("raw_message", b"")),
+                    )
+                    return self._render_cached_email(cached.value, max_body_chars)
+
+            logger.info("imap_cache tool=get_email action=read status=refresh")
+            with self._connected("get_email") as client:
+                self._select(client, selected_mailbox, readonly=True, operation="get_email")
+                started = perf_counter()
+                status, fetched = client.uid("FETCH", uid, "(UID FLAGS BODY.PEEK[])")
+                self._ensure_ok(status, "IMAP message fetch failed")
+                raw_message = self._literal_bytes(fetched)
+                logger.info(
+                    "imap_phase tool=get_email phase=message_fetch duration_ms={:.1f} bytes={}",
+                    (perf_counter() - started) * 1000,
+                    len(raw_message),
+                )
+                if not raw_message:
+                    raise EmailNotFoundError(f"Email not found: {uid}")
+                parse_started = perf_counter()
+                message = self._parse_message(raw_message)
+                summary = self._message_summary(
+                    message,
+                    uid=uid,
+                    mailbox=selected_mailbox,
+                    flags=self._fetch_flags(fetched),
+                )
+                logger.info(
+                    "imap_phase tool=get_email phase=parse duration_ms={:.1f}",
+                    (perf_counter() - parse_started) * 1000,
+                )
+            if self._cache is not None and len(raw_message) <= self._max_cached_message_bytes:
+                self._cache.set_email_messages(
+                    [
+                        {
+                            "mailbox": selected_mailbox,
+                            "uid": uid,
+                            "summary": summary,
+                            "raw_message": raw_message,
+                        }
+                    ]
+                )
+                logger.info(
+                    "imap_cache tool=get_email action=write status=refresh bytes={}",
+                    len(raw_message),
+                )
+            elif self._cache is not None:
+                logger.info(
+                    "imap_cache tool=get_email action=write status=skip reason=message_too_large bytes={} max_bytes={}",
+                    len(raw_message),
+                    self._max_cached_message_bytes,
+                )
+            result = dict(summary)
             result.update(self._message_body(message, max_body_chars))
             return result
+
+    @staticmethod
+    def _render_cached_email(value: dict[str, Any], max_body_chars: int) -> dict[str, Any]:
+        raw_message = value.get("raw_message")
+        if not isinstance(raw_message, bytes):
+            raise IMAPServiceError("Cached email content is invalid")
+        message = ICloudIMAPService._parse_message(raw_message)
+        summary = value.get("summary")
+        if not isinstance(summary, dict):
+            raise IMAPServiceError("Cached email summary is invalid")
+        result = dict(summary)
+        result.update(ICloudIMAPService._message_body(message, max_body_chars))
+        return result
+
+    def crawl_email_cache(self) -> dict[str, int]:
+        """Download uncached messages from newest to oldest in small batches."""
+
+        if self._cache is None:
+            logger.info("imap_cache tool=crawl_email_cache action=complete status=disabled")
+            return {"mailboxes": 0, "messages": 0, "bytes": 0, "skipped": 0}
+
+        self._crawl_stop_event.clear()
+        totals = {"mailboxes": 0, "messages": 0, "bytes": 0, "skipped": 0}
+        try:
+            mailboxes = self.list_mailboxes()
+        except Exception as exc:
+            logger.warning(
+                "imap_cache tool=crawl_email_cache action=complete status=error error_type={}",
+                exc.__class__.__name__,
+            )
+            return totals
+        for mailbox in mailboxes:
+            if self._crawl_stop_event.is_set():
+                break
+            flags = {str(flag).casefold() for flag in mailbox.get("flags", [])}
+            if "\\noselect" in flags:
+                continue
+            totals["mailboxes"] += 1
+            try:
+                stats = self._crawl_mailbox(str(mailbox["name"]))
+            except Exception as exc:
+                logger.warning(
+                    "imap_cache tool=crawl_email_cache action=mailbox status=error error_type={}",
+                    exc.__class__.__name__,
+                )
+                continue
+            for key in ("messages", "bytes", "skipped"):
+                totals[key] += stats[key]
+        logger.info(
+            "imap_cache tool=crawl_email_cache action=complete status=ok mailboxes={} messages={} bytes={} skipped={}",
+            totals["mailboxes"],
+            totals["messages"],
+            totals["bytes"],
+            totals["skipped"],
+        )
+        return totals
+
+    def _crawl_mailbox(self, mailbox: str) -> dict[str, int]:
+        stats = {"messages": 0, "bytes": 0, "skipped": 0}
+        with self._connected("crawl_email_cache") as client:
+            selected_data = self._select(
+                client,
+                mailbox,
+                readonly=True,
+                operation="crawl_email_cache",
+            )
+            uid_validity = self._uid_validity(client, selected_data)
+            started = perf_counter()
+            status, data = client.uid("SEARCH", None, "ALL")
+            self._ensure_ok(status, "IMAP cache crawl search failed")
+            uids = self._parse_uids(data)
+            logger.info(
+                "imap_phase tool=crawl_email_cache phase=search duration_ms={:.1f} uid_count={}",
+                (perf_counter() - started) * 1000,
+                len(uids),
+            )
+            cached_uids = self._cache.cached_email_uids(mailbox, uids)
+            pending = [uid for uid in reversed(uids) if uid not in cached_uids]
+            for offset in range(0, len(pending), self._crawl_batch_size):
+                if self._crawl_stop_event.is_set():
+                    break
+                batch = pending[offset : offset + self._crawl_batch_size]
+                started = perf_counter()
+                status, fetched = client.uid(
+                    "FETCH",
+                    ",".join(batch),
+                    "(UID FLAGS BODY.PEEK[])",
+                )
+                self._ensure_ok(status, "IMAP cache message fetch failed")
+                parsed = self._parse_full_fetch(fetched, mailbox=mailbox)
+                messages = []
+                for uid in batch:
+                    item = parsed.get(uid)
+                    if item is None:
+                        continue
+                    summary, raw_message = item
+                    if len(raw_message) > self._max_cached_message_bytes:
+                        stats["skipped"] += 1
+                        continue
+                    messages.append(
+                        {
+                            "mailbox": mailbox,
+                            "uid": uid,
+                            "uid_validity": uid_validity,
+                            "summary": summary,
+                            "raw_message": raw_message,
+                        }
+                    )
+                self._cache.set_email_messages(messages)
+                batch_bytes = sum(len(item["raw_message"]) for item in messages)
+                stats["messages"] += len(messages)
+                stats["bytes"] += batch_bytes
+                logger.info(
+                    "imap_cache tool=crawl_email_cache action=write status=refresh batch_entries={} progress={}/{} bytes={} duration_ms={:.1f}",
+                    len(messages),
+                    min(offset + len(batch), len(pending)),
+                    len(pending),
+                    batch_bytes,
+                    (perf_counter() - started) * 1000,
+                )
+                if self._crawl_interval_seconds:
+                    sleep(self._crawl_interval_seconds)
+        return stats
 
     def create_draft(
         self,
@@ -536,7 +902,7 @@ class ICloudIMAPService:
 
         with self._connected("update_draft") as client:
             new_uid = self._append_draft(client, selected_mailbox, message)
-            self._select(client, selected_mailbox, readonly=False)
+            self._select(client, selected_mailbox, readonly=False, operation="update_draft")
             status, _ = client.uid("STORE", uid, "+FLAGS.SILENT", r"(\Deleted)")
             self._ensure_ok(status, "IMAP draft replacement failed")
             old_expunged = self._expunge_uid_safely(client, uid)
@@ -708,7 +1074,7 @@ class ICloudIMAPService:
         operation = "+FLAGS.SILENT" if read else "-FLAGS.SILENT"
 
         with self._connected("mark_email_read") as client:
-            self._select(client, selected_mailbox, readonly=False)
+            self._select(client, selected_mailbox, readonly=False, operation="mark_email_read")
             status, _ = client.uid("STORE", uid, operation, r"(\Seen)")
             self._ensure_ok(status, "IMAP flag update failed")
             result = {
@@ -732,7 +1098,7 @@ class ICloudIMAPService:
             raise ValueError("source_mailbox and destination_mailbox must differ")
 
         with self._connected("move_email") as client:
-            self._select(client, source, readonly=False)
+            self._select(client, source, readonly=False, operation="move_email")
             status, _ = client.uid("COPY", uid, self._quote_mailbox(destination))
             self._ensure_ok(status, "IMAP copy failed")
             status, _ = client.uid("STORE", uid, "+FLAGS.SILENT", r"(\Deleted)")
@@ -761,7 +1127,7 @@ class ICloudIMAPService:
         uid = self._uid(uid)
         selected_mailbox = self._mailbox(mailbox)
         with self._connected("delete_email") as client:
-            self._select(client, selected_mailbox, readonly=False)
+            self._select(client, selected_mailbox, readonly=False, operation="delete_email")
             status, _ = client.uid("STORE", uid, "+FLAGS.SILENT", r"(\Deleted)")
             self._ensure_ok(status, "IMAP delete flag update failed")
             expunged = self._expunge_uid_safely(client, uid)
@@ -778,11 +1144,18 @@ class ICloudIMAPService:
     def _invalidate_email_cache(self, tool: str, *mailboxes: str) -> None:
         if self._cache is not None:
             invalidated = self._cache.invalidate_emails(*mailboxes)
+            invalidated_messages = self._cache.invalidate_email_messages(*mailboxes)
             logger.info(
                 "imap_cache tool={} action=invalidate kind=email_headers mailboxes={} entries={}",
                 tool,
                 len(mailboxes),
                 invalidated,
+            )
+            logger.info(
+                "imap_cache tool={} action=invalidate kind=email_messages mailboxes={} entries={}",
+                tool,
+                len(mailboxes),
+                invalidated_messages,
             )
 
     def _expunge_uid_safely(self, client: Any, uid: str) -> bool:
@@ -807,13 +1180,27 @@ class ICloudIMAPService:
         except Exception:
             return False
 
-    def _select(self, client: Any, mailbox: str, *, readonly: bool) -> None:
+    def _select(
+        self,
+        client: Any,
+        mailbox: str,
+        *,
+        readonly: bool,
+        operation: str,
+    ) -> list[Any]:
+        started = perf_counter()
         try:
-            status, _ = client.select(self._quote_mailbox(mailbox), readonly=readonly)
+            status, data = client.select(self._quote_mailbox(mailbox), readonly=readonly)
         except Exception as exc:
             raise MailboxNotFoundError(f"Mailbox not available: {mailbox}") from exc
         if not self._is_ok(status):
             raise MailboxNotFoundError(f"Mailbox not available: {mailbox}")
+        logger.info(
+            "imap_phase tool={} phase=select duration_ms={:.1f}",
+            operation,
+            (perf_counter() - started) * 1000,
+        )
+        return data or []
 
     @staticmethod
     def _ensure_ok(status: Any, message: str) -> None:
@@ -847,7 +1234,7 @@ class ICloudIMAPService:
         return limit
 
     @staticmethod
-    def _quote_search_value(value: str, field: str) -> str:
+    def _quote_search_value(value: str, field: str) -> str | bytes:
         normalized = value.strip()
         if not normalized:
             raise ValueError(f"{field} must not be empty")
@@ -855,6 +1242,9 @@ class ICloudIMAPService:
             raise ValueError(f"{field} must not contain control characters")
         if len(normalized) > 512:
             raise ValueError(f"{field} is too long")
+        if any(ord(character) > 127 for character in normalized):
+            encoded = normalized.encode("utf-8")
+            return b'"' + encoded.replace(b"\\", b"\\\\").replace(b'"', b'\\"') + b'"'
         return ICloudIMAPService._quote_string(normalized)
 
     @staticmethod

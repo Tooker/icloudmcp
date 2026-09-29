@@ -23,8 +23,9 @@ class SQLiteICloudCalendarCache:
     iCloud remains the source of truth. The database only stores read results
     so repeated MCP requests do not reopen a CalDAV or IMAP connection
     unnecessarily. Calendar and mail writes invalidate their corresponding
-    cached read results after the remote operation succeeds. Email cache
-    entries contain headers and flags only; message bodies are not stored.
+    cached read results after the remote operation succeeds. Full IMAP
+    messages are stored separately as SQLite BLOBs so headers and message
+    content can be refreshed independently.
     """
 
     def __init__(
@@ -33,7 +34,9 @@ class SQLiteICloudCalendarCache:
         *,
         events_ttl_seconds: int = 60,
         calendars_ttl_seconds: int = 300,
+        mailboxes_ttl_seconds: int = 1800,
         email_ttl_seconds: int = 300,
+        email_content_ttl_seconds: int = 86400,
         email_max_messages: int = 1000,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -41,15 +44,21 @@ class SQLiteICloudCalendarCache:
             raise ValueError("events_ttl_seconds must not be negative")
         if calendars_ttl_seconds < 0:
             raise ValueError("calendars_ttl_seconds must not be negative")
+        if mailboxes_ttl_seconds < 0:
+            raise ValueError("mailboxes_ttl_seconds must not be negative")
         if email_ttl_seconds < 0:
             raise ValueError("email_ttl_seconds must not be negative")
+        if email_content_ttl_seconds < 0:
+            raise ValueError("email_content_ttl_seconds must not be negative")
         if email_max_messages < 0:
             raise ValueError("email_max_messages must not be negative")
 
         self.path = Path(path)
         self.events_ttl_seconds = events_ttl_seconds
         self.calendars_ttl_seconds = calendars_ttl_seconds
+        self.mailboxes_ttl_seconds = mailboxes_ttl_seconds
         self.email_ttl_seconds = email_ttl_seconds
+        self.email_content_ttl_seconds = email_content_ttl_seconds
         self.email_max_messages = email_max_messages
         self._clock = clock
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -82,12 +91,37 @@ class SQLiteICloudCalendarCache:
                 "CREATE INDEX IF NOT EXISTS cache_entries_prefix_idx "
                 "ON cache_entries(cache_key)"
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS email_messages (
+                    cache_key TEXT PRIMARY KEY,
+                    mailbox_key TEXT NOT NULL,
+                    mailbox TEXT NOT NULL,
+                    uid TEXT NOT NULL,
+                    uid_validity TEXT NOT NULL DEFAULT '',
+                    message_id TEXT,
+                    summary_json TEXT NOT NULL,
+                    raw_message BLOB NOT NULL,
+                    fetched_at REAL NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS email_messages_mailbox_idx "
+                "ON email_messages(mailbox_key, uid)"
+            )
 
     def get_calendars(self) -> CacheEntry | None:
         return self._get("calendars", self.calendars_ttl_seconds)
 
     def set_calendars(self, calendars: list[dict[str, Any]]) -> None:
         self._set("calendars", calendars)
+
+    def get_mailboxes(self) -> CacheEntry | None:
+        return self._get("mailboxes", self.mailboxes_ttl_seconds)
+
+    def set_mailboxes(self, mailboxes: list[dict[str, Any]]) -> None:
+        self._set("mailboxes", mailboxes)
 
     def get_events(
         self,
@@ -218,6 +252,109 @@ class SQLiteICloudCalendarCache:
                 total += max(cursor.rowcount, 0)
             return total
 
+    def get_email_message(self, mailbox: str, uid: str) -> CacheEntry | None:
+        mailbox_key = mailbox.casefold()
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT summary_json, raw_message, uid_validity, fetched_at "
+                "FROM email_messages WHERE mailbox_key = ? AND uid = ? "
+                "ORDER BY fetched_at DESC LIMIT 1",
+                (mailbox_key, uid),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            summary = json.loads(row[0])
+        except json.JSONDecodeError:
+            return None
+        return CacheEntry(
+            value={
+                "summary": summary,
+                "raw_message": bytes(row[1]),
+                "uid_validity": row[2],
+            },
+            fresh=self._is_fresh(row[3], self.email_content_ttl_seconds),
+            fetched_at=row[3],
+        )
+
+    def set_email_messages(self, messages: list[dict[str, Any]]) -> None:
+        if not messages:
+            return
+        fetched_at = self._clock()
+        rows = []
+        for message in messages:
+            mailbox = str(message.get("mailbox") or "")
+            uid = str(message.get("uid") or "")
+            raw_message = message.get("raw_message")
+            summary = message.get("summary")
+            if not mailbox or not uid or not isinstance(raw_message, bytes):
+                continue
+            if not isinstance(summary, dict):
+                continue
+            rows.append(
+                (
+                    self._email_message_key(mailbox, uid),
+                    mailbox.casefold(),
+                    mailbox,
+                    uid,
+                    str(message.get("uid_validity") or ""),
+                    str(summary.get("message_id") or "") or None,
+                    json.dumps(summary, ensure_ascii=False),
+                    raw_message,
+                    fetched_at,
+                )
+            )
+        if not rows:
+            return
+        with self._connection() as connection:
+            connection.executemany(
+                "INSERT OR REPLACE INTO email_messages("
+                "cache_key, mailbox_key, mailbox, uid, uid_validity, message_id, "
+                "summary_json, raw_message, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+
+    def cached_email_uids(
+        self,
+        mailbox: str,
+        uids: list[str],
+        *,
+        fresh_only: bool = True,
+    ) -> set[str]:
+        if not uids:
+            return set()
+        mailbox_key = mailbox.casefold()
+        cached: set[str] = set()
+        with self._connection() as connection:
+            for offset in range(0, len(uids), 900):
+                batch = uids[offset : offset + 900]
+                placeholders = ",".join("?" for _ in batch)
+                rows = connection.execute(
+                    "SELECT uid, fetched_at FROM email_messages "
+                    f"WHERE mailbox_key = ? AND uid IN ({placeholders})",
+                    (mailbox_key, *batch),
+                ).fetchall()
+                for uid, fetched_at in rows:
+                    if not fresh_only or self._is_fresh(fetched_at, self.email_content_ttl_seconds):
+                        cached.add(str(uid))
+        if fresh_only and self.email_content_ttl_seconds <= 0:
+            return set()
+        return cached
+
+    def invalidate_email_messages(self, *mailboxes: str) -> int:
+        with self._connection() as connection:
+            if not mailboxes:
+                cursor = connection.execute("DELETE FROM email_messages")
+                return max(cursor.rowcount, 0)
+            total = 0
+            for mailbox in mailboxes:
+                cursor = connection.execute(
+                    "DELETE FROM email_messages WHERE mailbox_key = ?",
+                    (mailbox.casefold(),),
+                )
+                total += max(cursor.rowcount, 0)
+            return total
+
     def _get(self, key: str, ttl_seconds: int) -> CacheEntry | None:
         with self._connection() as connection:
             row = connection.execute(
@@ -264,6 +401,10 @@ class SQLiteICloudCalendarCache:
     @staticmethod
     def _email_key(mailbox: str) -> str:
         return "emails:" + SQLiteICloudCalendarCache._digest(mailbox.casefold())
+
+    @staticmethod
+    def _email_message_key(mailbox: str, uid: str) -> str:
+        return "email_message:" + SQLiteICloudCalendarCache._digest(mailbox.casefold(), uid)
 
     @staticmethod
     def _digest(*parts: str) -> str:

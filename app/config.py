@@ -23,9 +23,15 @@ DEFAULT_IMAP_PORT = 993
 DEFAULT_IMAP_MAILBOX = "INBOX"
 DEFAULT_IMAP_DRAFTS_MAILBOX = "Drafts"
 DEFAULT_IMAP_EMAIL_CACHE_TTL_SECONDS = 300
+DEFAULT_IMAP_EMAIL_CONTENT_TTL_SECONDS = 86400
+DEFAULT_IMAP_MAILBOX_CACHE_TTL_SECONDS = 1800
 DEFAULT_IMAP_EMAIL_CACHE_DAYS = 100
 DEFAULT_IMAP_EMAIL_CACHE_MAX_MESSAGES = 1000
 DEFAULT_IMAP_CONNECTION_POOL_SIZE = 4
+DEFAULT_IMAP_EMAIL_CACHE_CRAWL_ENABLED = True
+DEFAULT_IMAP_EMAIL_CACHE_CRAWL_BATCH_SIZE = 25
+DEFAULT_IMAP_EMAIL_CACHE_CRAWL_INTERVAL_SECONDS = 0.1
+DEFAULT_IMAP_EMAIL_CACHE_MAX_MESSAGE_BYTES = 25_000_000
 
 
 @dataclass(frozen=True)
@@ -383,6 +389,32 @@ def imap_email_cache_ttl_seconds(environ: dict[str, str] | None = None) -> int:
     )
 
 
+def imap_email_content_ttl_seconds(environ: dict[str, str] | None = None) -> int:
+    return _positive_or_zero_int(
+        environ,
+        (
+            "IMAP_EMAIL_CONTENT_TTL_SECONDS",
+            "ICLOUDCRUNCHER.IMAP_EMAIL_CONTENT_TTL_SECONDS",
+            "ICLOUD_CRUNCHER_IMAP_EMAIL_CONTENT_TTL_SECONDS",
+        ),
+        DEFAULT_IMAP_EMAIL_CONTENT_TTL_SECONDS,
+        "IMAP_EMAIL_CONTENT_TTL_SECONDS",
+    )
+
+
+def imap_mailbox_cache_ttl_seconds(environ: dict[str, str] | None = None) -> int:
+    return _positive_or_zero_int(
+        environ,
+        (
+            "IMAP_MAILBOX_CACHE_TTL_SECONDS",
+            "ICLOUDCRUNCHER.IMAP_MAILBOX_CACHE_TTL_SECONDS",
+            "ICLOUD_CRUNCHER_IMAP_MAILBOX_CACHE_TTL_SECONDS",
+        ),
+        DEFAULT_IMAP_MAILBOX_CACHE_TTL_SECONDS,
+        "IMAP_MAILBOX_CACHE_TTL_SECONDS",
+    )
+
+
 def imap_email_cache_days(environ: dict[str, str] | None = None) -> int:
     return _positive_or_zero_int(
         environ,
@@ -422,6 +454,83 @@ def imap_connection_pool_size(environ: dict[str, str] | None = None) -> int:
     )
 
 
+def imap_email_cache_crawl_enabled(environ: dict[str, str] | None = None) -> bool:
+    env = os.environ if environ is None else environ
+    raw_value = next(
+        (
+            env.get(name)
+            for name in (
+                "IMAP_EMAIL_CACHE_CRAWL_ENABLED",
+                "ICLOUDCRUNCHER.IMAP_EMAIL_CACHE_CRAWL_ENABLED",
+                "ICLOUD_CRUNCHER_IMAP_EMAIL_CACHE_CRAWL_ENABLED",
+            )
+            if env.get(name) is not None
+        ),
+        None,
+    )
+    if raw_value is None:
+        return DEFAULT_IMAP_EMAIL_CACHE_CRAWL_ENABLED
+    normalized = raw_value.strip().casefold()
+    if normalized not in {"0", "1", "false", "true", "no", "yes", "off", "on"}:
+        raise ValueError("IMAP_EMAIL_CACHE_CRAWL_ENABLED must be a boolean")
+    return normalized in {"1", "true", "yes", "on"}
+
+
+def imap_email_cache_crawl_batch_size(environ: dict[str, str] | None = None) -> int:
+    return _bounded_int(
+        environ,
+        (
+            "IMAP_EMAIL_CACHE_CRAWL_BATCH_SIZE",
+            "ICLOUDCRUNCHER.IMAP_EMAIL_CACHE_CRAWL_BATCH_SIZE",
+            "ICLOUD_CRUNCHER_IMAP_EMAIL_CACHE_CRAWL_BATCH_SIZE",
+        ),
+        DEFAULT_IMAP_EMAIL_CACHE_CRAWL_BATCH_SIZE,
+        "IMAP_EMAIL_CACHE_CRAWL_BATCH_SIZE",
+        minimum=1,
+        maximum=100,
+    )
+
+
+def imap_email_cache_crawl_interval_seconds(environ: dict[str, str] | None = None) -> float:
+    env = os.environ if environ is None else environ
+    raw_value = next(
+        (
+            env.get(name)
+            for name in (
+                "IMAP_EMAIL_CACHE_CRAWL_INTERVAL_SECONDS",
+                "ICLOUDCRUNCHER.IMAP_EMAIL_CACHE_CRAWL_INTERVAL_SECONDS",
+                "ICLOUD_CRUNCHER_IMAP_EMAIL_CACHE_CRAWL_INTERVAL_SECONDS",
+            )
+            if env.get(name) is not None
+        ),
+        None,
+    )
+    if raw_value is None:
+        return DEFAULT_IMAP_EMAIL_CACHE_CRAWL_INTERVAL_SECONDS
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise ValueError("IMAP_EMAIL_CACHE_CRAWL_INTERVAL_SECONDS must be a number") from exc
+    if value < 0:
+        raise ValueError("IMAP_EMAIL_CACHE_CRAWL_INTERVAL_SECONDS must not be negative")
+    return value
+
+
+def imap_email_cache_max_message_bytes(environ: dict[str, str] | None = None) -> int:
+    return _bounded_int(
+        environ,
+        (
+            "IMAP_EMAIL_CACHE_MAX_MESSAGE_BYTES",
+            "ICLOUDCRUNCHER.IMAP_EMAIL_CACHE_MAX_MESSAGE_BYTES",
+            "ICLOUD_CRUNCHER_IMAP_EMAIL_CACHE_MAX_MESSAGE_BYTES",
+        ),
+        DEFAULT_IMAP_EMAIL_CACHE_MAX_MESSAGE_BYTES,
+        "IMAP_EMAIL_CACHE_MAX_MESSAGE_BYTES",
+        minimum=1,
+        maximum=100_000_000,
+    )
+
+
 def _positive_or_zero_int(
     environ: dict[str, str] | None,
     names: tuple[str, ...],
@@ -438,6 +547,21 @@ def _positive_or_zero_int(
         raise ValueError(f"{setting_name} must be an integer") from exc
     if value < 0:
         raise ValueError(f"{setting_name} must not be negative")
+    return value
+
+
+def _bounded_int(
+    environ: dict[str, str] | None,
+    names: tuple[str, ...],
+    default: int,
+    setting_name: str,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    value = _positive_or_zero_int(environ, names, default, setting_name)
+    if value < minimum or value > maximum:
+        raise ValueError(f"{setting_name} must be between {minimum} and {maximum}")
     return value
 
 

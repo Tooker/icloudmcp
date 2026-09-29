@@ -11,7 +11,13 @@ from app.config import (
     imap_email_cache_days,
     imap_email_cache_max_messages,
     imap_connection_pool_size,
+    imap_email_cache_crawl_batch_size,
+    imap_email_cache_crawl_enabled,
+    imap_email_cache_crawl_interval_seconds,
+    imap_email_cache_max_message_bytes,
     imap_email_cache_ttl_seconds,
+    imap_email_content_ttl_seconds,
+    imap_mailbox_cache_ttl_seconds,
     load_calendars,
     load_imap_config,
     load_icloud_config,
@@ -152,6 +158,12 @@ def test_imap_email_cache_settings_default_to_recent_bounded_cache() -> None:
     assert imap_email_cache_days(environ={}) == 100
     assert imap_email_cache_max_messages(environ={}) == 1000
     assert imap_connection_pool_size(environ={}) == 4
+    assert imap_email_content_ttl_seconds(environ={}) == 86400
+    assert imap_mailbox_cache_ttl_seconds(environ={}) == 1800
+    assert imap_email_cache_crawl_enabled(environ={}) is True
+    assert imap_email_cache_crawl_batch_size(environ={}) == 25
+    assert imap_email_cache_crawl_interval_seconds(environ={}) == 0.1
+    assert imap_email_cache_max_message_bytes(environ={}) == 25_000_000
     configured = {
         "IMAP_EMAIL_CACHE_TTL_SECONDS": "600",
         "IMAP_EMAIL_CACHE_DAYS": "30",

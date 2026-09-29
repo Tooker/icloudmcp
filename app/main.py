@@ -24,9 +24,15 @@ from app.config import (
     icloud_cache_ttl_seconds,
     icloud_calendars_cache_ttl_seconds,
     imap_connection_pool_size,
+    imap_email_cache_crawl_batch_size,
+    imap_email_cache_crawl_enabled,
+    imap_email_cache_crawl_interval_seconds,
+    imap_email_cache_max_message_bytes,
     imap_email_cache_days,
     imap_email_cache_max_messages,
     imap_email_cache_ttl_seconds,
+    imap_email_content_ttl_seconds,
+    imap_mailbox_cache_ttl_seconds,
     load_calendars,
     load_imap_config,
     load_icloud_config,
@@ -92,6 +98,7 @@ def create_app(
         service = None
     if imap_service is not None:
         mail_service = imap_service
+        mail_service_created = False
     elif imap_config is not None:
         if shared_cache is None:
             shared_cache = _build_icloud_cache(environ)
@@ -101,9 +108,14 @@ def create_app(
             email_cache_days=imap_email_cache_days(environ),
             email_cache_max_messages=imap_email_cache_max_messages(environ),
             connection_pool_size=imap_connection_pool_size(environ),
+            crawl_batch_size=imap_email_cache_crawl_batch_size(environ),
+            crawl_interval_seconds=imap_email_cache_crawl_interval_seconds(environ),
+            max_cached_message_bytes=imap_email_cache_max_message_bytes(environ),
         )
+        mail_service_created = True
     else:
         mail_service = None
+        mail_service_created = False
     mcp_server = create_mcp_server(service, mail_service)
     mcp_http_app = mcp_server.streamable_http_app(
         streamable_http_path="/",
@@ -125,10 +137,30 @@ def create_app(
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         # Mounted Starlette applications do not run their own lifespan under
         # FastAPI, so the MCP session manager is owned by the host app.
+        crawl_task: asyncio.Task | None = None
         try:
+            if mail_service_created and imap_email_cache_crawl_enabled(environ):
+                logger.info(
+                    "imap_cache tool=crawl_email_cache action=start status=background batch_size={} interval_seconds={} max_message_bytes={}",
+                    imap_email_cache_crawl_batch_size(environ),
+                    imap_email_cache_crawl_interval_seconds(environ),
+                    imap_email_cache_max_message_bytes(environ),
+                )
+                crawl_task = asyncio.create_task(
+                    asyncio.to_thread(mail_service.crawl_email_cache),
+                    name="imap-email-cache-crawl",
+                )
             async with mcp_server.session_manager.run():
                 yield
         finally:
+            if crawl_task is not None and not crawl_task.done():
+                stop = getattr(mail_service, "stop_crawl", None)
+                if callable(stop):
+                    stop()
+                try:
+                    await asyncio.wait_for(crawl_task, timeout=5)
+                except (asyncio.CancelledError, TimeoutError):
+                    crawl_task.cancel()
             close = getattr(mail_service, "close", None)
             if callable(close):
                 await asyncio.to_thread(close)
@@ -150,11 +182,13 @@ def create_app(
     logger.info("calendar_cache ttl_seconds={}", cache.ttl_seconds)
     if shared_cache is not None:
         logger.info(
-            "icloud_cache_backend type=sqlite path={} events_ttl_seconds={} calendars_ttl_seconds={} email_ttl_seconds={} email_max_messages={} imap_connection_pool_size={}",
+            "icloud_cache_backend type=sqlite path={} events_ttl_seconds={} calendars_ttl_seconds={} mailboxes_ttl_seconds={} email_ttl_seconds={} email_content_ttl_seconds={} email_max_messages={} imap_connection_pool_size={}",
             shared_cache.path,
             shared_cache.events_ttl_seconds,
             shared_cache.calendars_ttl_seconds,
+            shared_cache.mailboxes_ttl_seconds,
             shared_cache.email_ttl_seconds,
+            shared_cache.email_content_ttl_seconds,
             shared_cache.email_max_messages,
             imap_connection_pool_size(environ),
         )
@@ -270,6 +304,8 @@ def _build_icloud_cache(environ: dict[str, str] | None) -> SQLiteICloudCalendarC
         events_ttl_seconds=icloud_cache_ttl_seconds(environ),
         calendars_ttl_seconds=icloud_calendars_cache_ttl_seconds(environ),
         email_ttl_seconds=imap_email_cache_ttl_seconds(environ),
+        mailboxes_ttl_seconds=imap_mailbox_cache_ttl_seconds(environ),
+        email_content_ttl_seconds=imap_email_content_ttl_seconds(environ),
         email_max_messages=imap_email_cache_max_messages(environ),
     )
 
