@@ -7,6 +7,7 @@ from typing import Any, Callable, TypeVar
 
 from loguru import logger
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import ToolAnnotations
 
 from app.icloud import ICloudCalendarService, ICloudServiceError
@@ -64,7 +65,7 @@ def create_mcp_server(
         logger.info("mcp_tool_start tool={}", operation)
         if target is None:
             _log_tool_complete(operation, started, "not_configured")
-            raise RuntimeError(missing_message)
+            raise ToolError(missing_message)
         try:
             result = await asyncio.to_thread(function)
             _log_tool_complete(
@@ -81,7 +82,7 @@ def create_mcp_server(
                 "validation_error",
                 error_type=exc.__class__.__name__,
             )
-            raise ValueError(str(exc)) from exc
+            raise ToolError(str(exc)) from None
         except Exception as exc:
             # Client exceptions can contain request details. Keep them out of
             # the MCP response and log only a stable exception class.
@@ -91,7 +92,10 @@ def create_mcp_server(
                 (perf_counter() - started) * 1000,
                 exc.__class__.__name__,
             )
-            raise RuntimeError("iCloud service request failed") from exc
+            # The SDK logs unexpected exceptions with their entire chain.
+            # An expected ToolError with no cause keeps private client details
+            # out of both the response and the SDK's logs.
+            raise ToolError("iCloud service request failed") from None
 
     def _log_tool_complete(
         operation: str,

@@ -1,8 +1,14 @@
 from pathlib import Path
+import asyncio
+import logging
 
 from fastapi.testclient import TestClient
+from mcp_types import CallToolRequestParams
+import pytest
 
 from app.main import create_app
+from app.icloud import ICloudServiceError
+from app.mcp_server import create_mcp_server
 
 
 def test_streamable_http_mcp_endpoint_exposes_calendar_tools(tmp_path: Path) -> None:
@@ -39,3 +45,26 @@ def test_streamable_http_mcp_endpoint_exposes_calendar_tools(tmp_path: Path) -> 
     assert '"name":"create_draft"' in tools_response.text
     assert '"name":"update_draft"' in tools_response.text
     assert '"name":"mark_email_read"' in tools_response.text
+
+
+@pytest.mark.parametrize("error", [RuntimeError, ValueError, ICloudServiceError])
+def test_mcp_errors_do_not_log_private_exception_causes(caplog, error) -> None:
+    marker = "PRIVATE_UPSTREAM_DETAIL_DO_NOT_LOG"
+
+    class FailingCalendar:
+        def list_calendars(self):
+            try:
+                raise RuntimeError(marker)
+            except RuntimeError as cause:
+                message = "safe validation message" if error is not RuntimeError else "upstream failed"
+                raise error(message) from cause
+
+    server = create_mcp_server(FailingCalendar())
+    with caplog.at_level(logging.INFO, logger="mcp.server.mcpserver.server"):
+        result = asyncio.run(server._handle_call_tool(
+            None, CallToolRequestParams(name="list_calendars", arguments={})
+        ))
+    assert result.is_error is True
+    assert marker not in str(result)
+    assert marker not in caplog.text
+    assert not any(record.exc_info for record in caplog.records)
