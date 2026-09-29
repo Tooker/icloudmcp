@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import imaplib
 import ssl
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -60,7 +61,11 @@ class FakeIMAP:
                     raw = MESSAGE.split(b"\r\n\r\n", 1)[0] + b"\r\n\r\n"
                 else:
                     raw = MESSAGE
-                metadata = f"{uid} FETCH (UID {uid} FLAGS (\\Seen) BODY {{{len(raw)}}})".encode()
+                internal_date = datetime.now(timezone.utc).strftime("%d-%b-%Y %H:%M:%S %z")
+                metadata = (
+                    f'{uid} FETCH (UID {uid} FLAGS (\\Seen) INTERNALDATE "{internal_date}" '
+                    f'BODY {{{len(raw)}}})'
+                ).encode()
                 fetched.append((metadata, raw))
             fetched.append(b")")
             return "OK", fetched
@@ -86,6 +91,49 @@ class FakeIMAP:
 class FailingLoginIMAP(FakeIMAP):
     def login(self, username: str, password: str) -> tuple[str, list[bytes]]:
         raise imaplib.IMAP4.error(b"[AUTHENTICATIONFAILED] Authentication Failed")
+
+
+class SearchMailboxIMAP(FakeIMAP):
+    """A mailbox whose SEARCH applies filters before FETCH applies the limit."""
+
+    def __init__(self, subjects: list[str], dates: list[date] | None = None) -> None:
+        super().__init__()
+        self.messages = {
+            str(index): (subject, received)
+            for index, (subject, received) in enumerate(
+                zip(subjects, dates or [date.today()] * len(subjects)), start=1
+            )
+        }
+
+    def uid(self, command: str, *args: Any) -> tuple[str, list[Any]]:
+        if command == "SEARCH":
+            self.calls.append((command, args))
+            selected = []
+            for uid, (subject, received) in self.messages.items():
+                if "SUBJECT" in args and str(args[args.index("SUBJECT") + 1]).strip('"') not in subject:
+                    continue
+                if "SINCE" in args and received < datetime.strptime(
+                    str(args[args.index("SINCE") + 1]), "%d-%b-%Y"
+                ).date():
+                    continue
+                selected.append(uid)
+            return "OK", [" ".join(selected).encode()]
+        if command == "FETCH":
+            self.calls.append((command, args))
+            rows = []
+            for uid in str(args[0]).split(","):
+                subject, received = self.messages[uid]
+                # Deliberately unrelated Date headers: SEARCH uses INTERNALDATE.
+                raw = (
+                    f"Subject: {subject}\r\nDate: Wed, 1 Jan 2020 10:00:00 +0000\r\n\r\n"
+                ).encode()
+                internal_date = received.strftime("%d-%b-%Y") + " 10:00:00 +0200"
+                rows.append((
+                    f'{uid} (UID {uid} FLAGS () INTERNALDATE "{internal_date}" BODY {{{len(raw)}}})'.encode(),
+                    raw,
+                ))
+            return "OK", rows + [b")"]
+        return super().uid(command, *args)
 
 
 def service_with(
@@ -248,10 +296,61 @@ def test_recent_email_header_search_uses_cache(tmp_path) -> None:
     cache = SQLiteICloudCalendarCache(tmp_path / "cache.sqlite3")
     mail = service_with(client, cache=cache)
 
-    first = mail.search_emails(subject="Test", limit=1)
-    second = mail.search_emails(subject="Test", limit=1)
+    first = mail.search_emails(subject="Test", since=mail._email_cache_since(), limit=1)
+    second = mail.search_emails(subject="Test", since=mail._email_cache_since(), limit=1)
 
     assert first == second
+    assert sum(call[0] == "SEARCH" for call in client.calls) == 1
+
+
+def test_truncated_header_cache_does_not_hide_filtered_matches(tmp_path) -> None:
+    client = SearchMailboxIMAP(["Rechnung", "Other", "Other"])
+    mail = service_with(
+        client, cache=SQLiteICloudCalendarCache(tmp_path / "cache.sqlite3"),
+        email_cache_max_messages=2,
+    )
+    args = {"subject": "Rechnung", "since": mail._email_cache_since()}
+    assert [message["uid"] for message in mail.search_emails(**args)] == ["1"]
+    assert mail._cache.get_emails("INBOX").value["complete"] is False
+    assert [message["uid"] for message in mail.search_emails(**args)] == ["1"]
+    # Only the first request refreshes the known-incomplete header cache.
+    assert sum(call[0] == "SEARCH" for call in client.calls) == 3
+
+
+def test_unbounded_header_search_includes_matches_older_than_cache_window(tmp_path) -> None:
+    client = SearchMailboxIMAP(
+        ["Rechnung", "Other"], [date.today() - timedelta(days=101), date.today()]
+    )
+    mail = service_with(client, cache=SQLiteICloudCalendarCache(tmp_path / "cache.sqlite3"))
+    assert [message["uid"] for message in mail.search_emails(subject="Rechnung")] == ["1"]
+    assert not any("SINCE" in args for command, args in client.calls if command == "SEARCH")
+
+
+def test_complete_cache_at_limit_uses_internal_dates_and_uid_order(tmp_path) -> None:
+    client = SearchMailboxIMAP(["First", "Second"])
+    mail = service_with(
+        client, cache=SQLiteICloudCalendarCache(tmp_path / "cache.sqlite3", email_max_messages=2),
+        email_cache_max_messages=2,
+    )
+    args = {"since": date.today().isoformat(), "limit": 2}
+    first = mail.search_emails(**args)
+    second = mail.search_emails(**args)
+    assert [message["uid"] for message in first] == ["2", "1"]
+    assert second == first
+    assert mail._cache.get_emails("INBOX").value["complete"] is True
+    assert sum(call[0] == "SEARCH" for call in client.calls) == 1
+
+
+def test_cached_coverage_is_checked_after_cache_window_configuration_changes(tmp_path) -> None:
+    client = SearchMailboxIMAP(["Rechnung"], [date.today() - timedelta(days=20)])
+    mail = service_with(client, cache=SQLiteICloudCalendarCache(tmp_path / "cache.sqlite3"))
+    mail._cache.set_emails(
+        "INBOX", [], (date.today() - timedelta(days=5)).isoformat(), complete=True
+    )
+    results = mail.search_emails(
+        subject="Rechnung", since=(date.today() - timedelta(days=30)).isoformat()
+    )
+    assert [message["uid"] for message in results] == ["1"]
     assert sum(call[0] == "SEARCH" for call in client.calls) == 1
 
 
@@ -259,7 +358,7 @@ def test_email_write_invalidates_mailbox_cache(tmp_path) -> None:
     client = FakeIMAP()
     cache = SQLiteICloudCalendarCache(tmp_path / "cache.sqlite3")
     mail = service_with(client, cache=cache)
-    mail.search_emails(limit=1)
+    mail.search_emails(since=mail._email_cache_since(), limit=1)
 
     assert mail._cache.get_emails("INBOX") is not None
     mail.mark_email_read("INBOX", "42", read=False)

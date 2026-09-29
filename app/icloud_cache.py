@@ -237,6 +237,8 @@ class SQLiteICloudCalendarCache:
         mailbox: str,
         emails: list[dict[str, Any]],
         coverage_since: str,
+        *,
+        complete: bool = False,
     ) -> None:
         if self.email_max_messages == 0:
             return
@@ -249,6 +251,7 @@ class SQLiteICloudCalendarCache:
             self._email_key(mailbox),
             {
                 "coverage_since": coverage_since,
+                "complete": complete and len(emails) <= self.email_max_messages,
                 "emails": ordered,
             },
         )

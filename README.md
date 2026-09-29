@@ -93,6 +93,9 @@ intentionally not implemented; send the uploaded draft manually from a mail clie
 The IMAP read cache keeps up to the 1,000 newest message headers per mailbox from the
 last 100 days in the same persistent SQLite volume as the calendar cache. It refreshes
 every 300 seconds by default. Mailbox listings are cached for 30 minutes by default.
+Header searches use the cache only when an explicit `since` date falls within
+its complete coverage. Unbounded searches and searches exceeding the cached
+message limit run directly on IMAP, so the cache never hides matching mail.
 Full `.eml` messages, including message bodies and attachment bytes, are stored in a
 separate SQLite BLOB table for 24 hours by default. On startup, a background crawler
 walks configured mailboxes from newest to oldest in batches and skips already cached

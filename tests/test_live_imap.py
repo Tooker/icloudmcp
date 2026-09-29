@@ -35,7 +35,7 @@ def test_live_imap_login_mailboxes_and_header_search(tmp_path: Path) -> None:
     mailbox_names = {str(mailbox["name"]) for mailbox in mailboxes}
     mailbox = config.default_mailbox if config.default_mailbox in mailbox_names else next(iter(mailbox_names))
     try:
-        results = service.search_emails(mailbox=mailbox, limit=5)
+        results = service.search_emails(mailbox=mailbox, since=service._email_cache_since(), limit=5)
     except IMAPServiceError as exc:
         raise AssertionError(str(exc)) from None
     except Exception as exc:
@@ -48,5 +48,5 @@ def test_live_imap_login_mailboxes_and_header_search(tmp_path: Path) -> None:
     cached = service._cache.get_emails(mailbox)
     assert cached is not None and cached.fresh
 
-    cached_results = service.search_emails(mailbox=mailbox, limit=5)
+    cached_results = service.search_emails(mailbox=mailbox, since=service._email_cache_since(), limit=5)
     assert cached_results == results

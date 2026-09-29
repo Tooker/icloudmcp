@@ -7,6 +7,7 @@ import ssl
 import threading
 from contextlib import contextmanager
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from email import policy
 from email.message import EmailMessage, Message
@@ -33,6 +34,12 @@ class EmailNotFoundError(IMAPServiceError):
     pass
 
 
+@dataclass(frozen=True)
+class _HeaderSearchResult:
+    emails: list[dict[str, Any]]
+    total_matches: int
+
+
 class ICloudIMAPService:
     """Small synchronous IMAP facade used from MCP worker threads.
 
@@ -47,7 +54,7 @@ class ICloudIMAPService:
     _MAX_ATTACHMENT_BYTES = 10_000_000
     _HEADER_FETCH_BATCH_SIZE = 100
     _FETCH_HEADERS = (
-        "(UID FLAGS BODY.PEEK[HEADER.FIELDS "
+        "(UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS "
         "(DATE FROM TO CC SUBJECT MESSAGE-ID)])"
     )
 
@@ -284,103 +291,53 @@ class ICloudIMAPService:
     ) -> list[dict[str, Any]]:
         limit = self._validate_limit(limit)
         selected_mailbox = self._mailbox(mailbox)
+        filters = dict(
+            from_address=from_address, to_address=to_address, subject=subject,
+            since=since, before=before, unread_only=unread_only, limit=limit,
+        )
         cache_enabled = self._email_cache_enabled()
         cache_range_supported = (
             self._cache_range_supported(since, before)
-            if cache_enabled and not query
-            else False
+            if cache_enabled and not query else False
         )
-
         if cache_enabled and not query and cache_range_supported:
-            cached = self._cache.get_emails(selected_mailbox)
-            cached_emails = self._cached_emails(cached)
-            if cached is not None and cached.fresh and cached_emails is not None:
-                result = self._filter_cached_emails(
-                    cached_emails,
-                    from_address=from_address,
-                    to_address=to_address,
-                    subject=subject,
-                    since=since,
-                    before=before,
-                    unread_only=unread_only,
-                    limit=limit,
-                )
-                logger.info(
-                    "imap_cache tool=search_emails action=read status=hit entries={}",
-                    len(result),
-                )
-                return result
-
             with self._refresh_lock(f"headers:{selected_mailbox.casefold()}"):
                 cached = self._cache.get_emails(selected_mailbox)
-                cached_emails = self._cached_emails(cached)
-                if cached is not None and cached.fresh and cached_emails is not None:
-                    result = self._filter_cached_emails(
-                        cached_emails,
-                        from_address=from_address,
-                        to_address=to_address,
-                        subject=subject,
-                        since=since,
-                        before=before,
-                        unread_only=unread_only,
-                        limit=limit,
-                    )
+                if cached is None or not cached.fresh or self._cached_emails(cached) is None:
                     logger.info(
-                        "imap_cache tool=search_emails action=read status=coalesced_hit entries={}",
+                        "imap_cache tool=search_emails action=read status={}",
+                        "stale" if cached is not None else "miss",
+                    )
+                    coverage_since = self._email_cache_since()
+                    recent = self._search_live(
+                        selected_mailbox, since=coverage_since,
+                        limit=self._email_cache_max_messages,
+                    )
+                    self._cache.set_emails(
+                        selected_mailbox, recent.emails, coverage_since,
+                        complete=recent.total_matches == len(recent.emails),
+                    )
+                    cached = self._cache.get_emails(selected_mailbox)
+                    logger.info(
+                        "imap_cache tool=search_emails action=write status=refresh entries={} coverage_days={} max_messages={}",
+                        len(recent.emails), self._email_cache_days, self._email_cache_max_messages,
+                    )
+                if self._cache_covers_search(cached, since):
+                    result = self._filter_cached_emails(self._cached_emails(cached), **filters)
+                    logger.info(
+                        "imap_cache tool=search_emails action=read status=hit entries={}",
                         len(result),
                     )
                     return result
-
-                logger.info(
-                    "imap_cache tool=search_emails action=read status={}",
-                    "stale" if cached is not None else "miss",
-                )
-                coverage_since = self._email_cache_since()
-                recent_emails = self._search_live(
-                    selected_mailbox,
-                    since=coverage_since,
-                    limit=self._email_cache_max_messages,
-                )
-                self._cache.set_emails(selected_mailbox, recent_emails, coverage_since)
-                logger.info(
-                    "imap_cache tool=search_emails action=write status=refresh entries={} coverage_days={} max_messages={}",
-                    len(recent_emails),
-                    self._email_cache_days,
-                    self._email_cache_max_messages,
-                )
-                return self._filter_cached_emails(
-                    recent_emails,
-                    from_address=from_address,
-                    to_address=to_address,
-                    subject=subject,
-                    since=since,
-                    before=before,
-                    unread_only=unread_only,
-                    limit=limit,
-                )
-
-        bypass_reason = (
-            "full_text_query"
-            if query
-            else "range_outside_cache"
-            if cache_enabled
-            else "disabled"
-        )
+            bypass_reason = "incomplete_cache"
+        else:
+            bypass_reason = (
+                "full_text_query" if query else "range_outside_cache" if cache_enabled else "disabled"
+            )
         logger.info(
-            "imap_cache tool=search_emails action=read status=bypass reason={}",
-            bypass_reason,
+            "imap_cache tool=search_emails action=read status=bypass reason={}", bypass_reason,
         )
-        return self._search_live(
-            selected_mailbox,
-            from_address=from_address,
-            to_address=to_address,
-            subject=subject,
-            query=query,
-            since=since,
-            before=before,
-            unread_only=unread_only,
-            limit=limit,
-        )
+        return self._search_live(selected_mailbox, query=query, **filters).emails
 
     def _search_live(
         self,
@@ -393,7 +350,7 @@ class ICloudIMAPService:
         before: str | None = None,
         unread_only: bool = False,
         limit: int = 50,
-    ) -> list[dict[str, Any]]:
+    ) -> _HeaderSearchResult:
         criteria: list[str | bytes] = []
         if from_address:
             criteria.extend(("FROM", self._quote_search_value(from_address, "from_address")))
@@ -454,7 +411,10 @@ class ICloudIMAPService:
                     (perf_counter() - parse_started) * 1000,
                     len(batch),
                 )
-            return [result_by_uid[uid] for uid in selected_uids if uid in result_by_uid]
+            return _HeaderSearchResult(
+                emails=[result_by_uid[uid] for uid in selected_uids if uid in result_by_uid],
+                total_matches=len(uids),
+            )
 
     def _email_cache_enabled(self) -> bool:
         return (
@@ -468,12 +428,31 @@ class ICloudIMAPService:
         return (date.today() - timedelta(days=self._email_cache_days)).isoformat()
 
     def _cache_range_supported(self, since: str | None, before: str | None) -> bool:
+        if not since:
+            # A rolling window cannot cover an unbounded mailbox search.
+            return False
         coverage_since = self._parse_cache_date(self._email_cache_since(), "since")
         if since is not None and self._parse_cache_date(since, "since") < coverage_since:
             return False
         if before is not None and self._parse_cache_date(before, "before") <= coverage_since:
             return False
         return True
+
+    def _cache_covers_search(self, cached: Any, since: str | None) -> bool:
+        emails = self._cached_emails(cached)
+        if emails is None or not since or cached.value.get("complete") is not True:
+            return False
+        coverage_since = cached.value.get("coverage_since")
+        if not isinstance(coverage_since, str):
+            return False
+        try:
+            coverage_date = self._parse_cache_date(coverage_since, "coverage_since")
+        except ValueError:
+            return False
+        return (
+            self._parse_cache_date(since, "since") >= coverage_date
+            and all(email.get("internal_date") for email in emails)
+        )
 
     @staticmethod
     def _parse_cache_date(value: str, field: str) -> date:
@@ -531,7 +510,8 @@ class ICloudIMAPService:
 
     @staticmethod
     def _email_date(email: dict[str, Any]) -> date | None:
-        value = str(email.get("date") or "")
+        # IMAP SINCE/BEFORE use the server's INTERNALDATE, not the Date header.
+        value = str(email.get("internal_date") or "")
         if len(value) < 10:
             return None
         try:
@@ -540,9 +520,9 @@ class ICloudIMAPService:
             return None
 
     @staticmethod
-    def _email_sort_key(email: dict[str, Any]) -> tuple[str, int]:
+    def _email_sort_key(email: dict[str, Any]) -> int:
         uid = str(email.get("uid") or "")
-        return str(email.get("date") or ""), int(uid) if uid.isdigit() else 0
+        return int(uid) if uid.isdigit() else 0
 
     @classmethod
     def _parse_header_fetch(
@@ -577,6 +557,14 @@ class ICloudIMAPService:
                 mailbox=mailbox,
                 flags=cls._fetch_flags(item),
             )
+            match = re.search(rb'INTERNALDATE "([^"]+)"', metadata)
+            if match:
+                try:
+                    result[uid]["internal_date"] = parsedate_to_datetime(
+                        match.group(1).decode("ascii").replace("-", " ", 2)
+                    ).isoformat()
+                except (ValueError, TypeError, OverflowError):
+                    pass
         return result
 
     @classmethod
