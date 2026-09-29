@@ -1,5 +1,6 @@
 services:
   icloud-cruncher:
+    container_name: icloud-cruncher-mcp
     build: .
     ports:
       # Keep the write-capable MCP endpoint local. The tunnel reaches it over
