@@ -48,7 +48,8 @@ def create_mcp_server(
             "Use list_calendars before selecting a calendar when the calendar is unknown. "
             "Use ISO 8601 timestamps for timed events and YYYY-MM-DD for all-day events. "
             "Write and delete operations change the user's iCloud data; summarize the "
-            "planned change and obtain user approval before calling them."
+            "planned change and obtain user approval before calling them. Draft tools "
+            "upload messages to IMAP but never send them; the user sends drafts manually."
         ),
         version="0.3.0",
     )
@@ -353,6 +354,86 @@ def create_mcp_server(
                 mailbox=mailbox,
                 uid=uid,
                 max_body_chars=max_body_chars,
+            ),
+            imap_missing,
+        )
+
+    @server.tool(
+        name="create_draft",
+        title="Create an iCloud Mail draft",
+        description=(
+            "Create a draft in the configured iCloud Mail Drafts mailbox. Supports plain text "
+            "or HTML and optional base64-encoded attachments. The draft is uploaded but never "
+            "sent; send it manually from a mail client."
+        ),
+        annotations=WRITE_ANNOTATIONS,
+    )
+    async def create_draft(
+        to: list[str],
+        subject: str,
+        body: str,
+        cc: list[str] | None = None,
+        bcc: list[str] | None = None,
+        mailbox: str | None = None,
+        body_format: str = "plain",
+        attachments: list[dict[str, str]] | None = None,
+        from_address: str | None = None,
+    ) -> dict[str, Any]:
+        return await call_service(
+            imap_service,
+            "create_draft",
+            partial(
+                imap_service.create_draft if imap_service else lambda **_: {},
+                to=to,
+                subject=subject,
+                body=body,
+                cc=cc,
+                bcc=bcc,
+                mailbox=mailbox,
+                body_format=body_format,
+                attachments=attachments,
+                from_address=from_address,
+            ),
+            imap_missing,
+        )
+
+    @server.tool(
+        name="update_draft",
+        title="Update an iCloud Mail draft",
+        description=(
+            "Replace an existing draft with new recipients, subject, body, and optional "
+            "base64-encoded attachments. The old draft is marked deleted when safe. Nothing "
+            "is sent; send the resulting draft manually from a mail client."
+        ),
+        annotations=WRITE_ANNOTATIONS,
+    )
+    async def update_draft(
+        uid: str,
+        to: list[str],
+        subject: str,
+        body: str,
+        cc: list[str] | None = None,
+        bcc: list[str] | None = None,
+        mailbox: str | None = None,
+        body_format: str = "plain",
+        attachments: list[dict[str, str]] | None = None,
+        from_address: str | None = None,
+    ) -> dict[str, Any]:
+        return await call_service(
+            imap_service,
+            "update_draft",
+            partial(
+                imap_service.update_draft if imap_service else lambda **_: {},
+                uid=uid,
+                to=to,
+                subject=subject,
+                body=body,
+                cc=cc,
+                bcc=bcc,
+                mailbox=mailbox,
+                body_format=body_format,
+                attachments=attachments,
+                from_address=from_address,
             ),
             imap_missing,
         )

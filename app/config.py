@@ -21,6 +21,7 @@ DEFAULT_ICLOUD_TIMEZONE = "UTC"
 DEFAULT_IMAP_HOST = "imap.mail.me.com"
 DEFAULT_IMAP_PORT = 993
 DEFAULT_IMAP_MAILBOX = "INBOX"
+DEFAULT_IMAP_DRAFTS_MAILBOX = "Drafts"
 DEFAULT_IMAP_EMAIL_CACHE_TTL_SECONDS = 300
 DEFAULT_IMAP_EMAIL_CACHE_DAYS = 100
 DEFAULT_IMAP_EMAIL_CACHE_MAX_MESSAGES = 1000
@@ -48,6 +49,7 @@ class IMAPConfig:
     host: str = DEFAULT_IMAP_HOST
     port: int = DEFAULT_IMAP_PORT
     default_mailbox: str = DEFAULT_IMAP_MAILBOX
+    drafts_mailbox: str = DEFAULT_IMAP_DRAFTS_MAILBOX
 
 
 def normalize_source_url(source_url: str) -> str:
@@ -290,12 +292,20 @@ def load_imap_config(
         raw_imap.get("default_mailbox"),
     ) or DEFAULT_IMAP_MAILBOX
 
+    drafts_mailbox = _first_non_empty(
+        env.get("IMAP_DRAFTS_MAILBOX"),
+        env.get("ICLOUDCRUNCHER.IMAP_DRAFTS_MAILBOX"),
+        env.get("ICLOUD_CRUNCHER_IMAP_DRAFTS_MAILBOX"),
+        raw_imap.get("drafts_mailbox"),
+    ) or DEFAULT_IMAP_DRAFTS_MAILBOX
+
     return IMAPConfig(
         username=username,
         app_specific_password=app_specific_password,
         host=host,
         port=port,
         default_mailbox=default_mailbox,
+        drafts_mailbox=drafts_mailbox,
     )
 
 

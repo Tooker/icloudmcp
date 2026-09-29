@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import imaplib
 from typing import Any
 
@@ -69,6 +70,16 @@ class FakeIMAP:
     def expunge(self) -> tuple[str, list[bytes]]:
         self.calls.append(("EXPUNGE", ()))
         return "OK", [b"expunged"]
+
+    def append(
+        self,
+        mailbox: str,
+        flags: str,
+        date_time: Any,
+        message: bytes,
+    ) -> tuple[str, list[bytes]]:
+        self.calls.append(("APPEND", (mailbox, flags, date_time, message)))
+        return "OK", [b"[APPENDUID 1 77] APPEND completed"]
 
 
 class FailingLoginIMAP(FakeIMAP):
@@ -149,6 +160,49 @@ def test_email_write_invalidates_mailbox_cache(tmp_path) -> None:
     assert cache.get_emails("INBOX") is not None
     mail.mark_email_read("INBOX", "42", read=False)
     assert cache.get_emails("INBOX") is None
+
+
+def test_create_draft_appends_mime_message_with_attachment() -> None:
+    client = FakeIMAP()
+    mail = service_with(client)
+
+    draft = mail.create_draft(
+        to=["Bob <bob@example.com>"],
+        subject="A draft",
+        body="Hello from a draft",
+        attachments=[
+            {
+                "filename": "note.txt",
+                "content_type": "text/plain",
+                "content_base64": base64.b64encode(b"attachment").decode("ascii"),
+            }
+        ],
+    )
+
+    assert draft["created"] is True
+    assert draft["uid"] == "77"
+    assert draft["attachment_count"] == 1
+    append = next(call for call in client.calls if call[0] == "APPEND")
+    assert append[1][0] == '"Drafts"'
+    assert b"Subject: A draft" in append[1][3]
+    assert b"note.txt" in append[1][3]
+
+
+def test_update_draft_replaces_old_draft_without_sending() -> None:
+    client = FakeIMAP()
+    mail = service_with(client)
+
+    updated = mail.update_draft(
+        uid="42",
+        to=["Bob <bob@example.com>"],
+        subject="Updated draft",
+        body="Updated body",
+    )
+
+    assert updated["updated"] is True
+    assert updated["uid"] == "77"
+    assert updated["old_draft_marked_deleted"] is True
+    assert any(call[0] == "STORE" for call in client.calls)
 
 
 def test_write_operations_mark_move_and_delete_by_uid() -> None:

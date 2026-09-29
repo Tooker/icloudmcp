@@ -5,9 +5,9 @@ import imaplib
 import re
 from contextlib import contextmanager
 from collections.abc import Callable, Iterator
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from email import policy
-from email.message import Message
+from email.message import EmailMessage, Message
 from email.parser import BytesParser
 from email.utils import parsedate_to_datetime
 from loguru import logger
@@ -39,6 +39,8 @@ class ICloudIMAPService:
 
     _MAX_LIMIT = 1000
     _MAX_BODY_CHARS = 100_000
+    _MAX_DRAFT_BYTES = 25_000_000
+    _MAX_ATTACHMENT_BYTES = 10_000_000
     _HEADER_FETCH_BATCH_SIZE = 100
     _FETCH_HEADERS = (
         "(UID FLAGS BODY.PEEK[HEADER.FIELDS "
@@ -411,6 +413,230 @@ class ICloudIMAPService:
             )
             result.update(self._message_body(message, max_body_chars))
             return result
+
+    def create_draft(
+        self,
+        to: list[str],
+        subject: str,
+        body: str,
+        cc: list[str] | None = None,
+        bcc: list[str] | None = None,
+        mailbox: str | None = None,
+        body_format: str = "plain",
+        attachments: list[dict[str, str]] | None = None,
+        from_address: str | None = None,
+    ) -> dict[str, Any]:
+        selected_mailbox = self._draft_mailbox(mailbox)
+        message, attachment_count = self._build_draft_message(
+            to=to,
+            subject=subject,
+            body=body,
+            cc=cc,
+            bcc=bcc,
+            body_format=body_format,
+            attachments=attachments,
+            from_address=from_address,
+        )
+
+        with self._connected() as client:
+            uid = self._append_draft(client, selected_mailbox, message)
+        self._invalidate_email_cache("create_draft", selected_mailbox)
+        return {
+            "created": True,
+            "mailbox": selected_mailbox,
+            "uid": uid,
+            "subject": subject.strip(),
+            "attachment_count": attachment_count,
+        }
+
+    def update_draft(
+        self,
+        uid: str,
+        to: list[str],
+        subject: str,
+        body: str,
+        cc: list[str] | None = None,
+        bcc: list[str] | None = None,
+        mailbox: str | None = None,
+        body_format: str = "plain",
+        attachments: list[dict[str, str]] | None = None,
+        from_address: str | None = None,
+    ) -> dict[str, Any]:
+        uid = self._uid(uid)
+        selected_mailbox = self._draft_mailbox(mailbox)
+        message, attachment_count = self._build_draft_message(
+            to=to,
+            subject=subject,
+            body=body,
+            cc=cc,
+            bcc=bcc,
+            body_format=body_format,
+            attachments=attachments,
+            from_address=from_address,
+        )
+
+        with self._connected() as client:
+            new_uid = self._append_draft(client, selected_mailbox, message)
+            self._select(client, selected_mailbox, readonly=False)
+            status, _ = client.uid("STORE", uid, "+FLAGS.SILENT", r"(\Deleted)")
+            self._ensure_ok(status, "IMAP draft replacement failed")
+            old_expunged = self._expunge_uid_safely(client, uid)
+        self._invalidate_email_cache("update_draft", selected_mailbox)
+        return {
+            "updated": True,
+            "mailbox": selected_mailbox,
+            "old_uid": uid,
+            "uid": new_uid,
+            "old_draft_marked_deleted": True,
+            "old_draft_expunged": old_expunged,
+            "subject": subject.strip(),
+            "attachment_count": attachment_count,
+        }
+
+    def _draft_mailbox(self, mailbox: str | None) -> str:
+        return self._mailbox(mailbox or self.config.drafts_mailbox)
+
+    def _build_draft_message(
+        self,
+        *,
+        to: list[str],
+        subject: str,
+        body: str,
+        cc: list[str] | None,
+        bcc: list[str] | None,
+        body_format: str,
+        attachments: list[dict[str, str]] | None,
+        from_address: str | None,
+    ) -> tuple[EmailMessage, int]:
+        recipients = {
+            "To": self._draft_recipients(to, "to"),
+            "Cc": self._draft_recipients(cc or [], "cc"),
+            "Bcc": self._draft_recipients(bcc or [], "bcc"),
+        }
+        if not any(recipients.values()):
+            raise ValueError("at least one recipient is required")
+
+        subject = self._draft_header(subject, "subject")
+        if not isinstance(body, str):
+            raise ValueError("body must be a string")
+        if len(body.encode("utf-8")) > self._MAX_DRAFT_BYTES:
+            raise ValueError("body is too large")
+        body_format = body_format.strip().casefold()
+        if body_format not in {"plain", "html"}:
+            raise ValueError("body_format must be plain or html")
+
+        message = EmailMessage(policy=policy.SMTP)
+        message["From"] = self._draft_header(from_address or self.config.username, "from_address")
+        message["Subject"] = subject
+        for header, values in recipients.items():
+            if values:
+                message[header] = ", ".join(values)
+        if body_format == "html":
+            message.add_alternative(body, subtype="html")
+        else:
+            message.set_content(body)
+
+        attachment_count = 0
+        total_attachment_bytes = 0
+        for attachment in attachments or []:
+            payload, filename, content_type = self._draft_attachment(attachment)
+            total_attachment_bytes += len(payload)
+            if total_attachment_bytes > self._MAX_DRAFT_BYTES:
+                raise ValueError("attachments are too large")
+            maintype, subtype = content_type.split("/", 1)
+            message.add_attachment(
+                payload,
+                maintype=maintype,
+                subtype=subtype,
+                filename=filename,
+            )
+            attachment_count += 1
+
+        if len(message.as_bytes()) > self._MAX_DRAFT_BYTES:
+            raise ValueError("draft is too large")
+        return message, attachment_count
+
+    @staticmethod
+    def _draft_recipients(values: list[str], field: str) -> list[str]:
+        if not isinstance(values, list):
+            raise ValueError(f"{field} must be a list of email addresses")
+        result: list[str] = []
+        for value in values:
+            if not isinstance(value, str):
+                raise ValueError(f"{field} must contain strings")
+            normalized = value.strip()
+            if not normalized:
+                continue
+            if any(character in normalized for character in "\r\n"):
+                raise ValueError(f"{field} must not contain line breaks")
+            result.append(normalized)
+        return result
+
+    @staticmethod
+    def _draft_header(value: str, field: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{field} must not be empty")
+        normalized = value.strip()
+        if any(character in normalized for character in "\r\n"):
+            raise ValueError(f"{field} must not contain line breaks")
+        return normalized
+
+    def _draft_attachment(
+        self,
+        attachment: dict[str, str],
+    ) -> tuple[bytes, str, str]:
+        if not isinstance(attachment, dict):
+            raise ValueError("attachments must contain objects")
+        filename = attachment.get("filename")
+        content_base64 = attachment.get("content_base64")
+        content_type = attachment.get("content_type") or "application/octet-stream"
+        if not isinstance(filename, str) or not filename.strip():
+            raise ValueError("attachment filename must not be empty")
+        filename = filename.strip()
+        if any(
+            character in filename
+            for character in "\\/\r\n"
+        ) or any(ord(character) < 32 or ord(character) == 127 for character in filename):
+            raise ValueError("attachment filename is invalid")
+        if not isinstance(content_base64, str) or not content_base64:
+            raise ValueError("attachment content_base64 must not be empty")
+        try:
+            payload = base64.b64decode(content_base64, validate=True)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("attachment content_base64 is invalid") from exc
+        if len(payload) > self._MAX_ATTACHMENT_BYTES:
+            raise ValueError("attachment is too large")
+        if (
+            not isinstance(content_type, str)
+            or not re.fullmatch(r"[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+", content_type)
+        ):
+            raise ValueError("attachment content_type must be a MIME type")
+        return payload, filename, content_type.lower()
+
+    def _append_draft(
+        self,
+        client: Any,
+        mailbox: str,
+        message: EmailMessage,
+    ) -> str | None:
+        status, data = client.append(
+            self._quote_mailbox(mailbox),
+            r"(\Draft)",
+            imaplib.Time2Internaldate(datetime.now(timezone.utc)),
+            message.as_bytes(),
+        )
+        self._ensure_ok(status, "IMAP draft creation failed")
+        return self._append_uid(data)
+
+    @staticmethod
+    def _append_uid(data: Any) -> str | None:
+        for item in data or []:
+            if not isinstance(item, bytes):
+                continue
+            match = re.search(rb"APPENDUID\s+\d+\s+(\d+)", item, re.IGNORECASE)
+            if match:
+                return match.group(1).decode("ascii")
+        return None
 
     def mark_email_read(
         self,

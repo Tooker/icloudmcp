@@ -258,6 +258,7 @@ icloud:
   app_specific_password: app-password
 imap:
   default_mailbox: Archive
+  drafts_mailbox: Entwürfe
 """,
     )
 
@@ -269,6 +270,7 @@ imap:
     assert config.host == "imap.mail.me.com"
     assert config.port == 993
     assert config.default_mailbox == "Archive"
+    assert config.drafts_mailbox == "Entwürfe"
 
 
 def test_imap_environment_overrides_yaml(tmp_path: Path) -> None:

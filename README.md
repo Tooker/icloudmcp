@@ -56,6 +56,7 @@ IMAP_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx
 IMAP_HOST=imap.mail.me.com
 IMAP_PORT=993
 IMAP_DEFAULT_MAILBOX=INBOX
+IMAP_DRAFTS_MAILBOX=Drafts
 IMAP_EMAIL_CACHE_TTL_SECONDS=300
 IMAP_EMAIL_CACHE_DAYS=100
 IMAP_EMAIL_CACHE_MAX_MESSAGES=1000
@@ -74,14 +75,20 @@ The MCP server provides:
 - `search_emails` — search by sender, recipient, subject, text, dates, or unread status.
 - `get_email` — read one message by its mailbox-local UID without marking it read. Bodies
   are bounded; attachments are returned as metadata only.
+- `create_draft` — upload a plain-text or HTML draft, optionally with base64-encoded
+  attachments. It never sends the message.
+- `update_draft` — replace an existing draft with new content and optional attachments.
+  It never sends the message.
 - `mark_email_read` — set or clear the `\Seen` flag.
 - `move_email` — copy a message to another mailbox and mark the source for deletion.
 - `delete_email` — delete a message; it requires `confirm=true` and may leave a safe
   deletion marker when the server cannot isolate an IMAP expunge.
 
 IMAP operations use mailbox-local UIDs, so callers should use the UID together with the
-mailbox returned by `search_emails`. IMAP is not an outgoing mail protocol; sending is
-intentionally not implemented.
+mailbox returned by `search_emails`. Drafts default to the `Drafts` mailbox and can be
+redirected with `IMAP_DRAFTS_MAILBOX` or the tool's `mailbox` argument. Attachments are
+passed as objects with `filename`, `content_type`, and `content_base64`. IMAP sending is
+intentionally not implemented; send the uploaded draft manually from a mail client.
 
 The IMAP read cache keeps up to the 1,000 newest message headers per mailbox from the
 last 100 days in the same persistent SQLite volume as the calendar cache. It refreshes
