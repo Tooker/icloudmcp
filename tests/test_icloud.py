@@ -64,6 +64,13 @@ class FakeCalendar:
         return resource
 
 
+class ICloudUIDReportCalendar(FakeCalendar):
+    def get_event_by_uid(self, uid: str) -> FakeResource:
+        from caldav.lib.error import ReportError
+
+        raise ReportError("412 Precondition Failed")
+
+
 class FakeClient:
     def __init__(self, calendars: list[FakeCalendar]) -> None:
         self.calendars = calendars
@@ -133,6 +140,22 @@ def test_list_events_filters_query_and_serializes_all_day() -> None:
     assert events[0]["start"] == "2026-01-03"
     assert events[0]["end"] == "2026-01-05"
     assert events[0]["all_day"] is True
+
+
+def test_get_event_falls_back_when_icloud_rejects_uid_report() -> None:
+    calendar = ICloudUIDReportCalendar("personal-id", "Personal")
+    service = service_with(calendar)
+    created = service.create_event(
+        calendar="Personal",
+        title="Fallback lookup",
+        start="2026-01-03T09:00:00+01:00",
+        end="2026-01-03T10:00:00+01:00",
+    )
+
+    event = service.get_event("Personal", created["uid"])
+
+    assert event["uid"] == created["uid"]
+    assert event["summary"] == "Fallback lookup"
 
 
 def test_multiple_calendars_require_selector_for_writes() -> None:

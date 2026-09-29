@@ -271,6 +271,51 @@ class ICloudCalendarService:
             return getter(uid)
         except caldav_error.NotFoundError as exc:
             raise EventNotFoundError(f"Event not found: {uid}") from exc
+        except caldav_error.ReportError as exc:
+            if not self._is_precondition_failed(exc):
+                raise
+            return self._find_event_by_uid_with_time_range(calendar, uid)
+
+    def _find_event_by_uid_with_time_range(self, calendar: Any, uid: str) -> Any:
+        """Work around iCloud rejecting UID-only calendar-query REPORTs.
+
+        iCloud accepts calendar queries with a time range but responds with
+        ``412 Precondition Failed`` to the UID-only query used by
+        ``Calendar.get_event_by_uid``. Search progressively wider windows and
+        compare the UID locally instead of relying on that server-side filter.
+        """
+
+        zone = self._zone(None)
+        now = datetime.now(zone)
+        for days in (365, 3650):
+            search_start = now - timedelta(days=days)
+            search_end = now + timedelta(days=days)
+            for resource in calendar.search(
+                event=True,
+                start=search_start,
+                end=search_end,
+            ):
+                if self._resource_uid(resource) == uid:
+                    return resource
+
+        raise EventNotFoundError(f"Event not found: {uid}")
+
+    @staticmethod
+    def _is_precondition_failed(exc: caldav_error.ReportError) -> bool:
+        response_status = str(getattr(exc, "url", "") or "").strip()
+        return response_status.startswith("412 Precondition Failed")
+
+    def _resource_uid(self, resource: Any) -> str | None:
+        component = resource.get_icalendar_component()
+        component_uid = self._component_text(component, "UID")
+        if component_uid:
+            return component_uid
+
+        resource_id = getattr(resource, "id", None)
+        if resource_id is None:
+            return None
+        resource_id = str(resource_id).strip()
+        return resource_id or None
 
     def _calendar_summary(self, calendar: Any) -> dict[str, Any]:
         identifier = getattr(calendar, "id", None)
