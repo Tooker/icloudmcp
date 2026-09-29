@@ -19,12 +19,16 @@ from app.config import (
     ICloudConfig,
     IMAPConfig,
     cache_ttl_seconds,
+    icloud_cache_path,
+    icloud_cache_ttl_seconds,
+    icloud_calendars_cache_ttl_seconds,
     load_calendars,
     load_imap_config,
     load_icloud_config,
     public_url_for_token,
 )
 from app.icloud import ICloudCalendarService
+from app.icloud_cache import SQLiteICloudCalendarCache
 from app.imap import ICloudIMAPService
 from app.mcp_server import create_mcp_server
 
@@ -72,9 +76,19 @@ def create_app(
     calendars = load_calendars(config_path, environ)
     icloud_config: ICloudConfig | None = load_icloud_config(config_path, environ)
     imap_config: IMAPConfig | None = load_imap_config(config_path, environ)
-    service = icloud_service or (
-        ICloudCalendarService(icloud_config) if icloud_config is not None else None
-    )
+    if icloud_service is not None:
+        service = icloud_service
+        icloud_cache = getattr(icloud_service, "_cache", None)
+    elif icloud_config is not None:
+        icloud_cache = SQLiteICloudCalendarCache(
+            icloud_cache_path(environ),
+            events_ttl_seconds=icloud_cache_ttl_seconds(environ),
+            calendars_ttl_seconds=icloud_calendars_cache_ttl_seconds(environ),
+        )
+        service = ICloudCalendarService(icloud_config, cache=icloud_cache)
+    else:
+        icloud_cache = None
+        service = None
     mail_service = imap_service or (
         ICloudIMAPService(imap_config) if imap_config is not None else None
     )
@@ -113,9 +127,17 @@ def create_app(
     app.state.calendars = calendars
     app.state.calendar_cache = cache
     app.state.icloud_service = service
+    app.state.icloud_cache = icloud_cache
     app.state.imap_service = mail_service
     app.state.mcp_server = mcp_server
     logger.info("calendar_cache ttl_seconds={}", cache.ttl_seconds)
+    if icloud_cache is not None:
+        logger.info(
+            "icloud_cache_backend type=sqlite path={} events_ttl_seconds={} calendars_ttl_seconds={}",
+            icloud_cache.path,
+            icloud_cache.events_ttl_seconds,
+            icloud_cache.calendars_ttl_seconds,
+        )
     if service is None:
         logger.warning(
             "iCloud CalDAV is not configured; MCP tools require ICLOUD_USERNAME and ICLOUD_APP_PASSWORD"

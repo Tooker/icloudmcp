@@ -88,6 +88,13 @@ The service listens on `http://127.0.0.1:8080/mcp` locally. The MCP endpoint
 does not expose iCloud credentials, source URLs, or raw iCalendar payloads in
 tool results.
 
+Read results from iCloud Calendar use a persistent SQLite cache. Calendar lists
+are cached for 300 seconds and event results for 60 seconds by default; a
+successful create, update, or delete invalidates the event cache. iCloud stays
+the source of truth, and the cache stores only normalized calendar/event data,
+not credentials. The Docker Compose setup stores the database in the named
+`icloud-cache` volume so it survives container restarts.
+
 ## Configuration
 
 `config.yaml` is intentionally ignored by git because shared calendar URLs and
@@ -113,6 +120,11 @@ ICLOUDCRUNCHER.1.URL="webcal://p106-caldav.icloud.com/published/2/..."
 YAML and environment calendars are combined. Set `ICLOUDCRUNCHER.BASE_URL` if startup logs should show full external URLs instead of only `/<token>`.
 
 Calendar responses are cached in memory for 300 seconds by default. Override with `ICLOUDCRUNCHER.CACHE_TTL_SECONDS`. Set it to `0` to disable fresh cache hits while still keeping the last successful response as an upstream-error fallback.
+
+The MCP cache can be tuned independently with `ICLOUD_CACHE_TTL_SECONDS` for
+events, `ICLOUD_CALENDARS_CACHE_TTL_SECONDS` for calendar lists, and
+`ICLOUD_CACHE_PATH` for the SQLite file path. Set either TTL to `0` to disable
+fresh hits for that data type.
 
 Because dots are not valid in normal shell variable assignment, use one of these forms for env-only local testing:
 
@@ -170,10 +182,10 @@ There is no calendar listing endpoint. Unknown tokens return a neutral `404`.
 
 ## Logging
 
-The app uses `loguru` and logs incoming requests plus upstream iCloud fetch results. Upstream logs include token, status, duration, content type, and response size, but not the configured iCloud source URL.
+The app uses `loguru` and logs incoming requests plus upstream iCloud fetch results. Upstream logs include token, status, duration, content type, and response size, but not the configured iCloud source URL. Every MCP call logs `mcp_tool_start` and `mcp_tool_complete` with the tool name, outcome, duration, and (where applicable) result count. Cache logs use the same tool name and show hit, miss, stale, or refresh without logging event contents.
 
 At startup, the app logs every URL path it answers. With `ICLOUDCRUNCHER.BASE_URL=https://calendar.example.com`, it logs full external URLs.
-Cache logs include `cache_hit` for fresh cached responses and `cache_stale_fallback` when iCloud is unavailable but a previous response can still be served.
+Cache logs include `cache_hit` for fresh public-calendar responses and `cache_stale_fallback` when iCloud is unavailable but a previous response can still be served. MCP cache logs use `icloud_cache tool=<name>`.
 
 ## Useful references
 

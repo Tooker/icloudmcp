@@ -13,6 +13,9 @@ from loguru import logger
 DEFAULT_CONFIG_PATH = Path(os.environ.get("ICLOUD_CRUNCHER_CONFIG", "config.yaml"))
 ENV_PREFIX = "ICLOUDCRUNCHER."
 DEFAULT_CACHE_TTL_SECONDS = 300
+DEFAULT_ICLOUD_CACHE_PATH = Path("data/icloud-calendar-cache.sqlite3")
+DEFAULT_ICLOUD_CACHE_TTL_SECONDS = 60
+DEFAULT_ICLOUD_CALENDARS_CACHE_TTL_SECONDS = 300
 DEFAULT_ICLOUD_CALDAV_URL = "https://caldav.icloud.com/"
 DEFAULT_ICLOUD_TIMEZONE = "UTC"
 DEFAULT_IMAP_HOST = "imap.mail.me.com"
@@ -315,6 +318,61 @@ def cache_ttl_seconds(environ: dict[str, str] | None = None) -> int:
     if ttl < 0:
         raise ValueError("ICLOUDCRUNCHER.CACHE_TTL_SECONDS must not be negative")
     return ttl
+
+
+def icloud_cache_path(environ: dict[str, str] | None = None) -> Path:
+    env = os.environ if environ is None else environ
+    raw_path = (
+        env.get("ICLOUD_CACHE_PATH")
+        or env.get("ICLOUDCRUNCHER.ICLOUD_CACHE_PATH")
+        or env.get("ICLOUD_CRUNCHER_ICLOUD_CACHE_PATH")
+    )
+    return Path(raw_path) if raw_path else DEFAULT_ICLOUD_CACHE_PATH
+
+
+def icloud_cache_ttl_seconds(environ: dict[str, str] | None = None) -> int:
+    return _positive_or_zero_int(
+        environ,
+        (
+            "ICLOUD_CACHE_TTL_SECONDS",
+            "ICLOUDCRUNCHER.ICLOUD_CACHE_TTL_SECONDS",
+            "ICLOUD_CRUNCHER_ICLOUD_CACHE_TTL_SECONDS",
+        ),
+        DEFAULT_ICLOUD_CACHE_TTL_SECONDS,
+        "ICLOUD_CACHE_TTL_SECONDS",
+    )
+
+
+def icloud_calendars_cache_ttl_seconds(environ: dict[str, str] | None = None) -> int:
+    return _positive_or_zero_int(
+        environ,
+        (
+            "ICLOUD_CALENDARS_CACHE_TTL_SECONDS",
+            "ICLOUDCRUNCHER.ICLOUD_CALENDARS_CACHE_TTL_SECONDS",
+            "ICLOUD_CRUNCHER_ICLOUD_CALENDARS_CACHE_TTL_SECONDS",
+        ),
+        DEFAULT_ICLOUD_CALENDARS_CACHE_TTL_SECONDS,
+        "ICLOUD_CALENDARS_CACHE_TTL_SECONDS",
+    )
+
+
+def _positive_or_zero_int(
+    environ: dict[str, str] | None,
+    names: tuple[str, ...],
+    default: int,
+    setting_name: str,
+) -> int:
+    env = os.environ if environ is None else environ
+    raw_value = next((env.get(name) for name in names if env.get(name) is not None), None)
+    if raw_value is None:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{setting_name} must be an integer") from exc
+    if value < 0:
+        raise ValueError(f"{setting_name} must not be negative")
+    return value
 
 
 def _load_yaml(config_path: Path) -> dict[str, Any]:

@@ -8,6 +8,7 @@ services:
       - "127.0.0.1:8080:8080"
     volumes:
       - ./config.yaml:/app/config.yaml:ro
+      - icloud-cache:/data
     environment:
       ICLOUD_CRUNCHER_CONFIG: /app/config.yaml
       ICLOUD_USERNAME: ${ICLOUD_USERNAME:-}
@@ -23,6 +24,10 @@ services:
       # ICLOUDCRUNCHER.BASE_URL: https://calendar.example.com
       # Optional: in-memory calendar cache TTL in seconds. Default: 300.
       # ICLOUDCRUNCHER.CACHE_TTL_SECONDS: "300"
+      # Persistent MCP read cache. Events default to 60 seconds, calendars to 300.
+      ICLOUD_CACHE_PATH: /data/icloud-calendar-cache.sqlite3
+      ICLOUD_CACHE_TTL_SECONDS: ${ICLOUD_CACHE_TTL_SECONDS:-60}
+      ICLOUD_CALENDARS_CACHE_TTL_SECONDS: ${ICLOUD_CALENDARS_CACHE_TTL_SECONDS:-300}
       # Optional env-only calendars. Quote keys because they contain dots.
       # ICLOUDCRUNCHER.0.token: your-secret-token
       # ICLOUDCRUNCHER.0.URL: webcal://p106-caldav.icloud.com/published/2/...
@@ -44,3 +49,6 @@ services:
       LOG_FORMAT: json
       HEALTH_LISTEN_ADDR: :8081
     restart: unless-stopped
+
+volumes:
+  icloud-cache:

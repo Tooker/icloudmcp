@@ -9,6 +9,7 @@ from icalendar import Calendar
 
 from app.config import ICloudConfig
 from app.icloud import CalendarNotFoundError, ICloudCalendarService
+from app.icloud_cache import SQLiteICloudCalendarCache
 
 
 class FakeResource:
@@ -84,8 +85,10 @@ class FakeClient:
     def __init__(self, calendars: list[FakeCalendar]) -> None:
         self.calendars = calendars
         self.session = FakeSession()
+        self.get_calendars_calls = 0
 
     def get_calendars(self) -> list[FakeCalendar]:
+        self.get_calendars_calls += 1
         return self.calendars
 
     def close(self) -> None:
@@ -138,6 +141,24 @@ def test_connected_client_disables_http3() -> None:
 
     with service._connected_client() as client:
         assert client.session.disable_http3 is True
+
+
+def test_list_calendars_uses_persistent_cache(tmp_path) -> None:
+    client = FakeClient([FakeCalendar("work-id", "Work")])
+    config = ICloudConfig(
+        username="user@example.com",
+        app_specific_password="app-password",
+        timezone="Europe/Berlin",
+    )
+    service = ICloudCalendarService(
+        config,
+        client_factory=lambda **_: client,
+        cache=SQLiteICloudCalendarCache(tmp_path / "cache.sqlite3"),
+    )
+
+    assert service.list_calendars() == [{"id": "work-id", "name": "Work"}]
+    assert service.list_calendars() == [{"id": "work-id", "name": "Work"}]
+    assert client.get_calendars_calls == 1
 
 
 def test_list_events_filters_query_and_serializes_all_day() -> None:

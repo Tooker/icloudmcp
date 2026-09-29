@@ -11,8 +11,10 @@ from caldav import DAVClient
 from caldav.lib import error as caldav_error
 from icalendar import Calendar as ICalendar
 from icalendar import Event as ICalendarEvent
+from loguru import logger
 
 from app.config import ICloudConfig
+from app.icloud_cache import SQLiteICloudCalendarCache
 
 
 class ICloudServiceError(RuntimeError):
@@ -39,9 +41,11 @@ class ICloudCalendarService:
         self,
         config: ICloudConfig,
         client_factory: Callable[..., Any] = DAVClient,
+        cache: SQLiteICloudCalendarCache | None = None,
     ) -> None:
         self.config = config
         self._client_factory = client_factory
+        self._cache = cache
 
     @contextmanager
     def _connected_client(self) -> Iterator[Any]:
@@ -87,8 +91,28 @@ class ICloudCalendarService:
             close()
 
     def list_calendars(self) -> list[dict[str, Any]]:
+        if self._cache is not None:
+            cached = self._cache.get_calendars()
+            if cached is not None and cached.fresh:
+                logger.info(
+                    "icloud_cache tool=list_calendars status=hit entries={}",
+                    len(cached.value),
+                )
+                return cached.value
+            logger.info(
+                "icloud_cache tool=list_calendars status={}",
+                "stale" if cached is not None else "miss",
+            )
+
         with self._connected_client() as client:
-            return [self._calendar_summary(calendar) for calendar in client.get_calendars()]
+            result = [self._calendar_summary(calendar) for calendar in client.get_calendars()]
+        if self._cache is not None:
+            self._cache.set_calendars(result)
+            logger.info(
+                "icloud_cache tool=list_calendars status=refresh entries={}",
+                len(result),
+            )
+        return result
 
     def list_events(
         self,
@@ -102,10 +126,40 @@ class ICloudCalendarService:
             raise ValueError("limit must be between 1 and 200")
 
         search_start, search_end = self._search_window(start, end)
+        cache_start = self._cache_datetime(search_start)
+        cache_end = self._cache_datetime(search_end)
+
+        if self._cache is not None:
+            cached_calendars = self._cache.get_calendars()
+            if cached_calendars is not None and cached_calendars.fresh:
+                selected_summaries = self._resolve_calendar_summaries(
+                    cached_calendars.value,
+                    calendar,
+                )
+                cached_events: list[dict[str, Any]] = []
+                all_cache_hits = True
+                for summary in selected_summaries:
+                    cached = self._cache.get_events(
+                        summary["id"],
+                        cache_start,
+                        cache_end,
+                    )
+                    if cached is None or not cached.fresh:
+                        all_cache_hits = False
+                        break
+                    cached_events.extend(cached.value)
+                if all_cache_hits:
+                    logger.info(
+                        "icloud_cache tool=list_events status=hit calendars={} entries={}",
+                        len(selected_summaries),
+                        len(cached_events),
+                    )
+                    return self._filter_events(cached_events, query, limit)
+            logger.info("icloud_cache tool=list_events status=miss")
+
         with self._connected_client() as client:
             calendars = self._selected_calendars(client, calendar)
             events: list[dict[str, Any]] = []
-            normalized_query = query.strip().casefold() if query else None
 
             for target_calendar in calendars:
                 summary = self._calendar_summary(target_calendar)
@@ -114,21 +168,45 @@ class ICloudCalendarService:
                     start=search_start,
                     end=search_end,
                 )
-                for resource in search_results:
-                    item = self._event_summary(resource, summary)
-                    if normalized_query and not self._matches_query(item, normalized_query):
-                        continue
-                    events.append(item)
+                calendar_events = [
+                    self._event_summary(resource, summary) for resource in search_results
+                ]
+                events.extend(calendar_events)
+                if self._cache is not None:
+                    self._cache.set_events(
+                        summary["id"],
+                        cache_start,
+                        cache_end,
+                        calendar_events,
+                    )
 
-            events.sort(key=lambda item: item.get("start") or "")
-            return events[:limit]
+            if self._cache is not None:
+                logger.info(
+                    "icloud_cache tool=list_events status=refresh entries={}",
+                    len(events),
+                )
+            return self._filter_events(events, query, limit)
 
     def get_event(self, calendar: str, uid: str) -> dict[str, Any]:
         uid = self._require_text(uid, "uid")
+        if self._cache is not None:
+            cached = self._cache.get_event(calendar, uid)
+            if cached is not None and cached.fresh:
+                logger.info("icloud_cache tool=get_event status=hit")
+                return cached.value
+            logger.info(
+                "icloud_cache tool=get_event status={}",
+                "stale" if cached is not None else "miss",
+            )
+
         with self._connected_client() as client:
             target_calendar, calendar_summary = self._resolve_calendar(client, calendar)
             resource = self._get_event_resource(target_calendar, uid)
-            return self._event_summary(resource, calendar_summary)
+            result = self._event_summary(resource, calendar_summary)
+        if self._cache is not None:
+            self._cache.set_event(result)
+            logger.info("icloud_cache tool=get_event status=refresh")
+        return result
 
     def create_event(
         self,
@@ -169,7 +247,10 @@ class ICloudCalendarService:
         with self._connected_client() as client:
             target_calendar, calendar_summary = self._resolve_calendar(client, calendar)
             resource = target_calendar.add_event(icalendar.to_ical())
-            return self._event_summary(resource, calendar_summary)
+            result = self._event_summary(resource, calendar_summary)
+        if self._cache is not None:
+            self._cache.invalidate_events()
+        return result
 
     def update_event(
         self,
@@ -238,7 +319,10 @@ class ICloudCalendarService:
                     self._replace_component_value(component, "DTEND", new_end)
 
             resource.save()
-            return self._event_summary(resource, calendar_summary)
+            result = self._event_summary(resource, calendar_summary)
+        if self._cache is not None:
+            self._cache.invalidate_events()
+        return result
 
     def delete_event(self, calendar: str, uid: str) -> dict[str, Any]:
         uid = self._require_text(uid, "uid")
@@ -246,21 +330,26 @@ class ICloudCalendarService:
             target_calendar, calendar_summary = self._resolve_calendar(client, calendar)
             resource = self._get_event_resource(target_calendar, uid)
             resource.delete()
-            return {
+            result = {
                 "deleted": True,
                 "uid": uid,
                 "calendar_id": calendar_summary["id"],
                 "calendar_name": calendar_summary["name"],
             }
+        if self._cache is not None:
+            self._cache.invalidate_events()
+        return result
 
     def _selected_calendars(self, client: Any, selector: str | None) -> list[Any]:
         calendars = list(client.get_calendars())
+        self._cache_calendars(calendars)
         if selector is None or not selector.strip():
             return calendars
         return [self._resolve_calendar_from_list(calendars, selector)[0]]
 
     def _resolve_calendar(self, client: Any, selector: str | None) -> tuple[Any, dict[str, Any]]:
         calendars = list(client.get_calendars())
+        self._cache_calendars(calendars)
         calendar, summary = self._resolve_calendar_from_list(calendars, selector)
         return calendar, summary
 
@@ -290,6 +379,50 @@ class ICloudCalendarService:
                 return calendar, summary
 
         raise CalendarNotFoundError(f"Calendar not found: {effective_selector}")
+
+    def _cache_calendars(self, calendars: list[Any]) -> None:
+        if self._cache is None:
+            return
+        self._cache.set_calendars([self._calendar_summary(calendar) for calendar in calendars])
+
+    def _resolve_calendar_summaries(
+        self,
+        summaries: list[dict[str, Any]],
+        selector: str | None,
+    ) -> list[dict[str, Any]]:
+        if not summaries:
+            raise CalendarNotFoundError("No iCloud calendars are available")
+
+        effective_selector = (selector or self.config.default_calendar or "").strip()
+        if not effective_selector:
+            return summaries
+
+        normalized_selector = effective_selector.casefold()
+        for summary in summaries:
+            if effective_selector == summary["id"] or effective_selector == summary["name"]:
+                return [summary]
+            if normalized_selector == summary["name"].casefold():
+                return [summary]
+
+        raise CalendarNotFoundError(f"Calendar not found: {effective_selector}")
+
+    def _filter_events(
+        self,
+        events: list[dict[str, Any]],
+        query: str | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        normalized_query = query.strip().casefold() if query else None
+        if normalized_query:
+            events = [
+                event for event in events if self._matches_query(event, normalized_query)
+            ]
+        events.sort(key=lambda item: item.get("start") or "")
+        return events[:limit]
+
+    @staticmethod
+    def _cache_datetime(value: datetime) -> str:
+        return value.replace(microsecond=0).isoformat()
 
     def _get_event_resource(self, calendar: Any, uid: str) -> Any:
         try:

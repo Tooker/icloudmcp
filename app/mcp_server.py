@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from functools import partial
+from time import perf_counter
 from typing import Any, Callable, TypeVar
 
 from loguru import logger
@@ -58,21 +59,65 @@ def create_mcp_server(
         function: Callable[[], ResultT],
         missing_message: str,
     ) -> ResultT:
+        started = perf_counter()
+        logger.info("mcp_tool_start tool={}", operation)
         if target is None:
+            _log_tool_complete(operation, started, "not_configured")
             raise RuntimeError(missing_message)
         try:
-            return await asyncio.to_thread(function)
+            result = await asyncio.to_thread(function)
+            _log_tool_complete(
+                operation,
+                started,
+                "ok",
+                result_count=_result_count(result),
+            )
+            return result
         except (ICloudServiceError, IMAPServiceError, ValueError) as exc:
+            _log_tool_complete(
+                operation,
+                started,
+                "validation_error",
+                error_type=exc.__class__.__name__,
+            )
             raise ValueError(str(exc)) from exc
         except Exception as exc:
             # Client exceptions can contain request details. Keep them out of
             # the MCP response and log only a stable exception class.
             logger.warning(
-                "mcp_service_failed operation={} error_type={}",
+                "mcp_tool_complete tool={} outcome=error duration_ms={:.1f} error_type={}",
                 operation,
+                (perf_counter() - started) * 1000,
                 exc.__class__.__name__,
             )
             raise RuntimeError("iCloud service request failed") from exc
+
+    def _log_tool_complete(
+        operation: str,
+        started: float,
+        outcome: str,
+        *,
+        result_count: int | None = None,
+        error_type: str | None = None,
+    ) -> None:
+        fields: list[Any] = [
+            operation,
+            outcome,
+            (perf_counter() - started) * 1000,
+        ]
+        message = "mcp_tool_complete tool={} outcome={} duration_ms={:.1f}"
+        if result_count is not None:
+            message += " result_count={}"
+            fields.append(result_count)
+        if error_type is not None:
+            message += " error_type={}"
+            fields.append(error_type)
+        logger.info(message, *fields)
+
+    def _result_count(result: Any) -> int | None:
+        if isinstance(result, (list, tuple, set, dict)):
+            return len(result)
+        return None
 
     calendar_missing = "iCloud CalDAV is not configured. Set ICLOUD_USERNAME and ICLOUD_APP_PASSWORD."
     imap_missing = "iCloud IMAP is not configured. Set IMAP_USERNAME and IMAP_APP_PASSWORD."
@@ -85,6 +130,7 @@ def create_mcp_server(
     )
     async def list_calendars() -> list[dict[str, Any]]:
         if service is None:
+            logger.info("mcp_tool tool=list_calendars outcome=not_configured")
             return []
         return await call_service(service, "list_calendars", service.list_calendars, calendar_missing)
 
@@ -106,6 +152,7 @@ def create_mcp_server(
         limit: int = 50,
     ) -> list[dict[str, Any]]:
         if service is None:
+            logger.info("mcp_tool tool=list_events outcome=not_configured")
             return []
         return await call_service(
             service,

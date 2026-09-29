@@ -37,3 +37,5 @@
 - `list_calendars`, `list_events`, `get_event`, `list_mailboxes`, `search_emails`, and `get_email` are read-only. Calendar creation/updates plus IMAP flag/move operations mutate iCloud; email deletion is destructive and requires `confirm=true`.
 - OpenAI Secure MCP Tunnel is a separate `openai-tunnel` Compose service. It connects to `http://icloud-cruncher:8080/mcp` over the private Compose network and needs `CONTROL_PLANE_API_KEY` plus `CONTROL_PLANE_TUNNEL_ID`.
 - Keep the write-capable MCP endpoint off the public internet. The default Compose binding is loopback-only.
+- Normalized iCloud calendar lists and event reads use a persistent SQLite TTL cache when the service is configured. Docker stores it in the named `icloud-cache` volume; configure `ICLOUD_CACHE_PATH`, `ICLOUD_CACHE_TTL_SECONDS`, and `ICLOUD_CALENDARS_CACHE_TTL_SECONDS` as needed. iCloud remains the source of truth and successful calendar writes invalidate cached events.
+- MCP tool logs use `mcp_tool_start` and `mcp_tool_complete` with the tool name, outcome, duration, and safe result counts; do not add event contents or credentials to logs.
