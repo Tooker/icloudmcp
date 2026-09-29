@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from functools import partial
 from time import perf_counter
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, Literal, TypeVar
 
 from loguru import logger
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
-from mcp_types import ToolAnnotations
+from mcp_types import CallToolResult, TextContent, ToolAnnotations
 
 from app.icloud import ICloudCalendarService, ICloudServiceError
 from app.imap import ICloudIMAPService, IMAPServiceError
+from app.mcp_resources import AttachmentMCPServer
 
 ResultT = TypeVar("ResultT")
 
@@ -39,7 +41,7 @@ def create_mcp_server(
     service: ICloudCalendarService | None,
     imap_service: ICloudIMAPService | None = None,
 ) -> MCPServer:
-    server = MCPServer(
+    server = AttachmentMCPServer(
         name="icloud-cruncher",
         title="iCloud Calendar & Mail",
         description=(
@@ -52,7 +54,7 @@ def create_mcp_server(
             "planned change and obtain user approval before calling them. Draft tools "
             "upload messages to IMAP but never send them; the user sends drafts manually."
         ),
-        version="0.3.0",
+        version="0.5.0",
     )
 
     async def call_service(
@@ -340,8 +342,9 @@ def create_mcp_server(
         title="Read an iCloud Mail message",
         description=(
             "Read one email by its mailbox-local IMAP UID. The message is fetched with "
-            "BODY.PEEK so reading it does not mark it read; attachments are represented by "
-            "metadata and are not returned as raw binary data."
+            "BODY.PEEK so reading it does not mark it read. Attachments include metadata and "
+            "attachment_id; call get_email_attachment with that ID to retrieve the original "
+            "file as a native MCP resource, or use format=text for PDF/text contents."
         ),
         annotations=READ_ANNOTATIONS,
     )
@@ -360,6 +363,52 @@ def create_mcp_server(
                 max_body_chars=max_body_chars,
             ),
             imap_missing,
+        )
+
+    @server.tool(
+        name="get_email_attachment",
+        title="Read an iCloud Mail attachment",
+        description=(
+            "Read an attachment using uid, mailbox and attachment_id from get_email. "
+            "Default format=file returns the COMPLETE original attachment as an embedded "
+            "binary MCP resource and resource link, with filename and MIME type (up to 10 MB). "
+            "File mode requires offset=0 and ignores limit; resource links can be read through "
+            "resources/read for up to 15 minutes, until capacity eviction or service restart. "
+            "Use format=text to extract readable PDF/text content; scanned PDFs without "
+            "embedded text need OCR. Use format=base64 for bounded original byte chunks. "
+            "offset/limit count characters for text and decoded bytes for base64 "
+            "(limit 1–100000). Follow next_offset while has_more=true; decode each base64 chunk "
+            "separately before concatenating bytes. Reads use BODY.PEEK and never mark mail read."
+        ),
+        annotations=READ_ANNOTATIONS,
+    )
+    async def get_email_attachment(
+        uid: str,
+        attachment_id: str,
+        mailbox: str | None = None,
+        format: Literal["file", "text", "base64"] = "file",
+        offset: int = 0,
+        limit: int = 20_000,
+    ) -> CallToolResult:
+        attachment = await call_service(
+            imap_service,
+            "get_email_attachment",
+            partial(
+                imap_service.get_email_attachment if imap_service else lambda **_: {},
+                mailbox=mailbox,
+                uid=uid,
+                attachment_id=attachment_id,
+                format=format,
+                offset=offset,
+                limit=limit,
+            ),
+            imap_missing,
+        )
+        if format == "file":
+            return server.attachment_result(attachment)
+        return CallToolResult(
+            content=[TextContent(type="text", text=json.dumps(attachment, ensure_ascii=False))],
+            structured_content=attachment,
         )
 
     @server.tool(

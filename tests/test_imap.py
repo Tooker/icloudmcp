@@ -4,12 +4,17 @@ import base64
 import imaplib
 import ssl
 from datetime import date, datetime, timedelta, timezone
+from email import policy
+from email.message import EmailMessage
+from io import BytesIO
 from typing import Any
 
 import pytest
+from pypdf import PdfWriter
+from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 from app.config import IMAPConfig
-from app.imap import EmailNotFoundError, ICloudIMAPService, IMAPServiceError
+from app.imap import AttachmentNotFoundError, EmailNotFoundError, ICloudIMAPService, IMAPServiceError
 from app.icloud_cache import SQLiteICloudCalendarCache
 
 
@@ -388,6 +393,218 @@ def test_search_and_read_use_uid_and_peek() -> None:
         call[0] == "FETCH" and "BODY.PEEK[]" in str(call[1])
         for call in client.calls
     )
+
+
+def pdf_attachment(*pages: str, encrypted: bool = False) -> bytes:
+    writer = PdfWriter()
+    for text in pages:
+        page = writer.add_blank_page(width=300, height=300)
+        font = DictionaryObject({
+            NameObject("/Type"): NameObject("/Font"),
+            NameObject("/Subtype"): NameObject("/Type1"),
+            NameObject("/BaseFont"): NameObject("/Helvetica"),
+        })
+        page[NameObject("/Resources")] = DictionaryObject({
+            NameObject("/Font"): DictionaryObject({NameObject("/F1"): font}),
+        })
+        content = DecodedStreamObject()
+        content.set_data(f"BT /F1 12 Tf 50 250 Td ({text}) Tj ET".encode("ascii"))
+        page[NameObject("/Contents")] = writer._add_object(content)
+    if encrypted:
+        writer.encrypt("secret")
+    output = BytesIO()
+    writer.write(output)
+    return output.getvalue()
+
+
+def attachment_message(payload: bytes, filename: str = "invoice.pdf", content_type: str = "application/pdf") -> bytes:
+    message = EmailMessage()
+    message["Subject"] = "Mail with attachment"
+    message.set_content("See attachment.")
+    maintype, subtype = content_type.split("/", 1)
+    message.add_attachment(payload, maintype=maintype, subtype=subtype, filename=filename)
+    return message.as_bytes(policy=policy.SMTP)
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_attachment_reads_pdf_text_from_persistent_cache_and_validates_generation(tmp_path, restart) -> None:
+    client = FakeIMAP()
+    payload = pdf_attachment("Invoice total: 42 EUR")
+    client.message = attachment_message(payload)
+    path = tmp_path / "cache.sqlite3"
+    mail = service_with(client, cache=SQLiteICloudCalendarCache(path))
+    message = mail.get_email("INBOX", "42")
+    assert message["attachments"] == [{
+        "attachment_id": "1", "filename": "invoice.pdf",
+        "content_type": "application/pdf", "size": len(payload),
+    }]
+    if restart:
+        mail = service_with(client, cache=SQLiteICloudCalendarCache(path))
+    attachment = mail.get_email_attachment("INBOX", "42", "1")
+    assert attachment["text"] == "Invoice total: 42 EUR"
+    assert attachment["text_status"] == "ok"
+    assert attachment["has_more"] is False
+    assert attachment["next_offset"] is None
+    assert len([call for call in client.calls if call[0] == "FETCH"]) == 1
+
+    client.uid_validity = "99"
+    client.message = attachment_message(pdf_attachment("New generation invoice"))
+    assert mail.get_email_attachment("INBOX", "42", "1")["text"] == "New generation invoice"
+    assert all(call[1][1] is True for call in client.calls if call[0] == "SELECT")
+    assert all("BODY.PEEK[]" in str(call[1]) for call in client.calls if call[0] == "FETCH")
+    assert not any(call[0] == "STORE" for call in client.calls)
+
+
+def test_attachment_pdf_text_paginates_across_pages() -> None:
+    client = FakeIMAP()
+    client.message = attachment_message(pdf_attachment("First invoice page", "Second invoice page"))
+    mail = service_with(client)
+    parts = []
+    offset = 0
+    while True:
+        result = mail.get_email_attachment("INBOX", "42", "1", offset=offset, limit=7)
+        parts.append(result["text"])
+        assert result["returned_chars"] <= 7
+        if not result["has_more"]:
+            assert result["next_offset"] is None
+            break
+        assert result["next_offset"] > offset
+        offset = result["next_offset"]
+    assert "".join(parts) == "First invoice page\n\nSecond invoice page"
+
+
+def test_original_attachment_bytes_round_trip_in_bounded_chunks() -> None:
+    client = FakeIMAP()
+    payload = bytes(range(256))
+    client.message = attachment_message(payload, "image.bin", "application/octet-stream")
+    mail = service_with(client)
+    chunks = []
+    offset = 0
+    while True:
+        result = mail.get_email_attachment("INBOX", "42", "1", format="base64", offset=offset, limit=17)
+        chunk = base64.b64decode(result["content_base64"], validate=True)
+        chunks.append(chunk)
+        assert len(chunk) == result["returned_bytes"] <= 17
+        if not result["has_more"]:
+            break
+        offset = result["next_offset"]
+    assert b"".join(chunks) == payload
+
+
+@pytest.mark.parametrize("limit", [0, 1, 100_001])
+def test_native_attachment_returns_complete_file_even_above_default_chunk_limit(tmp_path, limit) -> None:
+    client = FakeIMAP()
+    payload = pdf_attachment("Invoice") + b"\n" * 30_000
+    client.message = attachment_message(payload)
+    mail = service_with(client, cache=SQLiteICloudCalendarCache(tmp_path / "cache.sqlite3"))
+    mail.get_email("INBOX", "42")
+    result = mail.get_email_attachment("INBOX", "42", "1", format="file", limit=limit)
+    assert result["content_bytes"] == payload
+    assert result["returned_bytes"] == result["size"] == len(payload)
+    assert result["has_more"] is False
+    assert result["next_offset"] is None
+    assert len([call for call in client.calls if call[0] == "FETCH"]) == 1
+
+
+def test_native_attachment_refuses_oversize_files_without_truncating(monkeypatch) -> None:
+    client = FakeIMAP()
+    client.message = attachment_message(b"original file", "file.bin", "application/octet-stream")
+    mail = service_with(client)
+    monkeypatch.setattr(mail, "_MAX_ATTACHMENT_BYTES", 5)
+    with pytest.raises(ValueError, match="native file limit"):
+        mail.get_email_attachment("INBOX", "42", "1", format="file")
+    result = mail.get_email_attachment("INBOX", "42", "1", format="base64", limit=100)
+    assert base64.b64decode(result["content_base64"]) == b"original file"
+
+
+def test_text_attachment_honors_charset_and_keeps_content_out_of_body() -> None:
+    message = EmailMessage()
+    message.set_content("Outer body.")
+    message.add_attachment("Grüße aus Köln".encode("iso-8859-1"), maintype="text", subtype="plain", filename="notes.txt", params={"charset": "iso-8859-1"})
+    client = FakeIMAP()
+    client.message = message.as_bytes(policy=policy.SMTP)
+    mail = service_with(client)
+    assert mail.get_email("INBOX", "42")["body"] == "Outer body.\r\n"
+    result = mail.get_email_attachment("INBOX", "42", "1", offset=6, limit=100)
+    assert result["text"] == "aus Köln"
+
+
+@pytest.mark.parametrize("payload, filename, content_type, status", [
+    (pdf_attachment(""), "scan.pdf", "application/pdf", "no_text"),
+    (pdf_attachment("Private text", encrypted=True), "locked.pdf", "application/pdf", "encrypted"),
+    (b"PRIVATE_BROKEN_PDF_CONTENT", "broken.pdf", "application/pdf", "error"),
+    (b"\x89PNG\r\n", "image.png", "image/png", "unsupported"),
+])
+def test_unreadable_attachment_text_explains_fallback_without_leaking_content(payload, filename, content_type, status, caplog) -> None:
+    client = FakeIMAP()
+    client.message = attachment_message(payload, filename, content_type)
+    mail = service_with(client)
+    result = mail.get_email_attachment("INBOX", "42", "1")
+    assert result["text_status"] == status
+    assert result["text_message"]
+    assert result["has_more"] is False
+    assert "PRIVATE_BROKEN_PDF_CONTENT" not in caplog.text
+    assert "PRIVATE_BROKEN_PDF_CONTENT" not in str(result)
+    original = mail.get_email_attachment("INBOX", "42", "1", format="base64")
+    assert base64.b64decode(original["content_base64"]) == payload
+
+
+def test_attached_message_is_not_mixed_into_outer_body_or_attachment_ids() -> None:
+    inner = EmailMessage()
+    inner.set_content("Inner body.")
+    inner.add_attachment(b"inner attachment", maintype="text", subtype="plain", filename="inner.txt")
+    outer = EmailMessage()
+    outer.set_content("Outer body.")
+    outer.add_attachment(inner, filename="forwarded.eml")
+    outer.add_attachment(b"outer attachment", maintype="text", subtype="plain", filename="outer.txt")
+    client = FakeIMAP()
+    client.message = outer.as_bytes(policy=policy.SMTP)
+    mail = service_with(client)
+    result = mail.get_email("INBOX", "42")
+    assert result["body"] == "Outer body.\r\n"
+    assert [item["filename"] for item in result["attachments"]] == ["forwarded.eml", "outer.txt"]
+    assert mail.get_email_attachment("INBOX", "42", "2")["text"] == "outer attachment"
+    eml = mail.get_email_attachment("INBOX", "42", "1", format="base64")
+    assert b"Inner body." in base64.b64decode(eml["content_base64"])
+
+
+@pytest.mark.parametrize("arguments", [
+    {"attachment_id": "0"}, {"attachment_id": "-1"}, {"attachment_id": "1.1"},
+    {"format": "invalid"}, {"offset": -1}, {"limit": 0}, {"limit": 100_001},
+    {"format": "file", "offset": 1},
+])
+def test_attachment_validates_arguments_before_imap_access(arguments) -> None:
+    client = FakeIMAP()
+    with pytest.raises(ValueError):
+        service_with(client).get_email_attachment(**{
+            "mailbox": "INBOX", "uid": "42", "attachment_id": "1", **arguments,
+        })
+    assert client.calls == []
+
+
+def test_attachment_rejects_unknown_ids() -> None:
+    client = FakeIMAP()
+    client.message = attachment_message(pdf_attachment("Invoice"))
+    with pytest.raises(AttachmentNotFoundError, match="Attachment not found"):
+        service_with(client).get_email_attachment("INBOX", "42", "2")
+
+
+def test_attachment_ids_distinguish_duplicate_filenames_and_inline_parts() -> None:
+    message = EmailMessage()
+    message.set_content("Outer body.")
+    message.add_attachment(b"first", maintype="text", subtype="plain", filename="same.txt")
+    message.add_attachment(b"second", maintype="text", subtype="plain", filename="same.txt")
+    message.add_attachment(b"inline image", maintype="image", subtype="png", disposition="inline", cid="<image>")
+    client = FakeIMAP()
+    client.message = message.as_bytes(policy=policy.SMTP)
+    mail = service_with(client)
+    metadata = mail.get_email("INBOX", "42")["attachments"]
+    assert [item["attachment_id"] for item in metadata] == ["1", "2", "3"]
+    assert [item["filename"] for item in metadata] == ["same.txt", "same.txt", None]
+    assert mail.get_email_attachment("INBOX", "42", "1")["text"] == "first"
+    assert mail.get_email_attachment("INBOX", "42", "2")["text"] == "second"
+    inline = mail.get_email_attachment("INBOX", "42", "3", format="base64")
+    assert base64.b64decode(inline["content_base64"]) == b"inline image"
 
 
 def test_recent_email_header_search_uses_cache(tmp_path) -> None:

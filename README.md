@@ -74,7 +74,11 @@ The MCP server provides:
 - `list_mailboxes` — list IMAP mailboxes.
 - `search_emails` — search by sender, recipient, subject, text, dates, or unread status.
 - `get_email` — read one message by its mailbox-local UID without marking it read. Bodies
-  are bounded; attachments are returned as metadata only.
+  are bounded; attachments include metadata and an `attachment_id` for reading their contents.
+- `get_email_attachment` — return the complete original attachment as a native binary
+  MCP resource by default, including a resource link with filename, MIME type, and size.
+  Also supports PDF/text extraction and bounded base64 chunks. Uses the UID, mailbox,
+  and `attachment_id` from `get_email` and never marks the message read.
 - `create_draft` — upload a plain-text or HTML draft, optionally with base64-encoded
   attachments. It never sends the message.
 - `update_draft` — replace an existing draft with new content and optional attachments.
@@ -89,6 +93,33 @@ mailbox returned by `search_emails`. Drafts default to the `Drafts` mailbox and 
 redirected with `IMAP_DRAFTS_MAILBOX` or the tool's `mailbox` argument. Attachments are
 passed as objects with `filename`, `content_type`, and `content_base64`. IMAP sending is
 intentionally not implemented; send the uploaded draft manually from a mail client.
+
+To retrieve a PDF attachment, call `get_email` first, then
+`get_email_attachment(uid="42", mailbox="INBOX", attachment_id="1")`. The default
+`format="file"` returns the complete file (up to 10 MB) in an `EmbeddedResource` with
+`BlobResourceContents.blob` and the original MIME type, plus a `ResourceLink` carrying
+the filename and size. File mode requires `offset=0`; `limit` does not truncate files.
+The resource URI is private to MCP and contains an opaque random ID. Clients can also
+fetch its contents using `resources/read`; no public download endpoint is added.
+Resource reads return a snapshot of the issued file, not a subsequent message with a
+reused UID. Snapshots are held in memory for up to 15 minutes, bounded by 64 files and
+25 MB total; capacity eviction and service restarts may expire links sooner. Request
+the file again if its link expires. Files are not exposed through `resources/list`.
+Download and preview UI depend on the MCP client.
+
+Use `format="text"` to return extracted PDF/text content in `text`. For long content,
+follow `next_offset` while `has_more` is true. `offset` and `limit` count characters in
+text mode, or decoded bytes in `format="base64"` mode; the default limit is 20,000 and
+the maximum is 100,000. Base64 mode also supports files over the native file limit.
+Decode each base64 chunk separately before joining the bytes.
+Text extraction accepts files up to 10 MB and bounds PDF page content streams to 5 MB;
+larger files remain available as base64. `text_status` and `text_message` explain PDFs
+without embedded text, password protection, unsupported formats, or extraction errors.
+Scanned PDFs without a text layer require OCR; this service does not run OCR.
+
+The server uses the official Python MCP SDK's `MCPServer`, formerly named `FastMCP`.
+Native file results use the SDK's MCP content types directly; the separate `fastmcp`
+package is not required for this feature.
 
 The IMAP read cache keeps up to the 1,000 newest message headers per mailbox from the
 last 100 days in the same persistent SQLite volume as the calendar cache. It refreshes

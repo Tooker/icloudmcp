@@ -20,6 +20,7 @@ from typing import Any
 
 from app.config import IMAPConfig
 from app.icloud_cache import SQLiteICloudCalendarCache
+from app.mail_attachments import extract_attachment_text
 
 
 class IMAPServiceError(RuntimeError):
@@ -31,6 +32,10 @@ class MailboxNotFoundError(IMAPServiceError):
 
 
 class EmailNotFoundError(IMAPServiceError):
+    pass
+
+
+class AttachmentNotFoundError(IMAPServiceError):
     pass
 
 
@@ -649,11 +654,78 @@ class ICloudIMAPService:
         if not 1 <= max_body_chars <= self._MAX_BODY_CHARS:
             raise ValueError(f"max_body_chars must be between 1 and {self._MAX_BODY_CHARS}")
         selected_mailbox = self._mailbox(mailbox)
+        message, summary = self._load_email_message(selected_mailbox, uid, "get_email")
+        result = dict(summary)
+        result.update(self._message_body(message, max_body_chars))
+        return result
+
+    def get_email_attachment(
+        self,
+        mailbox: str | None,
+        uid: str,
+        attachment_id: str,
+        format: str = "text",
+        offset: int = 0,
+        limit: int = 20_000,
+    ) -> dict[str, Any]:
+        uid = self._uid(uid)
+        if not attachment_id.isascii() or not attachment_id.isdigit() or int(attachment_id) < 1:
+            raise ValueError("attachment_id must be a positive ID returned by get_email")
+        if format not in {"file", "text", "base64"}:
+            raise ValueError("format must be file, text or base64")
+        if offset < 0:
+            raise ValueError("offset must not be negative")
+        if format == "file" and offset != 0:
+            raise ValueError("format=file returns a complete file; offset must be 0")
+        if format != "file" and not 1 <= limit <= self._MAX_BODY_CHARS:
+            raise ValueError(f"limit must be between 1 and {self._MAX_BODY_CHARS}")
+        selected_mailbox = self._mailbox(mailbox)
+        message, _ = self._load_email_message(selected_mailbox, uid, "get_email_attachment")
+        attachments = (part for part in self._message_parts(message) if self._is_attachment(part))
+        for index, part in enumerate(attachments, start=1):
+            if index != int(attachment_id):
+                continue
+            payload = self._part_payload(part)
+            result = {
+                "uid": uid,
+                "mailbox": selected_mailbox,
+                **self._attachment_metadata(part, index, payload),
+                "format": format,
+                "offset": offset,
+            }
+            if format == "file":
+                if len(payload) > self._MAX_ATTACHMENT_BYTES:
+                    raise ValueError("Attachment exceeds the 10 MB native file limit; use format=base64 for chunks.")
+                result.update({
+                    "content_bytes": payload,
+                    "returned_bytes": len(payload),
+                    "has_more": False,
+                    "next_offset": None,
+                })
+            elif format == "base64":
+                content = payload[offset : offset + limit]
+                has_more = offset + len(content) < len(payload)
+                result.update({
+                    "content_base64": base64.b64encode(content).decode("ascii"),
+                    "returned_bytes": len(content),
+                    "has_more": has_more,
+                    "next_offset": offset + len(content) if has_more else None,
+                })
+            else:
+                result.update(extract_attachment_text(part, payload, offset, limit))
+            return result
+        raise AttachmentNotFoundError("Attachment not found; use an attachment_id returned by get_email")
+
+    def _load_email_message(
+        self, selected_mailbox: str, uid: str, operation: str,
+    ) -> tuple[Message, dict[str, Any]]:
+        """Share generation-checked, read-only message loading with attachment reads."""
+
         with self._refresh_lock(f"message:{selected_mailbox.casefold()}:{uid}"):
-            with self._connected("get_email") as client:
+            with self._connected(operation) as client:
                 # Validate the mailbox generation before using a cached UID.
                 uid_validity = self._select(
-                    client, selected_mailbox, readonly=True, operation="get_email"
+                    client, selected_mailbox, readonly=True, operation=operation
                 )
                 if self._cache is not None:
                     cached = self._cache.get_email_message(
@@ -661,12 +733,16 @@ class ICloudIMAPService:
                     )
                     if cached is not None and cached.fresh:
                         logger.info(
-                            "imap_cache tool=get_email action=read status=hit bytes={}",
+                            "imap_cache tool={} action=read status=hit bytes={}", operation,
                             len(cached.value.get("raw_message", b"")),
                         )
-                        return self._render_cached_email(cached.value, max_body_chars)
+                        raw_message = cached.value.get("raw_message")
+                        summary = cached.value.get("summary")
+                        if not isinstance(raw_message, bytes) or not isinstance(summary, dict):
+                            raise IMAPServiceError("Cached email content is invalid")
+                        return self._parse_message(raw_message), summary
                     logger.info(
-                        "imap_cache tool=get_email action=read status={}",
+                        "imap_cache tool={} action=read status={}", operation,
                         "stale" if cached is not None else "miss",
                     )
                 started = perf_counter()
@@ -674,8 +750,8 @@ class ICloudIMAPService:
                 self._ensure_ok(status, "IMAP message fetch failed")
                 raw_message = self._literal_bytes(fetched)
                 logger.info(
-                    "imap_phase tool=get_email phase=message_fetch duration_ms={:.1f} bytes={}",
-                    (perf_counter() - started) * 1000, len(raw_message),
+                    "imap_phase tool={} phase=message_fetch duration_ms={:.1f} bytes={}",
+                    operation, (perf_counter() - started) * 1000, len(raw_message),
                 )
                 if not raw_message:
                     raise EmailNotFoundError(f"Email not found: {uid}")
@@ -686,8 +762,8 @@ class ICloudIMAPService:
                     flags=self._fetch_flags(fetched),
                 )
                 logger.info(
-                    "imap_phase tool=get_email phase=parse duration_ms={:.1f}",
-                    (perf_counter() - parse_started) * 1000,
+                    "imap_phase tool={} phase=parse duration_ms={:.1f}",
+                    operation, (perf_counter() - parse_started) * 1000,
                 )
                 if self._cache is not None and uid_validity and len(raw_message) <= self._max_cached_message_bytes:
                     self._cache.set_email_messages([{
@@ -695,29 +771,14 @@ class ICloudIMAPService:
                         "summary": summary, "raw_message": raw_message,
                     }])
                     logger.info(
-                        "imap_cache tool=get_email action=write status=refresh bytes={}", len(raw_message),
+                        "imap_cache tool={} action=write status=refresh bytes={}", operation, len(raw_message),
                     )
                 elif self._cache is not None:
                     logger.info(
-                        "imap_cache tool=get_email action=write status=skip reason={}",
+                        "imap_cache tool={} action=write status=skip reason={}", operation,
                         "message_too_large" if uid_validity else "uid_validity_unavailable",
                     )
-                result = dict(summary)
-                result.update(self._message_body(message, max_body_chars))
-                return result
-
-    @staticmethod
-    def _render_cached_email(value: dict[str, Any], max_body_chars: int) -> dict[str, Any]:
-        raw_message = value.get("raw_message")
-        if not isinstance(raw_message, bytes):
-            raise IMAPServiceError("Cached email content is invalid")
-        message = ICloudIMAPService._parse_message(raw_message)
-        summary = value.get("summary")
-        if not isinstance(summary, dict):
-            raise IMAPServiceError("Cached email summary is invalid")
-        result = dict(summary)
-        result.update(ICloudIMAPService._message_body(message, max_body_chars))
-        return result
+                return message, summary
 
     def crawl_email_cache(self) -> dict[str, int]:
         """Download uncached messages from newest to oldest in small batches."""
@@ -1565,25 +1626,55 @@ class ICloudIMAPService:
         value = message.get(name)
         return str(value).strip() if value is not None else None
 
+    @staticmethod
+    def _is_attachment(part: Message) -> bool:
+        return bool(
+            part.get_filename()
+            or part.get_content_disposition() == "attachment"
+            or (not part.is_multipart() and part.get_content_maintype() != "text")
+            or part.get_content_type() == "message/rfc822"
+        )
+
+    @classmethod
+    def _message_parts(cls, message: Message) -> Iterator[Message]:
+        # Attached messages have multipart payloads too. Do not mix their
+        # bodies or their own attachments into the parent message.
+        if cls._is_attachment(message) or not message.is_multipart():
+            yield message
+        else:
+            for part in message.get_payload():
+                yield from cls._message_parts(part)
+
+    @staticmethod
+    def _part_payload(part: Message) -> bytes:
+        payload = part.get_payload(decode=True)
+        if isinstance(payload, bytes):
+            return payload
+        children = part.get_payload()
+        if part.get_content_type() == "message/rfc822" and isinstance(children, list):
+            return b"\r\n".join(child.as_bytes(policy=policy.SMTP) for child in children)
+        return part.as_bytes(policy=policy.SMTP) if part.is_multipart() else b""
+
+    @staticmethod
+    def _attachment_metadata(part: Message, index: int, payload: bytes) -> dict[str, Any]:
+        return {
+            "attachment_id": str(index),
+            "filename": part.get_filename(),
+            "content_type": part.get_content_type(),
+            "size": len(payload),
+        }
+
     @classmethod
     def _message_body(cls, message: Message, max_chars: int) -> dict[str, Any]:
         plain_parts: list[str] = []
         html_parts: list[str] = []
         attachments: list[dict[str, Any]] = []
 
-        for part in message.walk():
-            if part.is_multipart():
-                continue
-            filename = part.get_filename()
-            disposition = (part.get_content_disposition() or "").lower()
-            payload = part.get_payload(decode=True) or b""
-            if filename or disposition == "attachment":
+        for part in cls._message_parts(message):
+            payload = cls._part_payload(part)
+            if cls._is_attachment(part):
                 attachments.append(
-                    {
-                        "filename": filename,
-                        "content_type": part.get_content_type(),
-                        "size": len(payload),
-                    }
+                    cls._attachment_metadata(part, len(attachments) + 1, payload)
                 )
                 continue
             if part.get_content_maintype() != "text":
