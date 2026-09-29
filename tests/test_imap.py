@@ -170,6 +170,45 @@ def test_lists_mailboxes_and_decodes_modified_utf7() -> None:
     assert mailboxes[1]["name"] == "Übersicht"
 
 
+@pytest.mark.parametrize("name", ["Übersicht", "日本語", "A & B", 'Ü"ber\\sicht', "&ANw-bersicht"])
+@pytest.mark.parametrize("literal", [False, True])
+def test_utf8_mailbox_names_round_trip_through_all_commands(name: str, literal: bool) -> None:
+    class UTF8IMAP(FakeIMAP):
+        def enable(self, capability: str) -> tuple[str, list[bytes]]:
+            return "OK", [b"enabled"]
+
+        def list(self) -> tuple[str, list[Any]]:
+            if literal:
+                encoded = name.encode("utf-8")
+                return "OK", [(f'(\\HasNoChildren) "/" {{{len(encoded)}}}'.encode(), encoded)]
+            return "OK", [f'(\\HasNoChildren) "/" {ICloudIMAPService._quote_string(name)}'.encode("utf-8")]
+
+    client = UTF8IMAP()
+    mail = service_with(client)
+    returned_name = mail.list_mailboxes()[0]["name"]
+    assert returned_name == name
+    mail.get_email(returned_name, "42")
+    mail.create_draft(to=["bob@example.com"], subject="Draft", body="Body", mailbox=returned_name)
+    mail.move_email("INBOX", returned_name, "42")
+    quoted = ICloudIMAPService._quote_string(name)
+    assert ("SELECT", (quoted, True)) in client.calls
+    assert next(args[0] for command, args in client.calls if command == "APPEND") == quoted
+    assert ("COPY", ("42", quoted)) in client.calls
+
+
+def test_rejected_utf8_enable_preserves_modified_utf7_mailboxes() -> None:
+    class LegacyIMAP(FakeIMAP):
+        def enable(self, capability: str) -> tuple[str, list[bytes]]:
+            return "NO", [b"not supported"]
+
+    client = LegacyIMAP()
+    mail = service_with(client)
+    mailbox = mail.list_mailboxes()[1]["name"]
+    assert mailbox == "Übersicht"
+    mail.get_email(mailbox, "42")
+    assert ("SELECT", ('"&ANw-bersicht"', True)) in client.calls
+
+
 def test_reuses_a_successful_connection_for_sequential_operations() -> None:
     client = FakeIMAP()
     mail = service_with(client)

@@ -178,6 +178,7 @@ class ICloudIMAPService:
             # arguments. UTF8=ACCEPT allows UTF-8 search criteria.
             try:
                 client._encoding = "utf-8"
+                client.utf8_enabled = True
             except Exception:
                 pass
             state = "enabled"
@@ -267,7 +268,7 @@ class ICloudIMAPService:
 
                 result: list[dict[str, Any]] = []
                 for row in rows or []:
-                    parsed = self._parse_list_row(row)
+                    parsed = self._parse_list_row(row, utf8_enabled=getattr(client, "utf8_enabled", False))
                     if parsed is not None:
                         result.append(parsed)
             if self._cache is not None:
@@ -1169,7 +1170,7 @@ class ICloudIMAPService:
         message: EmailMessage,
     ) -> str | None:
         status, data = client.append(
-            self._quote_mailbox(mailbox),
+            self._quote_mailbox(mailbox, utf8_enabled=getattr(client, "utf8_enabled", False)),
             r"(\Draft)",
             imaplib.Time2Internaldate(datetime.now(timezone.utc)),
             message.as_bytes(),
@@ -1223,7 +1224,10 @@ class ICloudIMAPService:
 
         with self._connected("move_email") as client:
             self._select(client, source, readonly=False, operation="move_email")
-            status, _ = client.uid("COPY", uid, self._quote_mailbox(destination))
+            status, _ = client.uid(
+                "COPY", uid,
+                self._quote_mailbox(destination, utf8_enabled=getattr(client, "utf8_enabled", False)),
+            )
             self._ensure_ok(status, "IMAP copy failed")
             status, _ = client.uid("STORE", uid, "+FLAGS.SILENT", r"(\Deleted)")
             self._ensure_ok(status, "IMAP source flag update failed")
@@ -1305,7 +1309,10 @@ class ICloudIMAPService:
     ) -> str:
         started = perf_counter()
         try:
-            status, data = client.select(self._quote_mailbox(mailbox), readonly=readonly)
+            status, data = client.select(
+                self._quote_mailbox(mailbox, utf8_enabled=getattr(client, "utf8_enabled", False)),
+                readonly=readonly,
+            )
         except Exception as exc:
             raise MailboxNotFoundError(f"Mailbox not available: {mailbox}") from exc
         if not self._is_ok(status):
@@ -1375,8 +1382,8 @@ class ICloudIMAPService:
         return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
     @classmethod
-    def _quote_mailbox(cls, value: str) -> str:
-        return cls._quote_string(cls._encode_modified_utf7(value))
+    def _quote_mailbox(cls, value: str, *, utf8_enabled: bool = False) -> str:
+        return cls._quote_string(value if utf8_enabled else cls._encode_modified_utf7(value))
 
     @staticmethod
     def _imap_date(value: str, field: str) -> str:
@@ -1387,8 +1394,10 @@ class ICloudIMAPService:
         return parsed.strftime("%d-%b-%Y")
 
     @classmethod
-    def _parse_list_row(cls, row: Any) -> dict[str, Any] | None:
+    def _parse_list_row(cls, row: Any, *, utf8_enabled: bool = False) -> dict[str, Any] | None:
+        literal_name = None
         if isinstance(row, tuple):
+            literal_name = row[1] if len(row) > 1 and isinstance(row[1], bytes) else None
             row = row[0] if row else None
         if not isinstance(row, bytes):
             return None
@@ -1399,17 +1408,22 @@ class ICloudIMAPService:
             item.decode("ascii", errors="replace")
             for item in match.group("flags").split()
         ]
-        delimiter = cls._unquote_wire(match.group("delimiter"))
-        name = cls._decode_modified_utf7(cls._unquote_wire(match.group("name")))
+        encoding = "utf-8" if utf8_enabled else "ascii"
+        delimiter = cls._unquote_wire(match.group("delimiter"), encoding=encoding)
+        if literal_name is not None and re.fullmatch(rb"\{\d+\+?\}", match.group("name")):
+            wire_name = literal_name.decode(encoding, errors="replace")
+        else:
+            wire_name = cls._unquote_wire(match.group("name"), encoding=encoding)
+        name = wire_name if utf8_enabled else cls._decode_modified_utf7(wire_name)
         return {"name": name, "delimiter": delimiter, "flags": flags}
 
     @staticmethod
-    def _unquote_wire(value: bytes) -> str:
+    def _unquote_wire(value: bytes, *, encoding: str = "ascii") -> str:
         if value == b"NIL":
             return ""
         if len(value) >= 2 and value[:1] == b'"' and value[-1:] == b'"':
             value = value[1:-1].replace(b"\\\"", b'"').replace(b"\\\\", b"\\")
-        return value.decode("ascii", errors="replace")
+        return value.decode(encoding, errors="replace")
 
     @staticmethod
     def _decode_modified_utf7(value: str) -> str:
