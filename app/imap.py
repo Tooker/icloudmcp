@@ -737,43 +737,114 @@ class ICloudIMAPService:
             return {"mailboxes": 0, "messages": 0, "bytes": 0, "skipped": 0}
 
         self._crawl_stop_event.clear()
-        totals = {"mailboxes": 0, "messages": 0, "bytes": 0, "skipped": 0}
+        crawl_started = perf_counter()
+        cache_stats = self._cache.email_cache_stats()
+        logger.info(
+            "imap_cache tool=crawl_email_cache action=start status=running "
+            "cached_messages={} cached_bytes={} cached_mailboxes={} batch_size={} "
+            "interval_seconds={} max_message_bytes={}",
+            cache_stats["messages"],
+            cache_stats["bytes"],
+            cache_stats["mailboxes"],
+            self._crawl_batch_size,
+            self._crawl_interval_seconds,
+            self._max_cached_message_bytes,
+        )
+        totals = {
+            "mailboxes": 0,
+            "mailboxes_completed": 0,
+            "mailboxes_failed": 0,
+            "messages": 0,
+            "bytes": 0,
+            "skipped": 0,
+        }
         try:
             mailboxes = self.list_mailboxes()
         except Exception as exc:
+            cache_stats = self._cache.email_cache_stats()
             logger.warning(
-                "imap_cache tool=crawl_email_cache action=complete status=error error_type={}",
+                "imap_cache tool=crawl_email_cache action=complete status=error "
+                "error_type={} duration_ms={:.1f} cached_messages={} cached_bytes={} "
+                "cached_mailboxes={}",
                 exc.__class__.__name__,
+                (perf_counter() - crawl_started) * 1000,
+                cache_stats["messages"],
+                cache_stats["bytes"],
+                cache_stats["mailboxes"],
             )
             return totals
-        for mailbox in mailboxes:
+
+        selectable_mailboxes = [
+            mailbox
+            for mailbox in mailboxes
+            if "\\noselect" not in {str(flag).casefold() for flag in mailbox.get("flags", [])}
+        ]
+        mailbox_total = len(selectable_mailboxes)
+        logger.info(
+            "imap_cache tool=crawl_email_cache action=mailboxes status=ready "
+            "mailbox_total={} cached_messages={} cached_bytes={} cached_mailboxes={}",
+            mailbox_total,
+            cache_stats["messages"],
+            cache_stats["bytes"],
+            cache_stats["mailboxes"],
+        )
+        for mailbox_index, mailbox in enumerate(selectable_mailboxes, start=1):
             if self._crawl_stop_event.is_set():
                 break
-            flags = {str(flag).casefold() for flag in mailbox.get("flags", [])}
-            if "\\noselect" in flags:
-                continue
             totals["mailboxes"] += 1
             try:
-                stats = self._crawl_mailbox(str(mailbox["name"]))
+                stats = self._crawl_mailbox(
+                    str(mailbox["name"]),
+                    mailbox_index=mailbox_index,
+                    mailbox_total=mailbox_total,
+                )
             except Exception as exc:
+                totals["mailboxes_failed"] += 1
+                cache_stats = self._cache.email_cache_stats()
                 logger.warning(
-                    "imap_cache tool=crawl_email_cache action=mailbox status=error error_type={}",
+                    "imap_cache tool=crawl_email_cache action=mailbox status=error "
+                    "mailbox_index={} mailbox_total={} error_type={} "
+                    "cached_messages={} cached_bytes={} cached_mailboxes={}",
+                    mailbox_index,
+                    mailbox_total,
                     exc.__class__.__name__,
+                    cache_stats["messages"],
+                    cache_stats["bytes"],
+                    cache_stats["mailboxes"],
                 )
                 continue
+            totals["mailboxes_completed"] += 1
             for key in ("messages", "bytes", "skipped"):
                 totals[key] += stats[key]
+        cache_stats = self._cache.email_cache_stats()
+        status = "stopped" if self._crawl_stop_event.is_set() else "ok"
         logger.info(
-            "imap_cache tool=crawl_email_cache action=complete status=ok mailboxes={} messages={} bytes={} skipped={}",
+            "imap_cache tool=crawl_email_cache action=complete status={} duration_ms={:.1f} "
+            "mailboxes={} mailboxes_completed={} mailboxes_failed={} messages={} bytes={} skipped={} "
+            "cached_messages={} cached_bytes={} cached_mailboxes={}",
+            status,
+            (perf_counter() - crawl_started) * 1000,
             totals["mailboxes"],
+            totals["mailboxes_completed"],
+            totals["mailboxes_failed"],
             totals["messages"],
             totals["bytes"],
             totals["skipped"],
+            cache_stats["messages"],
+            cache_stats["bytes"],
+            cache_stats["mailboxes"],
         )
         return totals
 
-    def _crawl_mailbox(self, mailbox: str) -> dict[str, int]:
-        stats = {"messages": 0, "bytes": 0, "skipped": 0}
+    def _crawl_mailbox(
+        self,
+        mailbox: str,
+        *,
+        mailbox_index: int,
+        mailbox_total: int,
+    ) -> dict[str, int]:
+        mailbox_started = perf_counter()
+        stats = {"messages": 0, "bytes": 0, "skipped": 0, "pending": 0}
         with self._connected("crawl_email_cache") as client:
             selected_data = self._select(
                 client,
@@ -793,10 +864,23 @@ class ICloudIMAPService:
             )
             cached_uids = self._cache.cached_email_uids(mailbox, uids)
             pending = [uid for uid in reversed(uids) if uid not in cached_uids]
+            stats["pending"] = len(pending)
+            logger.info(
+                "imap_cache tool=crawl_email_cache action=mailbox status=running "
+                "mailbox_index={} mailbox_total={} uid_count={} cached_messages={} "
+                "pending_messages={}",
+                mailbox_index,
+                mailbox_total,
+                len(uids),
+                len(cached_uids),
+                len(pending),
+            )
+            processed = 0
             for offset in range(0, len(pending), self._crawl_batch_size):
                 if self._crawl_stop_event.is_set():
                     break
                 batch = pending[offset : offset + self._crawl_batch_size]
+                processed += len(batch)
                 started = perf_counter()
                 status, fetched = client.uid(
                     "FETCH",
@@ -827,16 +911,46 @@ class ICloudIMAPService:
                 batch_bytes = sum(len(item["raw_message"]) for item in messages)
                 stats["messages"] += len(messages)
                 stats["bytes"] += batch_bytes
+                cache_stats = self._cache.email_cache_stats()
                 logger.info(
-                    "imap_cache tool=crawl_email_cache action=write status=refresh batch_entries={} progress={}/{} bytes={} duration_ms={:.1f}",
+                    "imap_cache tool=crawl_email_cache action=write status=refresh "
+                    "mailbox_index={} mailbox_total={} batch_entries={} progress={}/{} "
+                    "pending_remaining={} bytes={} duration_ms={:.1f} cached_messages={} "
+                    "cached_bytes={} cached_mailboxes={}",
+                    mailbox_index,
+                    mailbox_total,
                     len(messages),
                     min(offset + len(batch), len(pending)),
                     len(pending),
+                    max(len(pending) - offset - len(batch), 0),
                     batch_bytes,
                     (perf_counter() - started) * 1000,
+                    cache_stats["messages"],
+                    cache_stats["bytes"],
+                    cache_stats["mailboxes"],
                 )
                 if self._crawl_interval_seconds:
                     sleep(self._crawl_interval_seconds)
+            stats["pending"] = max(len(pending) - processed, 0)
+        cache_stats = self._cache.email_cache_stats()
+        status = "stopped" if self._crawl_stop_event.is_set() else "complete"
+        logger.info(
+            "imap_cache tool=crawl_email_cache action=mailbox status={} "
+            "mailbox_index={} mailbox_total={} fetched_messages={} fetched_bytes={} "
+            "skipped_messages={} pending_messages={} cached_messages={} cached_bytes={} "
+            "cached_mailboxes={} duration_ms={:.1f}",
+            status,
+            mailbox_index,
+            mailbox_total,
+            stats["messages"],
+            stats["bytes"],
+            stats["skipped"],
+            stats["pending"],
+            cache_stats["messages"],
+            cache_stats["bytes"],
+            cache_stats["mailboxes"],
+            (perf_counter() - mailbox_started) * 1000,
+        )
         return stats
 
     def create_draft(

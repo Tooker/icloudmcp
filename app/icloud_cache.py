@@ -314,6 +314,20 @@ class SQLiteICloudCalendarCache:
                 rows,
             )
 
+    def email_cache_stats(self) -> dict[str, int]:
+        """Return aggregate content-cache counters without exposing message data."""
+
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*), COALESCE(SUM(length(raw_message)), 0), "
+                "COUNT(DISTINCT mailbox_key) FROM email_messages"
+            ).fetchone()
+        return {
+            "messages": int(row[0] or 0),
+            "bytes": int(row[1] or 0),
+            "mailboxes": int(row[2] or 0),
+        }
+
     def cached_email_uids(
         self,
         mailbox: str,

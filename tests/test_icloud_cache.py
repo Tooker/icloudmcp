@@ -112,6 +112,7 @@ def test_sqlite_cache_persists_mailboxes_and_full_messages(tmp_path: Path) -> No
     assert cached is not None and cached.fresh
     assert cached.value["raw_message"] == b"Subject: Cached\r\n\r\nBody"
     assert cache.cached_email_uids("INBOX", ["41", "42"]) == {"42"}
+    assert cache.email_cache_stats() == {"messages": 1, "bytes": 23, "mailboxes": 1}
 
     assert cache.invalidate_email_messages("INBOX") == 1
     assert cache.get_email_message("INBOX", "42") is None

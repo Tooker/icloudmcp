@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 import asyncio
+import logging
 import os
 from pathlib import Path
 from time import perf_counter
@@ -46,6 +47,8 @@ from app.mcp_server import create_mcp_server
 
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        if request.url.path == "/healthz":
+            return await call_next(request)
         start = perf_counter()
         response: Response | None = None
         try:
@@ -62,6 +65,17 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
                 elapsed_ms,
                 request.client.host if request.client else "unknown",
             )
+
+
+class _HealthCheckAccessFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "/healthz" not in record.getMessage()
+
+
+def _configure_healthcheck_access_logging() -> None:
+    access_logger = logging.getLogger("uvicorn.access")
+    if not any(isinstance(item, _HealthCheckAccessFilter) for item in access_logger.filters):
+        access_logger.addFilter(_HealthCheckAccessFilter())
 
 
 class ExactMcpEndpoint:
@@ -84,6 +98,7 @@ def create_app(
     icloud_service: ICloudCalendarService | None = None,
     imap_service: ICloudIMAPService | None = None,
 ) -> FastAPI:
+    _configure_healthcheck_access_logging()
     calendars = load_calendars(config_path, environ)
     icloud_config: ICloudConfig | None = load_icloud_config(config_path, environ)
     imap_config: IMAPConfig | None = load_imap_config(config_path, environ)
@@ -141,7 +156,7 @@ def create_app(
         try:
             if mail_service_created and imap_email_cache_crawl_enabled(environ):
                 logger.info(
-                    "imap_cache tool=crawl_email_cache action=start status=background batch_size={} interval_seconds={} max_message_bytes={}",
+                    "imap_cache tool=crawl_email_cache action=launch status=scheduled batch_size={} interval_seconds={} max_message_bytes={}",
                     imap_email_cache_crawl_batch_size(environ),
                     imap_email_cache_crawl_interval_seconds(environ),
                     imap_email_cache_max_message_bytes(environ),
