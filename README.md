@@ -203,10 +203,10 @@ There is no calendar listing endpoint. Unknown tokens return a neutral `404`.
 
 ## Logging
 
-The app uses `loguru` and logs incoming requests plus upstream iCloud fetch results. Upstream logs include token, status, duration, content type, and response size, but not the configured iCloud source URL. Every MCP call logs `mcp_tool_start` and `mcp_tool_complete` with the tool name, outcome, duration, and (where applicable) result count. Cache logs use the same tool name and show hit, miss, stale, or refresh without logging event contents.
+The app uses `loguru` and logs incoming requests plus upstream iCloud fetch results. Upstream logs include token, status, duration, content type, and response size, but not the configured iCloud source URL. Every MCP call logs `mcp_tool_start` and `mcp_tool_complete` with the tool name, outcome, duration, and (where applicable) result count. Cache logs identify read hits/misses/bypasses, refresh writes, and invalidations with counts; they never log event contents, email headers, message bodies, or credentials.
 
 At startup, the app logs every URL path it answers. With `ICLOUDCRUNCHER.BASE_URL=https://calendar.example.com`, it logs full external URLs.
-Cache logs include `cache_hit` for fresh public-calendar responses and `cache_stale_fallback` when iCloud is unavailable but a previous response can still be served. MCP cache logs use `icloud_cache tool=<name>`.
+Cache logs include `cache_hit` for fresh public-calendar responses, `public_calendar_cache action=write` for refreshed public feeds, and `cache_stale_fallback` when iCloud is unavailable but a previous response can still be served. Calendar MCP cache logs use `icloud_cache tool=<name> action=<read|write|invalidate>`, and IMAP cache logs use `imap_cache tool=<name> action=<read|write|invalidate>`.
 
 ## Useful references
 

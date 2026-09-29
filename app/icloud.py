@@ -95,12 +95,12 @@ class ICloudCalendarService:
             cached = self._cache.get_calendars()
             if cached is not None and cached.fresh:
                 logger.info(
-                    "icloud_cache tool=list_calendars status=hit entries={}",
+                    "icloud_cache tool=list_calendars action=read status=hit entries={}",
                     len(cached.value),
                 )
                 return cached.value
             logger.info(
-                "icloud_cache tool=list_calendars status={}",
+                "icloud_cache tool=list_calendars action=read status={}",
                 "stale" if cached is not None else "miss",
             )
 
@@ -109,7 +109,7 @@ class ICloudCalendarService:
         if self._cache is not None:
             self._cache.set_calendars(result)
             logger.info(
-                "icloud_cache tool=list_calendars status=refresh entries={}",
+                "icloud_cache tool=list_calendars action=write status=refresh entries={}",
                 len(result),
             )
         return result
@@ -150,12 +150,12 @@ class ICloudCalendarService:
                     cached_events.extend(cached.value)
                 if all_cache_hits:
                     logger.info(
-                        "icloud_cache tool=list_events status=hit calendars={} entries={}",
+                        "icloud_cache tool=list_events action=read status=hit calendars={} entries={}",
                         len(selected_summaries),
                         len(cached_events),
                     )
                     return self._filter_events(cached_events, query, limit)
-            logger.info("icloud_cache tool=list_events status=miss")
+            logger.info("icloud_cache tool=list_events action=read status=miss")
 
         with self._connected_client() as client:
             calendars = self._selected_calendars(client, calendar)
@@ -182,7 +182,7 @@ class ICloudCalendarService:
 
             if self._cache is not None:
                 logger.info(
-                    "icloud_cache tool=list_events status=refresh entries={}",
+                    "icloud_cache tool=list_events action=write status=refresh entries={}",
                     len(events),
                 )
             return self._filter_events(events, query, limit)
@@ -192,20 +192,24 @@ class ICloudCalendarService:
         if self._cache is not None:
             cached = self._cache.get_event(calendar, uid)
             if cached is not None and cached.fresh:
-                logger.info("icloud_cache tool=get_event status=hit")
+                logger.info("icloud_cache tool=get_event action=read status=hit")
                 return cached.value
             logger.info(
-                "icloud_cache tool=get_event status={}",
+                "icloud_cache tool=get_event action=read status={}",
                 "stale" if cached is not None else "miss",
             )
 
         with self._connected_client() as client:
-            target_calendar, calendar_summary = self._resolve_calendar(client, calendar)
+            target_calendar, calendar_summary = self._resolve_calendar(
+                client,
+                calendar,
+                tool="get_event",
+            )
             resource = self._get_event_resource(target_calendar, uid)
             result = self._event_summary(resource, calendar_summary)
         if self._cache is not None:
             self._cache.set_event(result)
-            logger.info("icloud_cache tool=get_event status=refresh")
+            logger.info("icloud_cache tool=get_event action=write status=refresh entries=1")
         return result
 
     def create_event(
@@ -245,11 +249,15 @@ class ICloudCalendarService:
         icalendar.add_component(event)
 
         with self._connected_client() as client:
-            target_calendar, calendar_summary = self._resolve_calendar(client, calendar)
+            target_calendar, calendar_summary = self._resolve_calendar(
+                client,
+                calendar,
+                tool="create_event",
+            )
             resource = target_calendar.add_event(icalendar.to_ical())
             result = self._event_summary(resource, calendar_summary)
         if self._cache is not None:
-            self._cache.invalidate_events()
+            self._invalidate_event_cache("create_event")
         return result
 
     def update_event(
@@ -282,7 +290,11 @@ class ICloudCalendarService:
             raise ValueError("timezone_name requires start/end or all_day")
 
         with self._connected_client() as client:
-            target_calendar, calendar_summary = self._resolve_calendar(client, calendar)
+            target_calendar, calendar_summary = self._resolve_calendar(
+                client,
+                calendar,
+                tool="update_event",
+            )
             resource = self._get_event_resource(target_calendar, uid)
 
             with resource.edit_icalendar_component() as component:
@@ -321,13 +333,17 @@ class ICloudCalendarService:
             resource.save()
             result = self._event_summary(resource, calendar_summary)
         if self._cache is not None:
-            self._cache.invalidate_events()
+            self._invalidate_event_cache("update_event")
         return result
 
     def delete_event(self, calendar: str, uid: str) -> dict[str, Any]:
         uid = self._require_text(uid, "uid")
         with self._connected_client() as client:
-            target_calendar, calendar_summary = self._resolve_calendar(client, calendar)
+            target_calendar, calendar_summary = self._resolve_calendar(
+                client,
+                calendar,
+                tool="delete_event",
+            )
             resource = self._get_event_resource(target_calendar, uid)
             resource.delete()
             result = {
@@ -337,19 +353,25 @@ class ICloudCalendarService:
                 "calendar_name": calendar_summary["name"],
             }
         if self._cache is not None:
-            self._cache.invalidate_events()
+            self._invalidate_event_cache("delete_event")
         return result
 
     def _selected_calendars(self, client: Any, selector: str | None) -> list[Any]:
         calendars = list(client.get_calendars())
-        self._cache_calendars(calendars)
+        self._cache_calendars(calendars, tool="list_events")
         if selector is None or not selector.strip():
             return calendars
         return [self._resolve_calendar_from_list(calendars, selector)[0]]
 
-    def _resolve_calendar(self, client: Any, selector: str | None) -> tuple[Any, dict[str, Any]]:
+    def _resolve_calendar(
+        self,
+        client: Any,
+        selector: str | None,
+        *,
+        tool: str,
+    ) -> tuple[Any, dict[str, Any]]:
         calendars = list(client.get_calendars())
-        self._cache_calendars(calendars)
+        self._cache_calendars(calendars, tool=tool)
         calendar, summary = self._resolve_calendar_from_list(calendars, selector)
         return calendar, summary
 
@@ -380,10 +402,26 @@ class ICloudCalendarService:
 
         raise CalendarNotFoundError(f"Calendar not found: {effective_selector}")
 
-    def _cache_calendars(self, calendars: list[Any]) -> None:
+    def _cache_calendars(self, calendars: list[Any], *, tool: str) -> None:
         if self._cache is None:
             return
-        self._cache.set_calendars([self._calendar_summary(calendar) for calendar in calendars])
+        summaries = [self._calendar_summary(calendar) for calendar in calendars]
+        self._cache.set_calendars(summaries)
+        logger.info(
+            "icloud_cache tool={} action=write kind=calendars status=update entries={}",
+            tool,
+            len(summaries),
+        )
+
+    def _invalidate_event_cache(self, tool: str) -> None:
+        if self._cache is None:
+            return
+        invalidated = self._cache.invalidate_events()
+        logger.info(
+            "icloud_cache tool={} action=invalidate kind=events entries={}",
+            tool,
+            invalidated,
+        )
 
     def _resolve_calendar_summaries(
         self,

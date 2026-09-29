@@ -215,6 +215,10 @@ def create_app(
             content=upstream_response.content,
             content_type=upstream_response.headers.get("content-type", "text/calendar; charset=utf-8"),
         )
+        logger.info(
+            "public_calendar_cache action=write status=refresh bytes={}",
+            len(cached_response.content),
+        )
         return calendar_response(cached_response, cache_status="MISS")
 
     return app

@@ -170,12 +170,13 @@ class SQLiteICloudCalendarCache:
             fetched_at=fetched_at,
         )
 
-    def invalidate_events(self) -> None:
+    def invalidate_events(self) -> int:
         with self._connection() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 "DELETE FROM cache_entries WHERE cache_key LIKE 'events:%' "
                 "OR cache_key LIKE 'event:%'"
             )
+            return max(cursor.rowcount, 0)
 
     def get_emails(self, mailbox: str) -> CacheEntry | None:
         return self._get(self._email_key(mailbox), self.email_ttl_seconds)
@@ -201,15 +202,21 @@ class SQLiteICloudCalendarCache:
             },
         )
 
-    def invalidate_emails(self, *mailboxes: str) -> None:
+    def invalidate_emails(self, *mailboxes: str) -> int:
         with self._connection() as connection:
             if not mailboxes:
-                connection.execute("DELETE FROM cache_entries WHERE cache_key LIKE 'emails:%'")
-                return
-            connection.executemany(
-                "DELETE FROM cache_entries WHERE cache_key = ?",
-                ((self._email_key(mailbox),) for mailbox in mailboxes),
-            )
+                cursor = connection.execute(
+                    "DELETE FROM cache_entries WHERE cache_key LIKE 'emails:%'"
+                )
+                return max(cursor.rowcount, 0)
+            total = 0
+            for mailbox in mailboxes:
+                cursor = connection.execute(
+                    "DELETE FROM cache_entries WHERE cache_key = ?",
+                    (self._email_key(mailbox),),
+                )
+                total += max(cursor.rowcount, 0)
+            return total
 
     def _get(self, key: str, ttl_seconds: int) -> CacheEntry | None:
         with self._connection() as connection:

@@ -94,6 +94,9 @@ class ICloudIMAPService:
                         pass
 
     def list_mailboxes(self) -> list[dict[str, Any]]:
+        logger.info(
+            "imap_cache tool=list_mailboxes action=read status=bypass reason=mailbox_listing_live"
+        )
         with self._connected() as client:
             status, rows = client.list()
             self._ensure_ok(status, "IMAP mailbox listing failed")
@@ -119,8 +122,14 @@ class ICloudIMAPService:
     ) -> list[dict[str, Any]]:
         limit = self._validate_limit(limit)
         selected_mailbox = self._mailbox(mailbox)
+        cache_enabled = self._email_cache_enabled()
+        cache_range_supported = (
+            self._cache_range_supported(since, before)
+            if cache_enabled and not query
+            else False
+        )
 
-        if self._email_cache_enabled() and not query and self._cache_range_supported(since, before):
+        if cache_enabled and not query and cache_range_supported:
             cached = self._cache.get_emails(selected_mailbox)
             cached_emails = self._cached_emails(cached)
             if cached is not None and cached.fresh and cached_emails is not None:
@@ -135,13 +144,13 @@ class ICloudIMAPService:
                     limit=limit,
                 )
                 logger.info(
-                    "imap_cache tool=search_emails status=hit entries={}",
+                    "imap_cache tool=search_emails action=read status=hit entries={}",
                     len(result),
                 )
                 return result
 
             logger.info(
-                "imap_cache tool=search_emails status={}",
+                "imap_cache tool=search_emails action=read status={}",
                 "stale" if cached is not None else "miss",
             )
             coverage_since = self._email_cache_since()
@@ -152,7 +161,7 @@ class ICloudIMAPService:
             )
             self._cache.set_emails(selected_mailbox, recent_emails, coverage_since)
             logger.info(
-                "imap_cache tool=search_emails status=refresh entries={} coverage_days={} max_messages={}",
+                "imap_cache tool=search_emails action=write status=refresh entries={} coverage_days={} max_messages={}",
                 len(recent_emails),
                 self._email_cache_days,
                 self._email_cache_max_messages,
@@ -168,6 +177,17 @@ class ICloudIMAPService:
                 limit=limit,
             )
 
+        bypass_reason = (
+            "full_text_query"
+            if query
+            else "range_outside_cache"
+            if cache_enabled
+            else "disabled"
+        )
+        logger.info(
+            "imap_cache tool=search_emails action=read status=bypass reason={}",
+            bypass_reason,
+        )
         return self._search_live(
             selected_mailbox,
             from_address=from_address,
@@ -371,6 +391,9 @@ class ICloudIMAPService:
                 f"max_body_chars must be between 1 and {self._MAX_BODY_CHARS}"
             )
         selected_mailbox = self._mailbox(mailbox)
+        logger.info(
+            "imap_cache tool=get_email action=read status=bypass reason=body_required"
+        )
 
         with self._connected() as client:
             self._select(client, selected_mailbox, readonly=True)
@@ -408,7 +431,7 @@ class ICloudIMAPService:
                 "mailbox": selected_mailbox,
                 "read": read,
             }
-        self._invalidate_email_cache(selected_mailbox)
+        self._invalidate_email_cache("mark_email_read", selected_mailbox)
         return result
 
     def move_email(
@@ -438,7 +461,7 @@ class ICloudIMAPService:
                 "source_marked_deleted": True,
                 "source_expunged": expunged,
             }
-        self._invalidate_email_cache(source, destination)
+        self._invalidate_email_cache("move_email", source, destination)
         return result
 
     def delete_email(self, mailbox: str | None, uid: str) -> dict[str, Any]:
@@ -464,12 +487,18 @@ class ICloudIMAPService:
                 "marked_deleted": True,
                 "expunged": expunged,
             }
-        self._invalidate_email_cache(selected_mailbox)
+        self._invalidate_email_cache("delete_email", selected_mailbox)
         return result
 
-    def _invalidate_email_cache(self, *mailboxes: str) -> None:
+    def _invalidate_email_cache(self, tool: str, *mailboxes: str) -> None:
         if self._cache is not None:
-            self._cache.invalidate_emails(*mailboxes)
+            invalidated = self._cache.invalidate_emails(*mailboxes)
+            logger.info(
+                "imap_cache tool={} action=invalidate kind=email_headers mailboxes={} entries={}",
+                tool,
+                len(mailboxes),
+                invalidated,
+            )
 
     def _expunge_uid_safely(self, client: Any, uid: str) -> bool:
         """Try UID EXPUNGE, otherwise expunge only an isolated deletion."""
