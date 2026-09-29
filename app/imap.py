@@ -1021,8 +1021,9 @@ class ICloudIMAPService:
         )
 
         with self._connected("update_draft") as client:
-            new_uid = self._append_draft(client, selected_mailbox, message)
             self._select(client, selected_mailbox, readonly=False, operation="update_draft")
+            self._require_draft(client, uid)
+            new_uid = self._append_draft(client, selected_mailbox, message)
             status, _ = client.uid("STORE", uid, "+FLAGS.SILENT", r"(\Deleted)")
             self._ensure_ok(status, "IMAP draft replacement failed")
             old_expunged = self._expunge_uid_safely(client, uid)
@@ -1037,6 +1038,22 @@ class ICloudIMAPService:
             "subject": subject.strip(),
             "attachment_count": attachment_count,
         }
+
+    def _require_draft(self, client: Any, uid: str) -> None:
+        status, fetched = client.uid("FETCH", uid, "(UID FLAGS)")
+        self._ensure_ok(status, "IMAP draft lookup failed")
+        for item in fetched or []:
+            metadata = item[0] if isinstance(item, tuple) and item else item
+            if not isinstance(metadata, bytes):
+                continue
+            match = re.search(rb"\bUID\s+(\d+)\b", metadata)
+            if match is None or int(match.group(1)) != int(uid):
+                continue
+            flags = {flag.casefold() for flag in self._fetch_flags([metadata])}
+            if r"\draft" not in flags or r"\deleted" in flags:
+                raise IMAPServiceError("Only an existing, non-deleted draft can be updated")
+            return
+        raise EmailNotFoundError(f"Draft not found: {uid}")
 
     def _draft_mailbox(self, mailbox: str | None) -> str:
         return self._mailbox(mailbox or self.config.drafts_mailbox)

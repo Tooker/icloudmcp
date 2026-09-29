@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from app.config import IMAPConfig
-from app.imap import ICloudIMAPService, IMAPServiceError
+from app.imap import EmailNotFoundError, ICloudIMAPService, IMAPServiceError
 from app.icloud_cache import SQLiteICloudCalendarCache
 
 
@@ -267,7 +267,14 @@ def test_create_draft_appends_mime_message_with_attachment() -> None:
 
 
 def test_update_draft_replaces_old_draft_without_sending() -> None:
-    client = FakeIMAP()
+    class DraftIMAP(FakeIMAP):
+        def uid(self, command: str, *args: Any) -> tuple[str, list[Any]]:
+            if command == "FETCH" and args[1] == "(UID FLAGS)":
+                self.calls.append((command, args))
+                return "OK", [b"1 (UID 42 FLAGS (\\Draft))"]
+            return super().uid(command, *args)
+
+    client = DraftIMAP()
     mail = service_with(client)
 
     updated = mail.update_draft(
@@ -281,6 +288,39 @@ def test_update_draft_replaces_old_draft_without_sending() -> None:
     assert updated["uid"] == "77"
     assert updated["old_draft_marked_deleted"] is True
     assert any(call[0] == "STORE" for call in client.calls)
+    commands = [call[0] for call in client.calls]
+    assert commands.index("FETCH") < commands.index("APPEND") < commands.index("STORE")
+
+
+@pytest.mark.parametrize("flags", [r"\Seen", r"\Draft \Deleted"])
+def test_update_draft_rejects_non_drafts_before_any_write(flags: str) -> None:
+    class NotDraftIMAP(FakeIMAP):
+        def uid(self, command: str, *args: Any) -> tuple[str, list[Any]]:
+            if command == "FETCH":
+                return "OK", [f"1 (UID 42 FLAGS ({flags}))".encode()]
+            return super().uid(command, *args)
+
+    client = NotDraftIMAP()
+    with pytest.raises(IMAPServiceError, match="non-deleted draft"):
+        service_with(client).update_draft(
+            uid="42", mailbox="INBOX", to=["bob@example.com"], subject="Update", body="Body"
+        )
+    assert not any(call[0] in {"APPEND", "STORE", "EXPUNGE"} for call in client.calls)
+
+
+def test_update_draft_rejects_missing_uid_before_any_write() -> None:
+    class MissingDraftIMAP(FakeIMAP):
+        def uid(self, command: str, *args: Any) -> tuple[str, list[Any]]:
+            if command == "FETCH":
+                return "OK", [None]
+            return super().uid(command, *args)
+
+    client = MissingDraftIMAP()
+    with pytest.raises(EmailNotFoundError):
+        service_with(client).update_draft(
+            uid="42", to=["bob@example.com"], subject="Update", body="Body"
+        )
+    assert not any(call[0] in {"APPEND", "STORE", "EXPUNGE"} for call in client.calls)
 
 
 def test_write_operations_mark_move_and_delete_by_uid() -> None:
