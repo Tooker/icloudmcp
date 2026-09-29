@@ -25,6 +25,7 @@ DEFAULT_IMAP_DRAFTS_MAILBOX = "Drafts"
 DEFAULT_IMAP_EMAIL_CACHE_TTL_SECONDS = 300
 DEFAULT_IMAP_EMAIL_CACHE_DAYS = 100
 DEFAULT_IMAP_EMAIL_CACHE_MAX_MESSAGES = 1000
+DEFAULT_IMAP_CONNECTION_POOL_SIZE = 4
 
 
 @dataclass(frozen=True)
@@ -405,6 +406,19 @@ def imap_email_cache_max_messages(environ: dict[str, str] | None = None) -> int:
         ),
         DEFAULT_IMAP_EMAIL_CACHE_MAX_MESSAGES,
         "IMAP_EMAIL_CACHE_MAX_MESSAGES",
+    )
+
+
+def imap_connection_pool_size(environ: dict[str, str] | None = None) -> int:
+    return _positive_or_zero_int(
+        environ,
+        (
+            "IMAP_CONNECTION_POOL_SIZE",
+            "ICLOUDCRUNCHER.IMAP_CONNECTION_POOL_SIZE",
+            "ICLOUD_CRUNCHER_IMAP_CONNECTION_POOL_SIZE",
+        ),
+        DEFAULT_IMAP_CONNECTION_POOL_SIZE,
+        "IMAP_CONNECTION_POOL_SIZE",
     )
 
 

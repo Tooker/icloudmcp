@@ -11,6 +11,8 @@ from email.message import EmailMessage, Message
 from email.parser import BytesParser
 from email.utils import parsedate_to_datetime
 from loguru import logger
+from queue import LifoQueue
+from time import perf_counter
 from typing import Any
 
 from app.config import IMAPConfig
@@ -54,52 +56,109 @@ class ICloudIMAPService:
         cache: SQLiteICloudCalendarCache | None = None,
         email_cache_days: int = 100,
         email_cache_max_messages: int = 1000,
+        connection_pool_size: int = 4,
     ) -> None:
         if email_cache_days < 0:
             raise ValueError("email_cache_days must not be negative")
         if email_cache_max_messages < 0 or email_cache_max_messages > self._MAX_LIMIT:
             raise ValueError(f"email_cache_max_messages must be between 0 and {self._MAX_LIMIT}")
+        if connection_pool_size < 1 or connection_pool_size > 16:
+            raise ValueError("connection_pool_size must be between 1 and 16")
         self.config = config
         self._client_factory = client_factory
         self._cache = cache
         self._email_cache_days = email_cache_days
         self._email_cache_max_messages = email_cache_max_messages
+        self._connection_pool: LifoQueue[Any | None] = LifoQueue(maxsize=connection_pool_size)
+        for _ in range(connection_pool_size):
+            self._connection_pool.put_nowait(None)
 
     @contextmanager
-    def _connected(self) -> Iterator[Any]:
-        client = self._client_factory(self.config.host, self.config.port, timeout=30)
+    def _connected(self, operation: str) -> Iterator[Any]:
+        acquire_started = perf_counter()
+        client = self._connection_pool.get()
+        reused = client is not None
+        logger.info(
+            "imap_phase tool={} phase=connection_acquire reused={} duration_ms={:.1f}",
+            operation,
+            reused,
+            (perf_counter() - acquire_started) * 1000,
+        )
+        discard = False
         try:
-            try:
-                status, _ = client.login(
-                    self.config.username,
-                    self.config.app_specific_password,
-                )
-            except imaplib.IMAP4.error as exc:
-                raise IMAPServiceError(
-                    "IMAP login failed; check the iCloud Mail address and app-specific password"
-                ) from exc
-            self._ensure_ok(status, "IMAP login failed")
+            if client is None:
+                client = self._open_connection(operation)
             yield client
+        except Exception:
+            # A protocol or socket error can leave a connection in an unknown
+            # state. Do not return it to the pool; the next operation gets a
+            # fresh TLS session instead.
+            discard = True
+            raise
         finally:
+            if discard:
+                self._close_connection(client)
+                client = None
+            self._connection_pool.put_nowait(client)
+
+    def _open_connection(self, operation: str) -> Any:
+        started = perf_counter()
+        client: Any | None = None
+        try:
+            client = self._client_factory(self.config.host, self.config.port, timeout=30)
+            status, _ = client.login(
+                self.config.username,
+                self.config.app_specific_password,
+            )
+            self._ensure_ok(status, "IMAP login failed")
+        except imaplib.IMAP4.error as exc:
+            self._close_connection(client)
+            raise IMAPServiceError(
+                "IMAP login failed; check the iCloud Mail address and app-specific password"
+            ) from exc
+        except Exception:
+            self._close_connection(client)
+            raise
+        logger.info(
+            "imap_phase tool={} phase=connection_open duration_ms={:.1f}",
+            operation,
+            (perf_counter() - started) * 1000,
+        )
+        return client
+
+    @staticmethod
+    def _close_connection(client: Any | None) -> None:
+        if client is None:
+            return
+        try:
+            logout = getattr(client, "logout", None)
+            if callable(logout):
+                logout()
+                return
+        except Exception:
+            pass
+        shutdown = getattr(client, "shutdown", None)
+        if callable(shutdown):
             try:
-                logout = getattr(client, "logout", None)
-                if callable(logout):
-                    logout()
+                shutdown()
             except Exception:
-                # Closing a connection must not replace the useful operation
-                # result or leak server-specific connection details.
-                shutdown = getattr(client, "shutdown", None)
-                if callable(shutdown):
-                    try:
-                        shutdown()
-                    except Exception:
-                        pass
+                pass
+
+    def close(self) -> None:
+        """Close idle pooled IMAP connections during application shutdown."""
+
+        while True:
+            try:
+                client = self._connection_pool.get_nowait()
+            except Exception:
+                return
+            self._close_connection(client)
 
     def list_mailboxes(self) -> list[dict[str, Any]]:
         logger.info(
             "imap_cache tool=list_mailboxes action=read status=bypass reason=mailbox_listing_live"
         )
-        with self._connected() as client:
+        with self._connected("list_mailboxes") as client:
             status, rows = client.list()
             self._ensure_ok(status, "IMAP mailbox listing failed")
 
@@ -232,7 +291,7 @@ class ICloudIMAPService:
         if not criteria:
             criteria.append("ALL")
 
-        with self._connected() as client:
+        with self._connected("search_emails") as client:
             self._select(client, selected_mailbox, readonly=True)
             status, data = client.uid("SEARCH", None, *criteria)
             self._ensure_ok(status, "IMAP search failed")
@@ -397,7 +456,7 @@ class ICloudIMAPService:
             "imap_cache tool=get_email action=read status=bypass reason=body_required"
         )
 
-        with self._connected() as client:
+        with self._connected("get_email") as client:
             self._select(client, selected_mailbox, readonly=True)
             status, fetched = client.uid("FETCH", uid, "(UID FLAGS BODY.PEEK[])")
             self._ensure_ok(status, "IMAP message fetch failed")
@@ -438,7 +497,7 @@ class ICloudIMAPService:
             from_address=from_address,
         )
 
-        with self._connected() as client:
+        with self._connected("create_draft") as client:
             uid = self._append_draft(client, selected_mailbox, message)
         self._invalidate_email_cache("create_draft", selected_mailbox)
         return {
@@ -475,7 +534,7 @@ class ICloudIMAPService:
             from_address=from_address,
         )
 
-        with self._connected() as client:
+        with self._connected("update_draft") as client:
             new_uid = self._append_draft(client, selected_mailbox, message)
             self._select(client, selected_mailbox, readonly=False)
             status, _ = client.uid("STORE", uid, "+FLAGS.SILENT", r"(\Deleted)")
@@ -648,7 +707,7 @@ class ICloudIMAPService:
         selected_mailbox = self._mailbox(mailbox)
         operation = "+FLAGS.SILENT" if read else "-FLAGS.SILENT"
 
-        with self._connected() as client:
+        with self._connected("mark_email_read") as client:
             self._select(client, selected_mailbox, readonly=False)
             status, _ = client.uid("STORE", uid, operation, r"(\Seen)")
             self._ensure_ok(status, "IMAP flag update failed")
@@ -672,7 +731,7 @@ class ICloudIMAPService:
         if source.casefold() == destination.casefold():
             raise ValueError("source_mailbox and destination_mailbox must differ")
 
-        with self._connected() as client:
+        with self._connected("move_email") as client:
             self._select(client, source, readonly=False)
             status, _ = client.uid("COPY", uid, self._quote_mailbox(destination))
             self._ensure_ok(status, "IMAP copy failed")
@@ -701,7 +760,7 @@ class ICloudIMAPService:
 
         uid = self._uid(uid)
         selected_mailbox = self._mailbox(mailbox)
-        with self._connected() as client:
+        with self._connected("delete_email") as client:
             self._select(client, selected_mailbox, readonly=False)
             status, _ = client.uid("STORE", uid, "+FLAGS.SILENT", r"(\Deleted)")
             self._ensure_ok(status, "IMAP delete flag update failed")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import asyncio
 import os
 from pathlib import Path
 from time import perf_counter
@@ -22,6 +23,7 @@ from app.config import (
     icloud_cache_path,
     icloud_cache_ttl_seconds,
     icloud_calendars_cache_ttl_seconds,
+    imap_connection_pool_size,
     imap_email_cache_days,
     imap_email_cache_max_messages,
     imap_email_cache_ttl_seconds,
@@ -98,6 +100,7 @@ def create_app(
             cache=shared_cache,
             email_cache_days=imap_email_cache_days(environ),
             email_cache_max_messages=imap_email_cache_max_messages(environ),
+            connection_pool_size=imap_connection_pool_size(environ),
         )
     else:
         mail_service = None
@@ -122,8 +125,13 @@ def create_app(
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         # Mounted Starlette applications do not run their own lifespan under
         # FastAPI, so the MCP session manager is owned by the host app.
-        async with mcp_server.session_manager.run():
-            yield
+        try:
+            async with mcp_server.session_manager.run():
+                yield
+        finally:
+            close = getattr(mail_service, "close", None)
+            if callable(close):
+                await asyncio.to_thread(close)
 
     app = FastAPI(
         docs_url=None,
@@ -142,12 +150,13 @@ def create_app(
     logger.info("calendar_cache ttl_seconds={}", cache.ttl_seconds)
     if shared_cache is not None:
         logger.info(
-            "icloud_cache_backend type=sqlite path={} events_ttl_seconds={} calendars_ttl_seconds={} email_ttl_seconds={} email_max_messages={}",
+            "icloud_cache_backend type=sqlite path={} events_ttl_seconds={} calendars_ttl_seconds={} email_ttl_seconds={} email_max_messages={} imap_connection_pool_size={}",
             shared_cache.path,
             shared_cache.events_ttl_seconds,
             shared_cache.calendars_ttl_seconds,
             shared_cache.email_ttl_seconds,
             shared_cache.email_max_messages,
+            imap_connection_pool_size(environ),
         )
     if service is None:
         logger.warning(

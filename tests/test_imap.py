@@ -116,6 +116,17 @@ def test_lists_mailboxes_and_decodes_modified_utf7() -> None:
     assert mailboxes[1]["name"] == "Übersicht"
 
 
+def test_reuses_a_successful_connection_for_sequential_operations() -> None:
+    client = FakeIMAP()
+    mail = service_with(client)
+
+    mail.list_mailboxes()
+    mail.list_mailboxes()
+
+    assert sum(call[0] == "LOGIN" for call in client.calls) == 1
+    assert sum(call[0] == "LOGOUT" for call in client.calls) == 0
+
+
 def test_login_failure_is_safe_and_actionable() -> None:
     mail = service_with(FailingLoginIMAP())
 

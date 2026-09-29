@@ -24,6 +24,7 @@ services:
       IMAP_EMAIL_CACHE_TTL_SECONDS: ${IMAP_EMAIL_CACHE_TTL_SECONDS:-300}
       IMAP_EMAIL_CACHE_DAYS: ${IMAP_EMAIL_CACHE_DAYS:-100}
       IMAP_EMAIL_CACHE_MAX_MESSAGES: ${IMAP_EMAIL_CACHE_MAX_MESSAGES:-1000}
+      IMAP_CONNECTION_POOL_SIZE: ${IMAP_CONNECTION_POOL_SIZE:-4}
       # Optional: used only for startup logs showing answered external URLs.
       # ICLOUDCRUNCHER.BASE_URL: https://calendar.example.com
       # Optional: in-memory calendar cache TTL in seconds. Default: 300.
