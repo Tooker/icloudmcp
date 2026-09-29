@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import imaplib
+import ssl
 from typing import Any
 
 import pytest
@@ -164,6 +165,40 @@ def test_login_failure_is_safe_and_actionable() -> None:
 
     with pytest.raises(IMAPServiceError, match="iCloud Mail address and app-specific password"):
         mail.list_mailboxes()
+
+
+def test_imap_connection_requires_valid_certificate_and_hostname() -> None:
+    client = FakeIMAP()
+    contexts: list[ssl.SSLContext] = []
+
+    def factory(*args: Any, **kwargs: Any) -> FakeIMAP:
+        contexts.append(kwargs["ssl_context"])
+        return client
+
+    mail = ICloudIMAPService(
+        IMAPConfig(username="user@example.com", app_specific_password="app-password"),
+        client_factory=factory,
+    )
+    mail.list_mailboxes()
+
+    assert contexts[0].verify_mode == ssl.CERT_REQUIRED
+    assert contexts[0].check_hostname is True
+    assert contexts[0].get_ca_certs()
+
+
+def test_certificate_failure_prevents_imap_login() -> None:
+    client = FakeIMAP()
+
+    def factory(*args: Any, **kwargs: Any) -> FakeIMAP:
+        raise ssl.SSLCertVerificationError("certificate rejected")
+
+    mail = ICloudIMAPService(
+        IMAPConfig(username="user@example.com", app_specific_password="app-password"),
+        client_factory=factory,
+    )
+    with pytest.raises(ssl.SSLCertVerificationError):
+        mail.list_mailboxes()
+    assert client.calls == []
 
 
 def test_search_and_read_use_uid_and_peek() -> None:

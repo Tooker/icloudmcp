@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import imaplib
 import re
+import ssl
 import threading
 from contextlib import contextmanager
 from collections.abc import Callable, Iterator
@@ -121,7 +122,12 @@ class ICloudIMAPService:
         started = perf_counter()
         client: Any | None = None
         try:
-            client = self._client_factory(self.config.host, self.config.port, timeout=30)
+            client = self._client_factory(
+                self.config.host,
+                self.config.port,
+                ssl_context=ssl.create_default_context(),
+                timeout=30,
+            )
             status, _ = client.login(
                 self.config.username,
                 self.config.app_specific_password,
