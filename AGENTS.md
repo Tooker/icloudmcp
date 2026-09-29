@@ -14,6 +14,7 @@
 - Build Docker image after code/dependency/Dockerfile changes: `docker compose build`.
 - Run with Docker: create `config.yaml` first, then `docker compose up`.
 - After changing only `config.yaml`, restart the service with `docker compose restart icloud-cruncher`; no image rebuild is needed.
+- The MCP container has a Docker health check for `/healthz`; use `docker compose ps` to see `healthy` or `unhealthy`.
 
 ## Calendar Proxy Behavior
 - `webcal://` source URLs are normalized to `https://`; plain `http://` sources are rejected.

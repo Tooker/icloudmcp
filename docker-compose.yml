@@ -37,6 +37,12 @@ services:
       # ICLOUDCRUNCHER.0.URL: webcal://p106-caldav.icloud.com/published/2/...
       # ICLOUDCRUNCHER.1.token: another-secret-token
       # ICLOUDCRUNCHER.1.URL: webcal://p106-caldav.icloud.com/published/2/...
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
     restart: unless-stopped
 
   # OpenAI Secure MCP Tunnel keeps the MCP server private. It makes an
@@ -44,7 +50,8 @@ services:
   openai-tunnel:
     image: ghcr.io/openai/tunnel-client:${TUNNEL_CLIENT_VERSION:-v0.0.15}
     depends_on:
-      - icloud-cruncher
+      icloud-cruncher:
+        condition: service_healthy
     environment:
       CONTROL_PLANE_API_KEY: ${CONTROL_PLANE_API_KEY:-}
       CONTROL_PLANE_TUNNEL_ID: ${CONTROL_PLANE_TUNNEL_ID:-}

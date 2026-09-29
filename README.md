@@ -203,7 +203,11 @@ Use `docker compose build` only after code, dependency, or Dockerfile changes. F
 ## Endpoints
 
 - `GET /<token>` forwards the matching calendar as `text/calendar`.
-- `GET /healthz` returns `{"status":"ok"}`.
+- `GET /healthz` returns `{"status":"ok"}`. The Docker health check probes this
+  endpoint, so `docker compose ps` shows whether the MCP container is healthy.
+  It intentionally checks only the local application and does not contact iCloud
+  or IMAP on every probe; external connectivity is verified when the tools are
+  used.
 - `POST/GET/DELETE /mcp` and `/mcp/` serve the Streamable HTTP MCP transport.
 
 There is no calendar listing endpoint. Unknown tokens return a neutral `404`.
