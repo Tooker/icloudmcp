@@ -126,6 +126,41 @@ class SQLiteICloudCalendarCache:
                 "CREATE INDEX IF NOT EXISTS email_messages_mailbox_idx "
                 "ON email_messages(mailbox_key, uid)"
             )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS mailbox_states ("
+                "mailbox_key TEXT PRIMARY KEY, uid_validity TEXT NOT NULL)"
+            )
+
+    def sync_uid_validity(self, mailbox: str, uid_validity: str) -> int:
+        """Invalidate one mailbox atomically when its UID generation changes."""
+
+        mailbox_key = self._scoped_key(mailbox.casefold())
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT uid_validity FROM mailbox_states WHERE mailbox_key = ?", (mailbox_key,)
+            ).fetchone()
+            if row is not None and row[0] == uid_validity:
+                return 0
+            headers = connection.execute(
+                "DELETE FROM cache_entries WHERE cache_key = ?",
+                (self._scoped_key(self._email_key(mailbox)),),
+            ).rowcount
+            messages = connection.execute(
+                "DELETE FROM email_messages WHERE mailbox_key = ?", (mailbox_key,)
+            ).rowcount
+            connection.execute(
+                "INSERT OR REPLACE INTO mailbox_states(mailbox_key, uid_validity) VALUES (?, ?)",
+                (mailbox_key, uid_validity),
+            )
+            return max(headers, 0) + max(messages, 0)
+
+    @staticmethod
+    def _generation_matches(connection: sqlite3.Connection, mailbox_key: str, uid_validity: str) -> bool:
+        row = connection.execute(
+            "SELECT uid_validity FROM mailbox_states WHERE mailbox_key = ?", (mailbox_key,)
+        ).fetchone()
+        return row is None or (bool(uid_validity) and row[0] == uid_validity)
 
     def get_calendars(self) -> CacheEntry | None:
         return self._get("calendars", self.calendars_ttl_seconds)
@@ -239,6 +274,7 @@ class SQLiteICloudCalendarCache:
         coverage_since: str,
         *,
         complete: bool = False,
+        uid_validity: str | None = None,
     ) -> None:
         if self.email_max_messages == 0:
             return
@@ -247,14 +283,22 @@ class SQLiteICloudCalendarCache:
             key=self._email_sort_key,
             reverse=True,
         )[: self.email_max_messages]
-        self._set(
-            self._email_key(mailbox),
-            {
-                "coverage_since": coverage_since,
-                "complete": complete and len(emails) <= self.email_max_messages,
-                "emails": ordered,
-            },
-        )
+        value = {
+            "coverage_since": coverage_since,
+            "complete": complete and len(emails) <= self.email_max_messages,
+            "uid_validity": uid_validity,
+            "emails": ordered,
+        }
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if uid_validity is not None and not self._generation_matches(
+                connection, self._scoped_key(mailbox.casefold()), uid_validity
+            ):
+                return
+            connection.execute(
+                "INSERT OR REPLACE INTO cache_entries(cache_key, value_json, fetched_at) VALUES (?, ?, ?)",
+                (self._scoped_key(self._email_key(mailbox)), json.dumps(value, ensure_ascii=False), self._clock()),
+            )
 
     def invalidate_emails(self, *mailboxes: str) -> int:
         with self._connection() as connection:
@@ -273,7 +317,11 @@ class SQLiteICloudCalendarCache:
                 total += max(cursor.rowcount, 0)
             return total
 
-    def get_email_message(self, mailbox: str, uid: str) -> CacheEntry | None:
+    def get_email_message(
+        self, mailbox: str, uid: str, *, uid_validity: str | None = None,
+    ) -> CacheEntry | None:
+        if uid_validity == "":
+            return None
         mailbox_key = self._scoped_key(mailbox.casefold())
         with self._connection() as connection:
             row = connection.execute(
@@ -282,7 +330,7 @@ class SQLiteICloudCalendarCache:
                 "ORDER BY fetched_at DESC LIMIT 1",
                 (mailbox_key, uid),
             ).fetchone()
-        if row is None:
+        if row is None or (uid_validity is not None and row[2] != uid_validity):
             return None
         try:
             summary = json.loads(row[0])
@@ -328,6 +376,8 @@ class SQLiteICloudCalendarCache:
         if not rows:
             return
         with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = [row for row in rows if self._generation_matches(connection, row[1], row[4])]
             connection.executemany(
                 "INSERT OR REPLACE INTO email_messages("
                 "cache_key, mailbox_key, mailbox, uid, uid_validity, message_id, "
@@ -356,8 +406,9 @@ class SQLiteICloudCalendarCache:
         uids: list[str],
         *,
         fresh_only: bool = True,
+        uid_validity: str | None = None,
     ) -> set[str]:
-        if not uids:
+        if not uids or uid_validity == "":
             return set()
         mailbox_key = self._scoped_key(mailbox.casefold())
         cached: set[str] = set()
@@ -366,11 +417,13 @@ class SQLiteICloudCalendarCache:
                 batch = uids[offset : offset + 900]
                 placeholders = ",".join("?" for _ in batch)
                 rows = connection.execute(
-                    "SELECT uid, fetched_at FROM email_messages "
+                    "SELECT uid, fetched_at, uid_validity FROM email_messages "
                     f"WHERE mailbox_key = ? AND uid IN ({placeholders})",
                     (mailbox_key, *batch),
                 ).fetchall()
-                for uid, fetched_at in rows:
+                for uid, fetched_at, stored_validity in rows:
+                    if uid_validity is not None and stored_validity != uid_validity:
+                        continue
                     if not fresh_only or self._is_fresh(fetched_at, self.email_content_ttl_seconds):
                         cached.add(str(uid))
         if fresh_only and self.email_content_ttl_seconds <= 0:

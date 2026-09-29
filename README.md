@@ -104,6 +104,9 @@ Successful flag, move, and delete operations invalidate the affected mailbox hea
 and full-message entries. Set `IMAP_EMAIL_CACHE_CRAWL_ENABLED=false` to disable the
 background crawler, or set `IMAP_EMAIL_CONTENT_TTL_SECONDS=0` to force full-message
 refreshes.
+Mailbox UIDVALIDITY is checked before cached searches and message reads. A
+changed generation invalidates that mailbox's headers and message content;
+messages are never reused when the server's UIDVALIDITY is unavailable.
 
 IMAP uses a small reusable connection pool (4 connections by default) so sequential
 requests do not repeat the TLS login/logout roundtrip. Set `IMAP_CONNECTION_POOL_SIZE`

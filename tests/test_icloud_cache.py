@@ -191,3 +191,30 @@ def test_account_scope_does_not_reuse_legacy_entries_with_unknown_owner(tmp_path
     assert scoped.get_event("Unknown", "event") is None
     assert scoped.get_emails("INBOX") is None
     assert scoped.get_email_message("INBOX", "42") is None
+
+
+def test_late_writes_from_old_uid_generation_cannot_repopulate_cache(tmp_path) -> None:
+    cache = SQLiteICloudCalendarCache(tmp_path / "cache.sqlite3")
+    cache.sync_uid_validity("INBOX", "7")
+    cache.sync_uid_validity("Other", "7")
+    cache.set_email_messages([{
+        "mailbox": "Other", "uid": "42", "uid_validity": "7",
+        "summary": {"subject": "Other"}, "raw_message": b"Other",
+    }])
+    cache.sync_uid_validity("INBOX", "99")
+    cache.set_emails("INBOX", [{"uid": "42"}], "2026-01-01", complete=True, uid_validity="7")
+    cache.set_email_messages([{
+        "mailbox": "INBOX", "uid": "42", "uid_validity": "7",
+        "summary": {"subject": "Old"}, "raw_message": b"Old",
+    }])
+    assert cache.get_emails("INBOX") is None
+    assert cache.get_email_message("INBOX", "42") is None
+    assert cache.get_email_message("Other", "42", uid_validity="7") is not None
+    cache.set_emails("INBOX", [{"uid": "42"}], "2026-01-01", complete=True, uid_validity="99")
+    cache.set_email_messages([{
+        "mailbox": "INBOX", "uid": "42", "uid_validity": "99",
+        "summary": {"subject": "New"}, "raw_message": b"New",
+    }])
+    assert cache.get_emails("INBOX").value["uid_validity"] == "99"
+    assert cache.cached_email_uids("INBOX", ["42"], uid_validity="7") == set()
+    assert cache.cached_email_uids("INBOX", ["42"], uid_validity="99") == {"42"}

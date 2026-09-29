@@ -28,6 +28,8 @@ MESSAGE = (
 class FakeIMAP:
     def __init__(self, *_: Any, **__: Any) -> None:
         self.calls: list[tuple[str, tuple[Any, ...]]] = []
+        self.uid_validity = "7"
+        self.message = MESSAGE
 
     def login(self, username: str, password: str) -> tuple[str, list[bytes]]:
         self.calls.append(("LOGIN", (username, password)))
@@ -47,6 +49,9 @@ class FakeIMAP:
         self.calls.append(("SELECT", (mailbox, readonly)))
         return "OK", [b"1"]
 
+    def response(self, code: str) -> tuple[str, list[Any]]:
+        return code, [self.uid_validity.encode()] if code == "UIDVALIDITY" else [None]
+
     def uid(self, command: str, *args: Any) -> tuple[str, list[Any]]:
         self.calls.append((command, args))
         if command == "SEARCH":
@@ -58,9 +63,9 @@ class FakeIMAP:
             fetched: list[Any] = []
             for uid in uids:
                 if "HEADER.FIELDS" in str(args[1]):
-                    raw = MESSAGE.split(b"\r\n\r\n", 1)[0] + b"\r\n\r\n"
+                    raw = self.message.split(b"\r\n\r\n", 1)[0] + b"\r\n\r\n"
                 else:
-                    raw = MESSAGE
+                    raw = self.message
                 internal_date = datetime.now(timezone.utc).strftime("%d-%b-%Y %H:%M:%S %z")
                 metadata = (
                     f'{uid} FETCH (UID {uid} FLAGS (\\Seen) INTERNALDATE "{internal_date}" '
@@ -232,6 +237,61 @@ def test_crawler_stores_full_messages_newest_first(tmp_path) -> None:
     assert stats["messages"] == 4
     assert mail._cache.get_email_message("INBOX", "42") is not None
     assert mail._cache.get_email_message("Übersicht", "41") is not None
+
+
+def test_reads_normal_imaplib_uid_validity_response() -> None:
+    assert ICloudIMAPService._uid_validity(FakeIMAP(), [b"1"]) == "7"
+    assert ICloudIMAPService._uid_validity(FakeIMAP(), [b"[UIDVALIDITY 99]"]) == "99"
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_get_email_validates_uid_generation_before_cached_read(tmp_path, restart) -> None:
+    client = FakeIMAP()
+    path = tmp_path / "cache.sqlite3"
+    mail = service_with(client, cache=SQLiteICloudCalendarCache(path))
+    assert mail.get_email("INBOX", "42")["body"] == "Hello from iCloud.\r\n"
+    if restart:
+        client = FakeIMAP()
+        mail = service_with(client, cache=SQLiteICloudCalendarCache(path))
+    client.uid_validity = "99"
+    client.message = MESSAGE.replace(b"Hello from iCloud.", b"A different message.")
+    assert mail.get_email("INBOX", "42")["body"] == "A different message.\r\n"
+    assert mail._cache.get_email_message("INBOX", "42", uid_validity="7") is None
+    assert mail._cache.get_email_message("INBOX", "42", uid_validity="99") is not None
+
+
+def test_crawler_refetches_fresh_uids_after_generation_change(tmp_path) -> None:
+    client = FakeIMAP()
+    mail = service_with(client, cache=SQLiteICloudCalendarCache(tmp_path / "cache.sqlite3"))
+    assert mail._crawl_mailbox("INBOX", mailbox_index=1, mailbox_total=1)["messages"] == 2
+    client.uid_validity = "99"
+    client.message = MESSAGE.replace(b"Hello from iCloud.", b"A different message.")
+    assert mail._crawl_mailbox("INBOX", mailbox_index=1, mailbox_total=1)["messages"] == 2
+    assert mail.get_email("INBOX", "42")["body"] == "A different message.\r\n"
+
+
+def test_header_cache_is_invalidated_on_uid_generation_change(tmp_path) -> None:
+    client = FakeIMAP()
+    mail = service_with(client, cache=SQLiteICloudCalendarCache(tmp_path / "cache.sqlite3"))
+    mail.search_emails(since=mail._email_cache_since())
+    client.uid_validity = "99"
+    client.message = MESSAGE.replace(b"Subject: =?utf-8?b?VGVzdCDDpA==?=", b"Subject: Replacement")
+    results = mail.search_emails(subject="Replacement", since=mail._email_cache_since())
+    assert len(results) == 2
+    assert all(message["subject"] == "Replacement" for message in results)
+    assert mail._cache.get_emails("INBOX").value["uid_validity"] == "99"
+
+
+def test_unknown_uid_generation_disables_content_cache_reuse(tmp_path) -> None:
+    client = FakeIMAP()
+    mail = service_with(client, cache=SQLiteICloudCalendarCache(tmp_path / "cache.sqlite3"))
+    mail.get_email("INBOX", "42")
+    client.uid_validity = ""
+    client.message = MESSAGE.replace(b"Hello from iCloud.", b"A different message.")
+    assert mail.get_email("INBOX", "42")["body"] == "A different message.\r\n"
+    mail.get_email("INBOX", "42")
+    assert mail._crawl_mailbox("INBOX", mailbox_index=1, mailbox_total=1)["messages"] == 0
+    assert sum(call[0] == "FETCH" for call in client.calls) == 3
 
 
 def test_login_failure_is_safe_and_actionable() -> None:
