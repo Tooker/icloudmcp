@@ -37,5 +37,3 @@ def test_streamable_http_mcp_endpoint_exposes_calendar_tools(tmp_path: Path) -> 
     assert '"name":"delete_event"' in tools_response.text
     assert '"name":"search_emails"' in tools_response.text
     assert '"name":"mark_email_read"' in tools_response.text
-    assert '"name":"list_reminder_lists"' in tools_response.text
-    assert '"name":"create_reminder"' in tools_response.text

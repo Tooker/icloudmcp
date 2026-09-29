@@ -27,7 +27,6 @@ from app.config import (
 from app.icloud import ICloudCalendarService
 from app.imap import ICloudIMAPService
 from app.mcp_server import create_mcp_server
-from app.reminders import ICloudReminderService
 
 
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
@@ -69,7 +68,6 @@ def create_app(
     environ: dict[str, str] | None = None,
     icloud_service: ICloudCalendarService | None = None,
     imap_service: ICloudIMAPService | None = None,
-    reminder_service: ICloudReminderService | None = None,
 ) -> FastAPI:
     calendars = load_calendars(config_path, environ)
     icloud_config: ICloudConfig | None = load_icloud_config(config_path, environ)
@@ -80,10 +78,7 @@ def create_app(
     mail_service = imap_service or (
         ICloudIMAPService(imap_config) if imap_config is not None else None
     )
-    reminders = reminder_service or (
-        ICloudReminderService(icloud_config) if icloud_config is not None else None
-    )
-    mcp_server = create_mcp_server(service, mail_service, reminders)
+    mcp_server = create_mcp_server(service, mail_service)
     mcp_http_app = mcp_server.streamable_http_app(
         streamable_http_path="/",
         host="0.0.0.0",
@@ -119,7 +114,6 @@ def create_app(
     app.state.calendar_cache = cache
     app.state.icloud_service = service
     app.state.imap_service = mail_service
-    app.state.reminder_service = reminders
     app.state.mcp_server = mcp_server
     logger.info("calendar_cache ttl_seconds={}", cache.ttl_seconds)
     if service is None:

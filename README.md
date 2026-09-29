@@ -1,11 +1,11 @@
 # IcloudCruncher
 
 Python proxy for shared iCloud calendars plus a read/write MCP server for iCloud
-Calendar, iCloud Mail, and CalDAV-backed Apple Reminders. The MCP integration is
-exposed over Streamable HTTP at `/mcp`.
+Calendar and iCloud Mail. The MCP integration is exposed over Streamable HTTP at
+`/mcp`.
 
-Calendar and Reminders use CalDAV; Mail uses IMAP over SSL. Contacts, Notes,
-Files, and SMTP mail sending are out of scope.
+Calendar uses CalDAV; Mail uses IMAP over SSL. Contacts, Notes, Reminders, Files,
+and SMTP mail sending are out of scope.
 
 ## Local Setup
 
@@ -75,10 +75,6 @@ The MCP server provides:
 - `move_email` — copy a message to another mailbox and mark the source for deletion.
 - `delete_email` — delete a message; it requires `confirm=true` and may leave a safe
   deletion marker when the server cannot isolate an IMAP expunge.
-- `list_reminder_lists`, `list_reminders`, and `get_reminder` — read CalDAV VTODO lists
-  and reminders.
-- `create_reminder`, `update_reminder`, and `delete_reminder` — write VTODO reminders;
-  `delete_reminder` requires `confirm=true`.
 
 IMAP operations use mailbox-local UIDs, so callers should use the UID together with the
 mailbox returned by `search_emails`. IMAP is not an outgoing mail protocol; sending is
@@ -87,15 +83,6 @@ intentionally not implemented.
 Apple's documented iCloud Mail settings are `imap.mail.me.com` on port `993` with SSL
 and an app-specific password. The username may be the full iCloud Mail address or the
 address name, depending on the client. See Apple's [iCloud Mail server settings](https://support.apple.com/en-us/102525).
-
-### Apple Reminders compatibility
-
-The Reminders integration uses standard CalDAV `VTODO` collections. It lists only
-collections that explicitly report `VTODO` support. Apple moved many Reminders lists to
-a newer CloudKit-backed store, so upgraded lists may not appear or may reject writes;
-this is an undocumented, account-dependent compatibility path rather than a guaranteed
-Apple Reminders API. The underlying CalDAV client documents similar iCloud task
-limitations in [python-caldav issue #3](https://github.com/python-caldav/caldav/issues/3).
 
 The service listens on `http://127.0.0.1:8080/mcp` locally. The MCP endpoint
 does not expose iCloud credentials, source URLs, or raw iCalendar payloads in

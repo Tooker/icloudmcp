@@ -10,7 +10,6 @@ from mcp_types import ToolAnnotations
 
 from app.icloud import ICloudCalendarService, ICloudServiceError
 from app.imap import ICloudIMAPService, IMAPServiceError
-from app.reminders import ICloudReminderService
 
 ResultT = TypeVar("ResultT")
 
@@ -37,23 +36,18 @@ DELETE_ANNOTATIONS = ToolAnnotations(
 def create_mcp_server(
     service: ICloudCalendarService | None,
     imap_service: ICloudIMAPService | None = None,
-    reminder_service: ICloudReminderService | None = None,
 ) -> MCPServer:
     server = MCPServer(
         name="icloud-cruncher",
-        title="iCloud Calendar, Mail & Reminders",
+        title="iCloud Calendar & Mail",
         description=(
-            "Read and write iCloud Calendar and compatible iCloud Mail and Reminders "
-            "through CalDAV and IMAP."
+            "Read and write iCloud Calendar and iCloud Mail through CalDAV and IMAP."
         ),
         instructions=(
             "Use list_calendars before selecting a calendar when the calendar is unknown. "
             "Use ISO 8601 timestamps for timed events and YYYY-MM-DD for all-day events. "
-            "Use list_reminder_lists before selecting a reminder list. iCloud Reminders "
-            "works only for CalDAV VTODO collections exposed by the account; upgraded "
-            "CloudKit-backed lists may not be available. Write and delete operations "
-            "change the user's iCloud data; summarize the planned change and obtain user "
-            "approval before calling them."
+            "Write and delete operations change the user's iCloud data; summarize the "
+            "planned change and obtain user approval before calling them."
         ),
         version="0.3.0",
     )
@@ -82,7 +76,6 @@ def create_mcp_server(
 
     calendar_missing = "iCloud CalDAV is not configured. Set ICLOUD_USERNAME and ICLOUD_APP_PASSWORD."
     imap_missing = "iCloud IMAP is not configured. Set IMAP_USERNAME and IMAP_APP_PASSWORD."
-    reminders_missing = "iCloud CalDAV is not configured. Set ICLOUD_USERNAME and ICLOUD_APP_PASSWORD."
 
     @server.tool(
         name="list_calendars",
@@ -391,161 +384,6 @@ def create_mcp_server(
                 uid=uid,
             ),
             imap_missing,
-        )
-
-    @server.tool(
-        name="list_reminder_lists",
-        title="List iCloud reminder lists",
-        description=(
-            "List task-capable iCloud CalDAV collections. Upgraded Apple Reminders lists "
-            "may not be exposed through CalDAV and therefore may not appear here."
-        ),
-        annotations=READ_ANNOTATIONS,
-    )
-    async def list_reminder_lists() -> list[dict[str, Any]]:
-        return await call_service(
-            reminder_service,
-            "list_reminder_lists",
-            reminder_service.list_reminder_lists if reminder_service else lambda: [],
-            reminders_missing,
-        )
-
-    @server.tool(
-        name="list_reminders",
-        title="List iCloud reminders",
-        description=(
-            "List reminders, optionally filtered by list, completion state, text, and due "
-            "date. Use list_reminder_lists first when the list name is unknown."
-        ),
-        annotations=READ_ANNOTATIONS,
-    )
-    async def list_reminders(
-        list_name: str | None = None,
-        completed: bool | None = None,
-        query: str | None = None,
-        due_after: str | None = None,
-        due_before: str | None = None,
-        limit: int = 50,
-    ) -> list[dict[str, Any]]:
-        return await call_service(
-            reminder_service,
-            "list_reminders",
-            partial(
-                reminder_service.list_reminders if reminder_service else lambda **_: [],
-                list_name=list_name,
-                completed=completed,
-                query=query,
-                due_after=due_after,
-                due_before=due_before,
-                limit=limit,
-            ),
-            reminders_missing,
-        )
-
-    @server.tool(
-        name="get_reminder",
-        title="Get an iCloud reminder",
-        description="Fetch one reminder by UID from a selected iCloud reminder list.",
-        annotations=READ_ANNOTATIONS,
-    )
-    async def get_reminder(list_name: str, uid: str) -> dict[str, Any]:
-        return await call_service(
-            reminder_service,
-            "get_reminder",
-            partial(
-                reminder_service.get_reminder if reminder_service else lambda **_: {},
-                list_name=list_name,
-                uid=uid,
-            ),
-            reminders_missing,
-        )
-
-    @server.tool(
-        name="create_reminder",
-        title="Create an iCloud reminder",
-        description=(
-            "Create a VTODO reminder. This changes external state and requires client approval. "
-            "Use an ISO date or datetime for due; priority follows RFC 5545 (1 high, 5 medium, "
-            "9 low)."
-        ),
-        annotations=WRITE_ANNOTATIONS,
-    )
-    async def create_reminder(
-        title: str,
-        list_name: str | None = None,
-        notes: str | None = None,
-        due: str | None = None,
-        priority: int | None = None,
-    ) -> dict[str, Any]:
-        return await call_service(
-            reminder_service,
-            "create_reminder",
-            partial(
-                reminder_service.create_reminder if reminder_service else lambda **_: {},
-                list_name=list_name,
-                title=title,
-                notes=notes,
-                due=due,
-                priority=priority,
-            ),
-            reminders_missing,
-        )
-
-    @server.tool(
-        name="update_reminder",
-        title="Update an iCloud reminder",
-        description=(
-            "Update supplied fields of a reminder. This changes external state. Pass notes "
-            "or due as an empty string to clear those fields."
-        ),
-        annotations=WRITE_ANNOTATIONS,
-    )
-    async def update_reminder(
-        list_name: str,
-        uid: str,
-        title: str | None = None,
-        notes: str | None = None,
-        due: str | None = None,
-        completed: bool | None = None,
-        priority: int | None = None,
-    ) -> dict[str, Any]:
-        return await call_service(
-            reminder_service,
-            "update_reminder",
-            partial(
-                reminder_service.update_reminder if reminder_service else lambda **_: {},
-                list_name=list_name,
-                uid=uid,
-                title=title,
-                notes=notes,
-                due=due,
-                completed=completed,
-                priority=priority,
-            ),
-            reminders_missing,
-        )
-
-    @server.tool(
-        name="delete_reminder",
-        title="Delete an iCloud reminder",
-        description=(
-            "Permanently delete a reminder. This is destructive and requires confirm=true in "
-            "addition to the client's approval flow."
-        ),
-        annotations=DELETE_ANNOTATIONS,
-    )
-    async def delete_reminder(list_name: str, uid: str, confirm: bool) -> dict[str, Any]:
-        if not confirm:
-            raise ValueError("delete_reminder requires confirm=true")
-        return await call_service(
-            reminder_service,
-            "delete_reminder",
-            partial(
-                reminder_service.delete_reminder if reminder_service else lambda **_: {},
-                list_name=list_name,
-                uid=uid,
-            ),
-            reminders_missing,
         )
 
     return server
