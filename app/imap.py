@@ -1256,9 +1256,8 @@ class ICloudIMAPService:
         """Mark one message deleted and expunge it when that is safe.
 
         UID EXPUNGE is not available on every IMAP server. If it is not
-        supported and other messages are already marked ``\\Deleted``, this
-        method intentionally leaves the target marked for deletion rather
-        than expunging unrelated messages.
+        supported, this method leaves the target marked for deletion rather
+        than risking a mailbox-wide expunge of unrelated messages.
         """
 
         uid = self._uid(uid)
@@ -1296,7 +1295,7 @@ class ICloudIMAPService:
             )
 
     def _expunge_uid_safely(self, client: Any, uid: str) -> bool:
-        """Try UID EXPUNGE, otherwise expunge only an isolated deletion."""
+        """Expunge only the requested UID; never use mailbox-wide EXPUNGE."""
 
         try:
             status, _ = client.uid("EXPUNGE", uid)
@@ -1305,17 +1304,9 @@ class ICloudIMAPService:
         except Exception:
             pass
 
-        try:
-            status, data = client.uid("SEARCH", None, "DELETED")
-            if not self._is_ok(status):
-                return False
-            deleted_uids = set(self._parse_uids(data))
-            if deleted_uids != {uid}:
-                return False
-            status, _ = client.expunge()
-            return self._is_ok(status)
-        except Exception:
-            return False
+        # A SEARCH followed by EXPUNGE cannot isolate a deletion: another
+        # connection may mark additional messages deleted between commands.
+        return False
 
     def _select(
         self,

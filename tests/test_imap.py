@@ -332,6 +332,43 @@ def test_write_operations_mark_move_and_delete_by_uid() -> None:
     deleted = mail.delete_email("INBOX", "42")
 
     assert moved["source_marked_deleted"] is True
-    assert moved["source_expunged"] is True
-    assert deleted["expunged"] is True
+    assert moved["source_expunged"] is False
+    assert deleted["marked_deleted"] is True
+    assert deleted["expunged"] is False
     assert any(call[0] == "COPY" for call in client.calls)
+
+
+@pytest.mark.parametrize("outcome", ["BAD", "NO", "abort"])
+def test_unsupported_uid_expunge_never_uses_mailbox_wide_expunge(outcome: str) -> None:
+    class NoUIDExpungeIMAP(FakeIMAP):
+        def uid(self, command: str, *args: Any) -> tuple[str, list[Any]]:
+            if command == "EXPUNGE":
+                self.calls.append((command, args))
+                if outcome == "abort":
+                    raise imaplib.IMAP4.abort("connection failed")
+                return outcome, [b"not available"]
+            return super().uid(command, *args)
+
+        def expunge(self) -> tuple[str, list[bytes]]:
+            raise AssertionError("mailbox-wide EXPUNGE must never be sent")
+
+    client = NoUIDExpungeIMAP()
+    result = service_with(client).delete_email("INBOX", "42")
+    assert result["marked_deleted"] is True
+    assert result["expunged"] is False
+    assert not any(call[0] == "SEARCH" for call in client.calls)
+
+
+def test_supported_uid_expunge_targets_only_requested_message() -> None:
+    class UIDExpungeIMAP(FakeIMAP):
+        def uid(self, command: str, *args: Any) -> tuple[str, list[Any]]:
+            if command == "EXPUNGE":
+                self.calls.append((command, args))
+                return "OK", [b"done"]
+            return super().uid(command, *args)
+
+    client = UIDExpungeIMAP()
+    result = service_with(client).delete_email("INBOX", "42")
+    assert result["expunged"] is True
+    assert ("EXPUNGE", ("42",)) in client.calls
+    assert ("EXPUNGE", ()) not in client.calls
