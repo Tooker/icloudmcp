@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 
 from app.config import load_imap_config
 from app.imap import ICloudIMAPService, IMAPServiceError
+from app.icloud_cache import SQLiteICloudCalendarCache
 
 pytestmark = pytest.mark.live
 
 
-def test_live_imap_login_mailboxes_and_header_search() -> None:
+def test_live_imap_login_mailboxes_and_header_search(tmp_path: Path) -> None:
     if os.environ.get("RUN_LIVE_IMAP_TESTS") != "1":
         pytest.skip("set RUN_LIVE_IMAP_TESTS=1 to access the configured iCloud mailbox")
 
@@ -18,7 +20,8 @@ def test_live_imap_login_mailboxes_and_header_search() -> None:
     if config is None:
         pytest.fail("IMAP credentials are not configured")
 
-    service = ICloudIMAPService(config)
+    cache = SQLiteICloudCalendarCache(tmp_path / "live-imap-cache.sqlite3")
+    service = ICloudIMAPService(config, cache=cache)
     try:
         mailboxes = service.list_mailboxes()
     except IMAPServiceError as exc:
@@ -42,3 +45,8 @@ def test_live_imap_login_mailboxes_and_header_search() -> None:
 
     assert len(results) <= 5
     assert all("body" not in result and "raw" not in result for result in results)
+    cached = cache.get_emails(mailbox)
+    assert cached is not None and cached.fresh
+
+    cached_results = service.search_emails(mailbox=mailbox, limit=5)
+    assert cached_results == results

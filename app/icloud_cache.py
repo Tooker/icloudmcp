@@ -18,12 +18,13 @@ class CacheEntry:
 
 
 class SQLiteICloudCalendarCache:
-    """Persistent, TTL-based cache for normalized iCloud calendar data.
+    """Persistent, TTL-based cache for normalized iCloud calendar and mail data.
 
     iCloud remains the source of truth. The database only stores read results
-    so repeated MCP requests do not reopen a CalDAV connection unnecessarily.
-    Calendar writes invalidate cached event results after the remote operation
-    succeeds.
+    so repeated MCP requests do not reopen a CalDAV or IMAP connection
+    unnecessarily. Calendar and mail writes invalidate their corresponding
+    cached read results after the remote operation succeeds. Email cache
+    entries contain headers and flags only; message bodies are not stored.
     """
 
     def __init__(
@@ -32,16 +33,24 @@ class SQLiteICloudCalendarCache:
         *,
         events_ttl_seconds: int = 60,
         calendars_ttl_seconds: int = 300,
+        email_ttl_seconds: int = 300,
+        email_max_messages: int = 1000,
         clock: Callable[[], float] = time.time,
     ) -> None:
         if events_ttl_seconds < 0:
             raise ValueError("events_ttl_seconds must not be negative")
         if calendars_ttl_seconds < 0:
             raise ValueError("calendars_ttl_seconds must not be negative")
+        if email_ttl_seconds < 0:
+            raise ValueError("email_ttl_seconds must not be negative")
+        if email_max_messages < 0:
+            raise ValueError("email_max_messages must not be negative")
 
         self.path = Path(path)
         self.events_ttl_seconds = events_ttl_seconds
         self.calendars_ttl_seconds = calendars_ttl_seconds
+        self.email_ttl_seconds = email_ttl_seconds
+        self.email_max_messages = email_max_messages
         self._clock = clock
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.touch(exist_ok=True)
@@ -168,6 +177,40 @@ class SQLiteICloudCalendarCache:
                 "OR cache_key LIKE 'event:%'"
             )
 
+    def get_emails(self, mailbox: str) -> CacheEntry | None:
+        return self._get(self._email_key(mailbox), self.email_ttl_seconds)
+
+    def set_emails(
+        self,
+        mailbox: str,
+        emails: list[dict[str, Any]],
+        coverage_since: str,
+    ) -> None:
+        if self.email_max_messages == 0:
+            return
+        ordered = sorted(
+            emails,
+            key=self._email_sort_key,
+            reverse=True,
+        )[: self.email_max_messages]
+        self._set(
+            self._email_key(mailbox),
+            {
+                "coverage_since": coverage_since,
+                "emails": ordered,
+            },
+        )
+
+    def invalidate_emails(self, *mailboxes: str) -> None:
+        with self._connection() as connection:
+            if not mailboxes:
+                connection.execute("DELETE FROM cache_entries WHERE cache_key LIKE 'emails:%'")
+                return
+            connection.executemany(
+                "DELETE FROM cache_entries WHERE cache_key = ?",
+                ((self._email_key(mailbox),) for mailbox in mailboxes),
+            )
+
     def _get(self, key: str, ttl_seconds: int) -> CacheEntry | None:
         with self._connection() as connection:
             row = connection.execute(
@@ -199,12 +242,21 @@ class SQLiteICloudCalendarCache:
         return ttl_seconds > 0 and fetched_at + ttl_seconds > self._clock()
 
     @staticmethod
+    def _email_sort_key(email: dict[str, Any]) -> tuple[str, int]:
+        uid = str(email.get("uid") or "")
+        return str(email.get("date") or ""), int(uid) if uid.isdigit() else 0
+
+    @staticmethod
     def _events_key(calendar_id: str, start: str, end: str) -> str:
         return "events:" + SQLiteICloudCalendarCache._digest(calendar_id, start, end)
 
     @staticmethod
     def _event_key(calendar_id: str, uid: str) -> str:
         return "event:" + SQLiteICloudCalendarCache._digest(calendar_id, uid)
+
+    @staticmethod
+    def _email_key(mailbox: str) -> str:
+        return "emails:" + SQLiteICloudCalendarCache._digest(mailbox.casefold())
 
     @staticmethod
     def _digest(*parts: str) -> str:

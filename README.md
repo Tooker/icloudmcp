@@ -56,6 +56,9 @@ IMAP_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx
 IMAP_HOST=imap.mail.me.com
 IMAP_PORT=993
 IMAP_DEFAULT_MAILBOX=INBOX
+IMAP_EMAIL_CACHE_TTL_SECONDS=300
+IMAP_EMAIL_CACHE_DAYS=100
+IMAP_EMAIL_CACHE_MAX_MESSAGES=1000
 ```
 
 The MCP server provides:
@@ -79,6 +82,14 @@ The MCP server provides:
 IMAP operations use mailbox-local UIDs, so callers should use the UID together with the
 mailbox returned by `search_emails`. IMAP is not an outgoing mail protocol; sending is
 intentionally not implemented.
+
+The IMAP read cache keeps up to the 1,000 newest message headers per mailbox from the
+last 100 days in the same persistent SQLite volume as the calendar cache. It refreshes
+every 300 seconds by default. Search filters for sender, recipient, subject, dates, and
+unread status can use the cache; free-text searches and `get_email` still query iCloud
+because they may require message bodies. Bodies and attachments are not stored in the
+cache. Successful flag, move, and delete operations invalidate the affected mailbox
+cache. Set `IMAP_EMAIL_CACHE_TTL_SECONDS=0` to disable it.
 
 An opt-in live smoke test is available for diagnosing real mailbox access. It logs no
 credentials and checks only login, mailbox listing, and message headers:

@@ -60,3 +60,27 @@ def test_sqlite_cache_indexes_events_and_can_invalidate_them(tmp_path: Path) -> 
         "2026-02-01T00:00:00+00:00",
     ) is None
     assert cache.get_event("work", "event-1") is None
+
+
+def test_sqlite_cache_keeps_latest_email_headers_with_a_bound(tmp_path: Path) -> None:
+    cache = SQLiteICloudCalendarCache(
+        tmp_path / "cache.sqlite3",
+        email_ttl_seconds=300,
+        email_max_messages=2,
+        clock=lambda: 100.0,
+    )
+    emails = [
+        {"uid": "1", "date": "2026-01-01T10:00:00+00:00", "subject": "old"},
+        {"uid": "3", "date": "2026-01-03T10:00:00+00:00", "subject": "newest"},
+        {"uid": "2", "date": "2026-01-02T10:00:00+00:00", "subject": "middle"},
+    ]
+    cache.set_emails("INBOX", emails, "2025-10-01")
+
+    cached = cache.get_emails("INBOX")
+    assert cached is not None
+    assert cached.fresh is True
+    assert cached.value["coverage_since"] == "2025-10-01"
+    assert [email["uid"] for email in cached.value["emails"]] == ["3", "2"]
+
+    cache.invalidate_emails("INBOX")
+    assert cache.get_emails("INBOX") is None

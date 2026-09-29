@@ -21,6 +21,9 @@ DEFAULT_ICLOUD_TIMEZONE = "UTC"
 DEFAULT_IMAP_HOST = "imap.mail.me.com"
 DEFAULT_IMAP_PORT = 993
 DEFAULT_IMAP_MAILBOX = "INBOX"
+DEFAULT_IMAP_EMAIL_CACHE_TTL_SECONDS = 300
+DEFAULT_IMAP_EMAIL_CACHE_DAYS = 100
+DEFAULT_IMAP_EMAIL_CACHE_MAX_MESSAGES = 1000
 
 
 @dataclass(frozen=True)
@@ -353,6 +356,45 @@ def icloud_calendars_cache_ttl_seconds(environ: dict[str, str] | None = None) ->
         ),
         DEFAULT_ICLOUD_CALENDARS_CACHE_TTL_SECONDS,
         "ICLOUD_CALENDARS_CACHE_TTL_SECONDS",
+    )
+
+
+def imap_email_cache_ttl_seconds(environ: dict[str, str] | None = None) -> int:
+    return _positive_or_zero_int(
+        environ,
+        (
+            "IMAP_EMAIL_CACHE_TTL_SECONDS",
+            "ICLOUDCRUNCHER.IMAP_EMAIL_CACHE_TTL_SECONDS",
+            "ICLOUD_CRUNCHER_IMAP_EMAIL_CACHE_TTL_SECONDS",
+        ),
+        DEFAULT_IMAP_EMAIL_CACHE_TTL_SECONDS,
+        "IMAP_EMAIL_CACHE_TTL_SECONDS",
+    )
+
+
+def imap_email_cache_days(environ: dict[str, str] | None = None) -> int:
+    return _positive_or_zero_int(
+        environ,
+        (
+            "IMAP_EMAIL_CACHE_DAYS",
+            "ICLOUDCRUNCHER.IMAP_EMAIL_CACHE_DAYS",
+            "ICLOUD_CRUNCHER_IMAP_EMAIL_CACHE_DAYS",
+        ),
+        DEFAULT_IMAP_EMAIL_CACHE_DAYS,
+        "IMAP_EMAIL_CACHE_DAYS",
+    )
+
+
+def imap_email_cache_max_messages(environ: dict[str, str] | None = None) -> int:
+    return _positive_or_zero_int(
+        environ,
+        (
+            "IMAP_EMAIL_CACHE_MAX_MESSAGES",
+            "ICLOUDCRUNCHER.IMAP_EMAIL_CACHE_MAX_MESSAGES",
+            "ICLOUD_CRUNCHER_IMAP_EMAIL_CACHE_MAX_MESSAGES",
+        ),
+        DEFAULT_IMAP_EMAIL_CACHE_MAX_MESSAGES,
+        "IMAP_EMAIL_CACHE_MAX_MESSAGES",
     )
 
 

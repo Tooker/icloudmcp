@@ -8,6 +8,9 @@ from app.config import (
     icloud_cache_path,
     icloud_cache_ttl_seconds,
     icloud_calendars_cache_ttl_seconds,
+    imap_email_cache_days,
+    imap_email_cache_max_messages,
+    imap_email_cache_ttl_seconds,
     load_calendars,
     load_imap_config,
     load_icloud_config,
@@ -141,6 +144,20 @@ def test_icloud_cache_settings_have_separate_defaults_and_overrides(tmp_path: Pa
     assert icloud_cache_path(environ=configured) == tmp_path / "calendar-cache.sqlite3"
     assert icloud_cache_ttl_seconds(environ=configured) == 15
     assert icloud_calendars_cache_ttl_seconds(environ=configured) == 900
+
+
+def test_imap_email_cache_settings_default_to_recent_bounded_cache() -> None:
+    assert imap_email_cache_ttl_seconds(environ={}) == 300
+    assert imap_email_cache_days(environ={}) == 100
+    assert imap_email_cache_max_messages(environ={}) == 1000
+    configured = {
+        "IMAP_EMAIL_CACHE_TTL_SECONDS": "600",
+        "IMAP_EMAIL_CACHE_DAYS": "30",
+        "IMAP_EMAIL_CACHE_MAX_MESSAGES": "250",
+    }
+    assert imap_email_cache_ttl_seconds(environ=configured) == 600
+    assert imap_email_cache_days(environ=configured) == 30
+    assert imap_email_cache_max_messages(environ=configured) == 250
 
 
 def test_rejects_duplicate_tokens(tmp_path: Path) -> None:

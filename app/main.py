@@ -22,6 +22,9 @@ from app.config import (
     icloud_cache_path,
     icloud_cache_ttl_seconds,
     icloud_calendars_cache_ttl_seconds,
+    imap_email_cache_days,
+    imap_email_cache_max_messages,
+    imap_email_cache_ttl_seconds,
     load_calendars,
     load_imap_config,
     load_icloud_config,
@@ -78,20 +81,26 @@ def create_app(
     imap_config: IMAPConfig | None = load_imap_config(config_path, environ)
     if icloud_service is not None:
         service = icloud_service
-        icloud_cache = getattr(icloud_service, "_cache", None)
+        shared_cache = getattr(icloud_service, "_cache", None)
     elif icloud_config is not None:
-        icloud_cache = SQLiteICloudCalendarCache(
-            icloud_cache_path(environ),
-            events_ttl_seconds=icloud_cache_ttl_seconds(environ),
-            calendars_ttl_seconds=icloud_calendars_cache_ttl_seconds(environ),
-        )
-        service = ICloudCalendarService(icloud_config, cache=icloud_cache)
+        shared_cache = _build_icloud_cache(environ)
+        service = ICloudCalendarService(icloud_config, cache=shared_cache)
     else:
-        icloud_cache = None
+        shared_cache = None
         service = None
-    mail_service = imap_service or (
-        ICloudIMAPService(imap_config) if imap_config is not None else None
-    )
+    if imap_service is not None:
+        mail_service = imap_service
+    elif imap_config is not None:
+        if shared_cache is None:
+            shared_cache = _build_icloud_cache(environ)
+        mail_service = ICloudIMAPService(
+            imap_config,
+            cache=shared_cache,
+            email_cache_days=imap_email_cache_days(environ),
+            email_cache_max_messages=imap_email_cache_max_messages(environ),
+        )
+    else:
+        mail_service = None
     mcp_server = create_mcp_server(service, mail_service)
     mcp_http_app = mcp_server.streamable_http_app(
         streamable_http_path="/",
@@ -127,16 +136,18 @@ def create_app(
     app.state.calendars = calendars
     app.state.calendar_cache = cache
     app.state.icloud_service = service
-    app.state.icloud_cache = icloud_cache
+    app.state.icloud_cache = shared_cache
     app.state.imap_service = mail_service
     app.state.mcp_server = mcp_server
     logger.info("calendar_cache ttl_seconds={}", cache.ttl_seconds)
-    if icloud_cache is not None:
+    if shared_cache is not None:
         logger.info(
-            "icloud_cache_backend type=sqlite path={} events_ttl_seconds={} calendars_ttl_seconds={}",
-            icloud_cache.path,
-            icloud_cache.events_ttl_seconds,
-            icloud_cache.calendars_ttl_seconds,
+            "icloud_cache_backend type=sqlite path={} events_ttl_seconds={} calendars_ttl_seconds={} email_ttl_seconds={} email_max_messages={}",
+            shared_cache.path,
+            shared_cache.events_ttl_seconds,
+            shared_cache.calendars_ttl_seconds,
+            shared_cache.email_ttl_seconds,
+            shared_cache.email_max_messages,
         )
     if service is None:
         logger.warning(
@@ -238,6 +249,16 @@ def _split_csv(value: str | None, default: tuple[str, ...]) -> list[str]:
     if not value:
         return list(default)
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _build_icloud_cache(environ: dict[str, str] | None) -> SQLiteICloudCalendarCache:
+    return SQLiteICloudCalendarCache(
+        icloud_cache_path(environ),
+        events_ttl_seconds=icloud_cache_ttl_seconds(environ),
+        calendars_ttl_seconds=icloud_calendars_cache_ttl_seconds(environ),
+        email_ttl_seconds=imap_email_cache_ttl_seconds(environ),
+        email_max_messages=imap_email_cache_max_messages(environ),
+    )
 
 
 app = create_app()

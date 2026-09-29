@@ -7,6 +7,7 @@ import pytest
 
 from app.config import IMAPConfig
 from app.imap import ICloudIMAPService, IMAPServiceError
+from app.icloud_cache import SQLiteICloudCalendarCache
 
 
 MESSAGE = (
@@ -50,13 +51,17 @@ class FakeIMAP:
                 return "OK", [b"42"]
             return "OK", [b"41 42"]
         if command == "FETCH":
-            uid = str(args[0])
-            if "HEADER.FIELDS" in str(args[1]):
-                raw = MESSAGE.split(b"\r\n\r\n", 1)[0] + b"\r\n\r\n"
-            else:
-                raw = MESSAGE
-            metadata = f"{uid} FETCH (UID {uid} FLAGS (\\Seen) BODY {{{len(raw)}}})".encode()
-            return "OK", [(metadata, raw), b")"]
+            uids = str(args[0]).split(",")
+            fetched: list[Any] = []
+            for uid in uids:
+                if "HEADER.FIELDS" in str(args[1]):
+                    raw = MESSAGE.split(b"\r\n\r\n", 1)[0] + b"\r\n\r\n"
+                else:
+                    raw = MESSAGE
+                metadata = f"{uid} FETCH (UID {uid} FLAGS (\\Seen) BODY {{{len(raw)}}})".encode()
+                fetched.append((metadata, raw))
+            fetched.append(b")")
+            return "OK", fetched
         if command == "EXPUNGE":
             return "BAD", [b"UID EXPUNGE unsupported"]
         return "OK", [b"done"]
@@ -71,12 +76,23 @@ class FailingLoginIMAP(FakeIMAP):
         raise imaplib.IMAP4.error(b"[AUTHENTICATIONFAILED] Authentication Failed")
 
 
-def service_with(client: FakeIMAP) -> ICloudIMAPService:
+def service_with(
+    client: FakeIMAP,
+    cache: SQLiteICloudCalendarCache | None = None,
+    email_cache_days: int = 100,
+    email_cache_max_messages: int = 1000,
+) -> ICloudIMAPService:
     config = IMAPConfig(
         username="user@example.com",
         app_specific_password="app-password",
     )
-    return ICloudIMAPService(config, client_factory=lambda *_args, **_kwargs: client)
+    return ICloudIMAPService(
+        config,
+        client_factory=lambda *_args, **_kwargs: client,
+        cache=cache,
+        email_cache_days=email_cache_days,
+        email_cache_max_messages=email_cache_max_messages,
+    )
 
 
 def test_lists_mailboxes_and_decodes_modified_utf7() -> None:
@@ -110,6 +126,29 @@ def test_search_and_read_use_uid_and_peek() -> None:
         call[0] == "FETCH" and "BODY.PEEK[]" in str(call[1])
         for call in client.calls
     )
+
+
+def test_recent_email_header_search_uses_cache(tmp_path) -> None:
+    client = FakeIMAP()
+    cache = SQLiteICloudCalendarCache(tmp_path / "cache.sqlite3")
+    mail = service_with(client, cache=cache)
+
+    first = mail.search_emails(subject="Test", limit=1)
+    second = mail.search_emails(subject="Test", limit=1)
+
+    assert first == second
+    assert sum(call[0] == "SEARCH" for call in client.calls) == 1
+
+
+def test_email_write_invalidates_mailbox_cache(tmp_path) -> None:
+    client = FakeIMAP()
+    cache = SQLiteICloudCalendarCache(tmp_path / "cache.sqlite3")
+    mail = service_with(client, cache=cache)
+    mail.search_emails(limit=1)
+
+    assert cache.get_emails("INBOX") is not None
+    mail.mark_email_read("INBOX", "42", read=False)
+    assert cache.get_emails("INBOX") is None
 
 
 def test_write_operations_mark_move_and_delete_by_uid() -> None:
