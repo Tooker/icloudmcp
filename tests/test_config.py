@@ -6,6 +6,7 @@ import pytest
 from app.config import (
     cache_ttl_seconds,
     load_calendars,
+    load_imap_config,
     load_icloud_config,
     normalize_source_url,
     public_url_for_token,
@@ -210,4 +211,60 @@ def test_partial_icloud_credentials_are_rejected(tmp_path: Path) -> None:
         load_icloud_config(
             tmp_path / "missing.yaml",
             environ={"ICLOUD_USERNAME": "user@example.com"},
+        )
+
+
+def test_loads_imap_config_and_reuses_icloud_credentials(tmp_path: Path) -> None:
+    config_path = write_config(
+        tmp_path,
+        """
+icloud:
+  username: user@example.com
+  app_specific_password: app-password
+imap:
+  default_mailbox: Archive
+""",
+    )
+
+    config = load_imap_config(config_path)
+
+    assert config is not None
+    assert config.username == "user@example.com"
+    assert config.app_specific_password == "app-password"
+    assert config.host == "imap.mail.me.com"
+    assert config.port == 993
+    assert config.default_mailbox == "Archive"
+
+
+def test_imap_environment_overrides_yaml(tmp_path: Path) -> None:
+    config_path = write_config(
+        tmp_path,
+        """
+imap:
+  username: yaml@example.com
+  app_specific_password: yaml-password
+  port: 1993
+""",
+    )
+
+    config = load_imap_config(
+        config_path,
+        environ={
+            "IMAP_USERNAME": "env@example.com",
+            "IMAP_APP_PASSWORD": "env-password",
+            "IMAP_PORT": "993",
+        },
+    )
+
+    assert config is not None
+    assert config.username == "env@example.com"
+    assert config.app_specific_password == "env-password"
+    assert config.port == 993
+
+
+def test_partial_imap_credentials_are_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="both username"):
+        load_imap_config(
+            tmp_path / "missing.yaml",
+            environ={"IMAP_USERNAME": "user@example.com"},
         )

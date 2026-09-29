@@ -3,12 +3,15 @@
 ## Goal
 - Keep the existing stateless proxy for shared iCloud calendar URLs.
 - Add a read/write MCP server for iCloud Calendar events through authenticated CalDAV.
+- Add iCloud Mail read/write tools through authenticated IMAP over SSL.
+- Add best-effort iCloud Reminders read/write tools through CalDAV VTODO collections.
 - Run the MCP server privately in Docker and connect it to OpenAI products with Secure MCP Tunnel.
 - Keep the output paths opaque: no calendar names, `ical`, `ics`, or calendar-related words in the token path.
 
 ## Stack
 - Python with FastAPI.
 - `caldav` for iCloud Calendar CalDAV access.
+- Python's standard-library `imaplib` for iCloud Mail IMAP access.
 - MCP Python SDK with Streamable HTTP at `/mcp`.
 - Dependency and lockfile management with `uv`.
 - YAML configuration for multiple source calendars.
@@ -24,6 +27,8 @@
 - Provide `GET /healthz` for local and container health checks.
 - Provide MCP tools for listing calendars, listing/getting events, creating events, updating events, and deleting events.
 - Require `confirm=true` for destructive event deletion.
+- Provide mailbox/search/read/flag/move/delete tools for iCloud Mail; IMAP does not send mail, so SMTP is out of scope.
+- Provide list/list/get/create/update/delete tools for CalDAV-backed Reminders, with an explicit caveat for upgraded CloudKit-backed lists.
 - Keep Apple Account and OpenAI tunnel credentials out of tool results and logs.
 - Keep the MCP service bound to the private Docker network; tunnel-client provides outbound-only OpenAI connectivity.
 

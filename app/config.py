@@ -15,6 +15,9 @@ ENV_PREFIX = "ICLOUDCRUNCHER."
 DEFAULT_CACHE_TTL_SECONDS = 300
 DEFAULT_ICLOUD_CALDAV_URL = "https://caldav.icloud.com/"
 DEFAULT_ICLOUD_TIMEZONE = "UTC"
+DEFAULT_IMAP_HOST = "imap.mail.me.com"
+DEFAULT_IMAP_PORT = 993
+DEFAULT_IMAP_MAILBOX = "INBOX"
 
 
 @dataclass(frozen=True)
@@ -30,6 +33,15 @@ class ICloudConfig:
     caldav_url: str = DEFAULT_ICLOUD_CALDAV_URL
     default_calendar: str | None = None
     timezone: str = DEFAULT_ICLOUD_TIMEZONE
+
+
+@dataclass(frozen=True)
+class IMAPConfig:
+    username: str
+    app_specific_password: str
+    host: str = DEFAULT_IMAP_HOST
+    port: int = DEFAULT_IMAP_PORT
+    default_mailbox: str = DEFAULT_IMAP_MAILBOX
 
 
 def normalize_source_url(source_url: str) -> str:
@@ -179,6 +191,105 @@ def load_icloud_config(
         caldav_url=caldav_url,
         default_calendar=default_calendar,
         timezone=timezone,
+    )
+
+
+def load_imap_config(
+    config_path: Path = DEFAULT_CONFIG_PATH,
+    environ: dict[str, str] | None = None,
+) -> IMAPConfig | None:
+    """Load iCloud Mail IMAP credentials and connection settings.
+
+    IMAP normally uses the same Apple Account email and app-specific password
+    as CalDAV.  Dedicated ``IMAP_*`` values take precedence, while the
+    ``icloud`` credentials remain a convenient shared fallback.
+    """
+
+    env = os.environ if environ is None else environ
+    raw_config: dict[str, Any] = {}
+    if config_path.exists():
+        raw_config = _load_yaml(config_path)
+
+    raw_imap = raw_config.get("imap", {})
+    if raw_imap is None:
+        raw_imap = {}
+    if not isinstance(raw_imap, dict):
+        raise ValueError("config.yaml 'imap' must be an object")
+
+    raw_icloud = raw_config.get("icloud", {})
+    if raw_icloud is None:
+        raw_icloud = {}
+    if not isinstance(raw_icloud, dict):
+        raise ValueError("config.yaml 'icloud' must be an object")
+
+    username = _first_non_empty(
+        env.get("IMAP_USERNAME"),
+        env.get("ICLOUDCRUNCHER.IMAP_USERNAME"),
+        env.get("ICLOUD_CRUNCHER_IMAP_USERNAME"),
+        raw_imap.get("username"),
+        raw_imap.get("apple_id"),
+        env.get("ICLOUD_USERNAME"),
+        env.get("ICLOUDCRUNCHER.ICLOUD_USERNAME"),
+        env.get("ICLOUD_CRUNCHER_ICLOUD_USERNAME"),
+        raw_icloud.get("username"),
+        raw_icloud.get("apple_id"),
+    )
+    app_specific_password = _first_non_empty(
+        env.get("IMAP_APP_PASSWORD"),
+        env.get("ICLOUDCRUNCHER.IMAP_APP_PASSWORD"),
+        env.get("ICLOUD_CRUNCHER_IMAP_APP_PASSWORD"),
+        raw_imap.get("app_specific_password"),
+        raw_imap.get("password"),
+        env.get("ICLOUD_APP_PASSWORD"),
+        env.get("ICLOUDCRUNCHER.ICLOUD_APP_PASSWORD"),
+        env.get("ICLOUD_CRUNCHER_ICLOUD_APP_PASSWORD"),
+        raw_icloud.get("app_specific_password"),
+        raw_icloud.get("password"),
+    )
+
+    if username is None and app_specific_password is None:
+        return None
+    if username is None or app_specific_password is None:
+        raise ValueError(
+            "IMAP configuration must define both username and app_specific_password"
+        )
+
+    host = _first_non_empty(
+        env.get("IMAP_HOST"),
+        env.get("ICLOUDCRUNCHER.IMAP_HOST"),
+        env.get("ICLOUD_CRUNCHER_IMAP_HOST"),
+        raw_imap.get("host"),
+    ) or DEFAULT_IMAP_HOST
+    if any(character.isspace() for character in host) or "/" in host:
+        raise ValueError("imap.host must be a hostname")
+
+    raw_port: Any = (
+        env.get("IMAP_PORT")
+        or env.get("ICLOUDCRUNCHER.IMAP_PORT")
+        or env.get("ICLOUD_CRUNCHER_IMAP_PORT")
+        or raw_imap.get("port")
+        or DEFAULT_IMAP_PORT
+    )
+    try:
+        port = int(raw_port)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("imap.port must be an integer") from exc
+    if not 1 <= port <= 65535:
+        raise ValueError("imap.port must be between 1 and 65535")
+
+    default_mailbox = _first_non_empty(
+        env.get("IMAP_DEFAULT_MAILBOX"),
+        env.get("ICLOUDCRUNCHER.IMAP_DEFAULT_MAILBOX"),
+        env.get("ICLOUD_CRUNCHER_IMAP_DEFAULT_MAILBOX"),
+        raw_imap.get("default_mailbox"),
+    ) or DEFAULT_IMAP_MAILBOX
+
+    return IMAPConfig(
+        username=username,
+        app_specific_password=app_specific_password,
+        host=host,
+        port=port,
+        default_mailbox=default_mailbox,
     )
 
 

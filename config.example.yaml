@@ -17,3 +17,10 @@ icloud:
   # Name or id from list_calendars. Leave null when the account has one calendar.
   default_calendar: null
   timezone: "Europe/Berlin"
+
+# iCloud Mail uses the same Apple Account credentials by default. Dedicated
+# IMAP_USERNAME and IMAP_APP_PASSWORD environment variables can override them.
+imap:
+  host: "imap.mail.me.com"
+  port: 993
+  default_mailbox: "INBOX"

@@ -1,10 +1,11 @@
 # IcloudCruncher
 
-Python proxy for shared iCloud calendars plus a read/write MCP server for iCloud Calendar.
-The MCP integration uses CalDAV and is exposed over Streamable HTTP at `/mcp`.
+Python proxy for shared iCloud calendars plus a read/write MCP server for iCloud
+Calendar, iCloud Mail, and CalDAV-backed Apple Reminders. The MCP integration is
+exposed over Streamable HTTP at `/mcp`.
 
-The current write-capable scope is iCloud Calendar events (VEVENT). iCloud Mail,
-Contacts, Notes, Files, and Reminders are not exposed by this version.
+Calendar and Reminders use CalDAV; Mail uses IMAP over SSL. Contacts, Notes,
+Files, and SMTP mail sending are out of scope.
 
 ## Local Setup
 
@@ -48,6 +49,13 @@ ICLOUD_USERNAME=your-apple-id@example.com
 ICLOUD_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx
 ICLOUD_DEFAULT_CALENDAR=Work
 ICLOUD_TIMEZONE=Europe/Berlin
+
+# Optional: override the shared credentials or mailbox settings for IMAP.
+IMAP_USERNAME=your-apple-id@example.com
+IMAP_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx
+IMAP_HOST=imap.mail.me.com
+IMAP_PORT=993
+IMAP_DEFAULT_MAILBOX=INBOX
 ```
 
 The MCP server provides:
@@ -59,6 +67,35 @@ The MCP server provides:
 - `update_event` — update only supplied event fields.
 - `delete_event` — delete an event; it requires `confirm=true` and should also
   be protected by the client's MCP approval flow.
+- `list_mailboxes` — list IMAP mailboxes.
+- `search_emails` — search by sender, recipient, subject, text, dates, or unread status.
+- `get_email` — read one message by its mailbox-local UID without marking it read. Bodies
+  are bounded; attachments are returned as metadata only.
+- `mark_email_read` — set or clear the `\Seen` flag.
+- `move_email` — copy a message to another mailbox and mark the source for deletion.
+- `delete_email` — delete a message; it requires `confirm=true` and may leave a safe
+  deletion marker when the server cannot isolate an IMAP expunge.
+- `list_reminder_lists`, `list_reminders`, and `get_reminder` — read CalDAV VTODO lists
+  and reminders.
+- `create_reminder`, `update_reminder`, and `delete_reminder` — write VTODO reminders;
+  `delete_reminder` requires `confirm=true`.
+
+IMAP operations use mailbox-local UIDs, so callers should use the UID together with the
+mailbox returned by `search_emails`. IMAP is not an outgoing mail protocol; sending is
+intentionally not implemented.
+
+Apple's documented iCloud Mail settings are `imap.mail.me.com` on port `993` with SSL
+and an app-specific password. The username may be the full iCloud Mail address or the
+address name, depending on the client. See Apple's [iCloud Mail server settings](https://support.apple.com/en-us/102525).
+
+### Apple Reminders compatibility
+
+The Reminders integration uses standard CalDAV `VTODO` collections. It lists only
+collections that explicitly report `VTODO` support. Apple moved many Reminders lists to
+a newer CloudKit-backed store, so upgraded lists may not appear or may reject writes;
+this is an undocumented, account-dependent compatibility path rather than a guaranteed
+Apple Reminders API. The underlying CalDAV client documents similar iCloud task
+limitations in [python-caldav issue #3](https://github.com/python-caldav/caldav/issues/3).
 
 The service listens on `http://127.0.0.1:8080/mcp` locally. The MCP endpoint
 does not expose iCloud credentials, source URLs, or raw iCalendar payloads in

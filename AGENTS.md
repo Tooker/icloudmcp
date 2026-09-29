@@ -32,7 +32,9 @@
 ## iCloud Read/Write MCP
 - iCloud Calendar access uses CalDAV with an Apple Account email and app-specific password; never log or commit either credential.
 - `app/icloud.py` is synchronous because `caldav` is blocking; MCP tools call it through worker threads.
+- iCloud Mail access uses IMAP over SSL (`imap.mail.me.com:993`) with the same Apple Account/app-specific password by default; `app/imap.py` is synchronous and MCP tools call it through worker threads.
+- iCloud Reminders are exposed only when an account reports CalDAV `VTODO` collections. Upgraded CloudKit-backed lists may not be visible through this undocumented compatibility path.
 - MCP Streamable HTTP is mounted at `/mcp` and `/mcp/`; the app owns the MCP session-manager lifespan because it is mounted inside FastAPI.
-- `list_calendars`, `list_events`, and `get_event` are read-only. `create_event` and `update_event` mutate iCloud; `delete_event` is destructive and requires `confirm=true`.
+- `list_calendars`, `list_events`, `get_event`, `list_mailboxes`, `search_emails`, `get_email`, `list_reminder_lists`, `list_reminders`, and `get_reminder` are read-only. Calendar/reminder creation and updates plus IMAP flag/move operations mutate iCloud; email/reminder deletes are destructive and require `confirm=true`.
 - OpenAI Secure MCP Tunnel is a separate `openai-tunnel` Compose service. It connects to `http://icloud-cruncher:8080/mcp` over the private Compose network and needs `CONTROL_PLANE_API_KEY` plus `CONTROL_PLANE_TUNNEL_ID`.
 - Keep the write-capable MCP endpoint off the public internet. The default Compose binding is loopback-only.
