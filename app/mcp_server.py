@@ -61,10 +61,14 @@ def create_mcp_server(
             "planned change and obtain user approval before calling them. Draft tools "
             "upload messages to IMAP but never send them; the user sends drafts manually. "
             "Use list_reminder_lists and list_reminders to get exact IDs before Reminders operations. "
+            "Native section headings are separate from reminders. Use list_reminder_sections for section IDs. "
+            "Use view=tree for nested subtasks, move_reminder for indentation/sections and reorder_reminders for manual order. "
+            "Priority numbers: 0=none, 9=low (!), 5=medium (!!), 1=high (!!!); ≡ is a manual drag handle, not priority. "
+            "• means pending, ✓ complete and ↳ a subtask. These are display symbols, never title text. "
             "Never blindly retry a failed or timed-out Reminders write; inspect current data first. "
             "Reminders authentication and device approval are separate administrative Go CLI operations."
         ),
-        version="1.0.0",
+        version="1.1.0",
     )
 
     async def call_service(

@@ -445,15 +445,78 @@ an unconfigured backend return a safe configuration error;
 | Tool | Purpose |
 | --- | --- |
 | `list_reminder_lists` | Discover owned and incoming shared lists. |
-| `list_reminders` | Filter by list, parent, title and completion; paginate results. |
-| `get_reminder` | Read one reminder and its assignment. |
-| `create_reminder` | Create in an existing list, optionally as a subtask. |
+| `list_reminders` | Read in manual section/sibling order; filter by list, parent, section, title and completion; `view=tree` nests the current page. |
+| `get_reminder` | Read one reminder, its assignment, section, parent, depth and manual position. |
+| `create_reminder` | Create in an existing list or native section, optionally as a subtask inheriting its parent's section. |
 | `update_reminder` | Change supplied title/date/notes/priority fields. |
 | `complete_reminder` | Mark complete; an already completed task performs no write. |
 | `delete_reminder` | Permanently delete with `confirm=true`. |
 | `sync_reminders` | Refresh the cache; `full=true` requests a full sync. |
 | `list_reminder_participants` | Read accepted collaborators, available contact details and permissions. |
 | `assign_reminder` | Assign/reassign by participant ID, or remove with `clear=true`. |
+| `list_reminder_sections` | Discover native section headings and IDs in section order. |
+| `create_reminder_section` | Create a native section heading in an existing list. |
+| `move_reminder` | Indent/outdent, move into/out of sections, or place before/after a sibling; keep the subtree together. |
+| `reorder_reminders` | Set the manual order of every sibling in a list, section or parent, including completed reminders. |
+
+### Reminders sections, subtasks and ordering (1.1.0)
+
+Section headings are native `ListSection` records, separate from reminders.
+Discover them with `list_reminder_sections(list_id="list-id")`, create one with
+`create_reminder_section(list_id="list-id", title="Planning")`, and pass its
+returned `section_id` to `create_reminder` or `move_reminder`.
+
+`list_reminders(list_id="list-id", view="tree")` adds a nested `tree` alongside
+the compatible flat `reminders` array. The returned page contains only matching
+reminders: a filtered or paginated-out parent is not silently added.
+`parent_ref` remains authoritative, `depth` reports ancestor count, and
+`section_ref`/`section_name` identify the inherited native section.
+Follow `next_offset` for all results. `sort_index` is the zero-based position in
+the list's manual order; filtering can leave gaps. Automatic sorting selected
+in the Apple app can display a different order.
+
+To indent an existing reminder, use `move_reminder(id="task-id",
+parent_id="parent-id")`; `clear_parent=true` makes it top-level.
+Use `section_id` or `clear_section=true` to change its section.
+Subtasks inherit their parent's section. `before_id` and `after_id` are
+mutually exclusive anchors in the target sibling group; omitting both appends
+the subtree to that group. Moves stay within one list, reject cycles, and
+preserve incoming shared lists' original database/owner zone.
+
+`reorder_reminders` takes every sibling ID exactly once, in the desired order.
+Read with `include_completed=true` first, including all pages. Set `parent_id`
+for children or `section_id` for a top-level section; omit both for top-level
+unsectioned reminders. Reordering preserves complete subtrees and other groups.
+
+The descriptions and returned `legend` explain display symbols to the LLM:
+
+| Symbol / value | Meaning |
+| --- | --- |
+| `•` / `✓` | Pending / completed. |
+| indentation / `↳` | Subtask; use `parent_ref` as its identity. |
+| `!` / `!!` / `!!!` | Low / medium / high priority; iCloud values `9` / `5` / `1`. |
+| priority `0` | No priority. |
+| `≡` | Handle for manual reordering; independent of priority. |
+
+These symbols are presentation metadata and must not be inserted into titles.
+Structure writes use fresh list metadata, current shared-list permissions and
+an atomic CloudKit record request. Unknown metadata is preserved; unsupported
+formats fail before record mutation. Writes are never automatically retried.
+
+### Building the paired 1.1.0 source checkouts
+
+Keep this repository beside the updated `icloud-reminders-cli` checkout and run:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.release.yml --profile reminders config --quiet
+docker compose -f docker-compose.yml -f docker-compose.release.yml --profile reminders build
+```
+
+This produces `icloud-cruncher:1.1.0` and `icloud-reminders:1.1.0` locally.
+The release override explicitly selects the adjacent Go source; the main
+Compose file retains its production commit pin. Use the same two Compose files
+when starting the locally built pair. Building images does not recreate the
+running services.
 
 ### Recurring events
 

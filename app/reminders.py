@@ -6,7 +6,9 @@ import asyncio
 from contextlib import contextmanager
 from contextvars import ContextVar
 import logging
+import re
 from typing import Any
+from uuid import UUID, uuid4
 
 import httpx2
 from mcp.client.session import ClientSession
@@ -14,17 +16,24 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp_types import CallToolResult, TextContent
 
 from app.config import RemindersConfig
-from app.timing import measure_phase
+from app.timing import call_id, measure_phase
 
 
 REMINDER_TOOLS = frozenset({
     "list_reminder_lists", "list_reminders", "get_reminder", "create_reminder",
     "update_reminder", "complete_reminder", "delete_reminder", "sync_reminders",
     "list_reminder_participants", "assign_reminder",
+    "list_reminder_sections", "create_reminder_section", "move_reminder", "reorder_reminders",
 })
 
 _PUBLIC_ERRORS = {
-    "not_found": "Reminder or list not found. Refresh the available lists and reminders and use their exact IDs.",
+    "not_configured": "Reminders is not configured. Set REMINDERS_MCP_URL to the Go backend's private MCP endpoint.",
+    "backend_auth_failed": "The Go backend rejected authentication. Check REMINDERS_MCP_TOKEN on both services.",
+    "backend_protocol_error": "The Go backend returned an invalid MCP response.",
+    "idempotency_conflict": "This client_request_id was already used with different creation arguments. Use the original arguments or a new ID.",
+    "local_state_failed": "The creation succeeded but local request state could not be saved. Recover using the same client_request_id.",
+    "unsupported_backend": "This Go backend does not support client_request_id. Upgrade it before making a keyed creation.",
+    "not_found": "Reminder, list or section not found. Refresh the available lists and reminders and use their exact IDs.",
     "not_shared": "Only reminders in a shared list can be assigned to a participant.",
     "permission_denied": "The current participant cannot modify this shared list.",
     "auth_required": "Stop the Go backend, run reminders auth with its data directory, then start it again.",
@@ -32,7 +41,10 @@ _PUBLIC_ERRORS = {
         "Enable iCloud web data access, stop the Go backend, run reminders auth --approve-web-access "
         "with its data directory and approve on a trusted device, then start it again."
     ),
-    "invalid_argument": "Reminders rejected the arguments. Check exact IDs, dates, priority and pagination; assignment needs one accepted participant ID from this list or clear=true.",
+    "invalid_argument": "Reminders rejected the arguments. Check exact IDs, dates, priority, pagination, same-list parent/section references and ordering anchors; assignment needs one accepted participant ID from this list or clear=true.",
+    "unsupported_structure": "This list uses an unsupported structure format. No write was attempted; refresh or inspect the list in Apple Reminders.",
+    "write_result_unknown": "iCloud did not confirm the complete write. Inspect current reminders and sections before retrying.",
+    "icloud_write_failed": "iCloud rejected the write. Inspect current reminders and sections before retrying.",
     "request_timeout": "Request ended before completion. A write may have succeeded; inspect the reminder before retrying.",
     "icloud_request_failed": "iCloud request failed. A write may have succeeded; inspect the reminder before retrying.",
     "backend_unavailable": "The Go Reminders backend could not complete the request. Check its service and bearer token. A write may have succeeded; inspect before retrying.",
@@ -42,9 +54,93 @@ _PUBLIC_ERRORS = {
 class RemindersError(Exception):
     """Only application-owned messages cross the public MCP boundary."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(
+        self, code: str, *, operation: str | None = None, request_id: str | None = None,
+        write_status: str | None = None, retry_class: str = "not_retryable",
+        http_status: int | None = None, upstream_status: int | None = None,
+        upstream_error_code: str | None = None,
+    ) -> None:
         self.code = code if code in _PUBLIC_ERRORS else "backend_unavailable"
+        self.details = {"error_code": self.code, "retry_class": retry_class,
+                        "retryable": retry_class != "not_retryable"}
+        for key, value in {
+            "operation": operation, "request_id": request_id, "write_status": write_status,
+            "http_status": http_status, "upstream_status": upstream_status,
+            "upstream_error_code": upstream_error_code,
+        }.items():
+            if value is not None:
+                self.details[key] = value
         super().__init__(f"{self.code}: {_PUBLIC_ERRORS[self.code]}")
+
+    def as_result(self) -> CallToolResult:
+        return CallToolResult(is_error=True, structured_content=self.details,
+                              content=[TextContent(type="text", text=str(self))])
+
+
+READ_TOOLS = frozenset({
+    "list_reminder_lists", "list_reminders", "get_reminder", "sync_reminders",
+    "list_reminder_participants", "list_reminder_sections",
+})
+_RETRY_CLASSES = frozenset({"retryable_safe", "retryable_after_read", "not_retryable"})
+_WRITE_STATES = frozenset({"not_sent", "failed", "succeeded", "unknown"})
+_UPSTREAM_CODES = frozenset({
+    "BAD_REQUEST", "AUTHENTICATION_REQUIRED", "ACCESS_DENIED", "NOT_FOUND", "UNKNOWN_ITEM",
+    "CONFLICT", "SERVER_RECORD_CHANGED", "ZONE_NOT_FOUND", "QUOTA_EXCEEDED", "LIMIT_EXCEEDED",
+    "THROTTLED", "SERVICE_UNAVAILABLE", "INTERNAL_ERROR", "BATCH_REQUEST_FAILED",
+})
+
+
+def _exceptions(error: BaseException):
+    yield error
+    if isinstance(error, BaseExceptionGroup):
+        for child in error.exceptions:
+            yield from _exceptions(child)
+
+
+def _http_status(error: BaseException) -> int | None:
+    return next((item.response.status_code for item in _exceptions(error)
+                 if isinstance(item, httpx2.HTTPStatusError)), None)
+
+
+def _error_code(result: CallToolResult) -> str:
+    payload = result.structured_content
+    if isinstance(payload, dict) and isinstance(payload.get("error_code"), str) and payload["error_code"] in _PUBLIC_ERRORS:
+        return payload["error_code"]
+    # Older Go SDKs wrap tool errors, e.g. 'calling "tool": code: message'.
+    # Only known enum values survive; upstream text is never returned or logged.
+    for item in result.content:
+        if isinstance(item, TextContent):
+            for match in re.finditer(r"(?:^|:\s+)([a-z_]+):", item.text):
+                if match[1] in _PUBLIC_ERRORS:
+                    return match[1]
+    return "backend_unavailable"
+
+
+def _upstream_error(result: CallToolResult, operation: str, request_id: str) -> RemindersError:
+    code = _error_code(result)
+    mutation = operation not in READ_TOOLS
+    status = "unknown" if mutation else None
+    retry = "retryable_after_read" if mutation else "retryable_safe"
+    if code in {"invalid_argument", "not_found", "not_shared", "permission_denied", "unsupported_structure",
+                "idempotency_conflict"}:
+        status, retry = "not_sent" if mutation else None, "not_retryable"
+    details = result.structured_content
+    safe: dict[str, Any] = {}
+    if isinstance(details, dict):
+        if mutation and isinstance(details.get("write_status"), str) and details["write_status"] in _WRITE_STATES:
+            status = details["write_status"]
+        if isinstance(details.get("retry_class"), str) and details["retry_class"] in _RETRY_CLASSES:
+            retry = details["retry_class"]
+        # A retry is never safe after an unknown/confirmed mutation.
+        if mutation and status in {"unknown", "succeeded"} and retry == "retryable_safe":
+            retry = "retryable_after_read"
+        value = details.get("upstream_status")
+        if type(value) is int and 100 <= value <= 599:
+            safe["upstream_status"] = value
+        if isinstance(details.get("upstream_error_code"), str) and details["upstream_error_code"] in _UPSTREAM_CODES:
+            safe["upstream_error_code"] = details["upstream_error_code"]
+    return RemindersError(code, operation=operation, request_id=request_id,
+                          write_status=status, retry_class=retry, **safe)
 
 
 _transport_active: ContextVar[bool] = ContextVar("reminders_transport_active", default=False)
@@ -86,9 +182,26 @@ class GoRemindersService:
         self.config = config
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> CallToolResult:
+        request_id = call_id()
+        if request_id == "none":
+            request_id = uuid4().hex[:16]
         if name not in REMINDER_TOOLS:
-            raise RemindersError("invalid_argument")
+            raise RemindersError("invalid_argument", operation=name, request_id=request_id)
+        if name == "create_reminder" and "client_request_id" in arguments:
+            try:
+                UUID(arguments["client_request_id"])
+            except (ValueError, TypeError, AttributeError):
+                raise RemindersError("invalid_argument", operation=name, request_id=request_id,
+                                     write_status="not_sent") from None
         headers = {"Authorization": f"Bearer {self.config.token}"} if self.config.token else {}
+        dispatched = False
+        response_status = None
+
+        async def record_response(response: httpx2.Response) -> None:
+            nonlocal response_status
+            if response.request.method == "POST" and response.status_code >= 400:
+                response_status = response.status_code
+
         try:
             # A fresh MCP session per call survives backend restarts and avoids
             # sharing AnyIO task groups across incoming request tasks. Go is
@@ -99,6 +212,7 @@ class GoRemindersService:
                         headers=headers,
                         timeout=httpx2.Timeout(10, read=self.config.timeout_seconds),
                         trust_env=False,
+                        event_hooks={"response": [record_response]},
                     ) as http_client:
                         async with streamable_http_client(
                             self.config.mcp_url, http_client=http_client, terminate_on_close=False,
@@ -109,17 +223,38 @@ class GoRemindersService:
                             ) as session:
                                 with measure_phase("reminders_mcp_connect"):
                                     await session.initialize()
+                                if name == "create_reminder" and arguments.get("client_request_id") is not None:
+                                    with measure_phase("reminders_mcp_capabilities"):
+                                        available = await session.list_tools()
+                                    create_tool = next((tool for tool in available.tools if tool.name == name), None)
+                                    if create_tool is None or "client_request_id" not in create_tool.input_schema.get("properties", {}):
+                                        raise RemindersError("unsupported_backend", operation=name, request_id=request_id,
+                                                             write_status="not_sent")
                                 with measure_phase("reminders_mcp_call"):
+                                    dispatched = True
                                     result = await session.call_tool(name, arguments)
+        except RemindersError:
+            raise
         except Exception as error:
-            raise RemindersError("request_timeout" if _contains_timeout(error) else "backend_unavailable") from None
+            known = next((item for item in _exceptions(error) if isinstance(item, RemindersError)), None)
+            if known is not None:
+                raise known from None
+            status = response_status or _http_status(error)
+            code = "request_timeout" if _contains_timeout(error) else "backend_unavailable"
+            if status in {401, 403}:
+                code = "backend_auth_failed"
+            mutation = name not in READ_TOOLS
+            # Only a failure before tools/call proves the mutation wasn't sent.
+            write_status = ("unknown" if dispatched else "not_sent") if mutation else None
+            retry = "retryable_after_read" if mutation and dispatched else "retryable_safe"
+            if code == "backend_auth_failed":
+                retry = "not_retryable"
+            raise RemindersError(code, operation=name, request_id=request_id, write_status=write_status,
+                                 retry_class=retry, http_status=status) from None
         if not isinstance(result, CallToolResult):
-            raise RemindersError("backend_unavailable")
+            raise RemindersError("backend_protocol_error", operation=name, request_id=request_id,
+                                 write_status="unknown" if name not in READ_TOOLS else None,
+                                 retry_class="retryable_after_read" if name not in READ_TOOLS else "retryable_safe")
         if result.is_error:
-            # Do not trust upstream text, even for a familiar error prefix.
-            code = next((
-                content.text.split(":", 1)[0].strip()
-                for content in result.content if isinstance(content, TextContent)
-            ), "backend_unavailable")
-            raise RemindersError(code)
+            raise _upstream_error(result, name, request_id)
         return result

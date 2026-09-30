@@ -20,7 +20,7 @@ from app.reminders import GoRemindersService, REMINDER_TOOLS, RemindersError
 PRIVATE = "PRIVATE_REMINDER_CONTENT_OR_CREDENTIAL"
 
 
-def simulated_go(monkeypatch, *, result=None, failure=None, delay=0):
+def simulated_go(monkeypatch, *, result=None, failure=None, delay=0, supports_key=False):
     calls = []
     original_client = httpx2.AsyncClient
 
@@ -40,7 +40,9 @@ def simulated_go(monkeypatch, *, result=None, failure=None, delay=0):
             }
         elif message["method"] == "tools/list":
             payload = {"tools": [{
-                "name": name, "inputSchema": {"type": "object", "properties": {}},
+                "name": name, "inputSchema": {"type": "object", "properties": {
+                    "client_request_id": {"type": "string"},
+                } if supports_key and name == "create_reminder" else {}},
             } for name in REMINDER_TOOLS]}
         else:
             assert message["method"] == "tools/call"
@@ -82,6 +84,13 @@ def simulated_go(monkeypatch, *, result=None, failure=None, delay=0):
     ("list_reminder_participants", {"list_id": "exact-list"}),
     ("assign_reminder", {"id": "exact-id", "participant_id": "exact-person"}),
     ("assign_reminder", {"id": "exact-id", "clear": True}),
+    ("list_reminder_sections", {"list_id": "exact-list"}),
+    ("create_reminder_section", {"list_id": "exact-list", "title": PRIVATE}),
+    ("list_reminders", {"list_id": "exact-list", "section_id": "exact-section", "view": "tree"}),
+    ("create_reminder", {"title": PRIVATE, "list_id": "exact-list", "section_id": "exact-section"}),
+    ("move_reminder", {"id": "exact-id", "parent_id": "exact-parent", "after_id": "exact-sibling"}),
+    ("move_reminder", {"id": "exact-id", "clear_parent": True, "clear_section": True}),
+    ("reorder_reminders", {"list_id": "exact-list", "reminder_ids": ["second", "first"], "section_id": "exact-section"}),
 ])
 def test_python_tools_forward_through_real_mcp_client_once_and_keep_results_private(monkeypatch, caplog, name, arguments):
     backend, messages = simulated_go(monkeypatch)
@@ -132,7 +141,7 @@ def test_private_transport_failures_do_not_escape_or_replay_writes(monkeypatch, 
             "title": PRIVATE, "list_id": "exact-list",
         })))
     assert result.is_error
-    assert "backend_unavailable" in result.content[0].text
+    assert ("backend_auth_failed" if failure == "http" else "backend_unavailable") in result.content[0].text
     assert PRIVATE not in str(result) + caplog.text
     assert len([message for message in messages if message["method"] == "tools/call"]) == 1
 
@@ -233,6 +242,13 @@ def test_reminders_schema_annotations_and_optional_configuration():
     assert tools["delete_reminder"].annotations.destructive_hint
     assert not tools["create_reminder"].annotations.idempotent_hint
     assert tools["list_reminders"].annotations.read_only_hint
+    assert tools["list_reminder_sections"].annotations.read_only_hint
+    assert not tools["create_reminder_section"].annotations.idempotent_hint
+    assert tools["move_reminder"].annotations.destructive_hint
+    assert tools["reorder_reminders"].annotations.destructive_hint
+    assert tools["list_reminders"].input_schema["properties"]["view"]["enum"] == ["flat", "tree"]
+    assert "drag handle" in tools["list_reminders"].description
+    assert "9=low (!)" in tools["list_reminders"].description
     result = asyncio.run(server._handle_call_tool(None, CallToolRequestParams(name="list_reminder_lists", arguments={})))
     assert result.is_error
     assert "REMINDERS_MCP_URL" in result.content[0].text
@@ -261,3 +277,36 @@ def test_invalid_reminders_configuration_uses_non_private_errors(settings):
     with pytest.raises(ValueError) as error:
         load_reminders_config({"REMINDERS_MCP_URL": "http://reminders:8080/mcp", **settings})
     assert "secret" not in str(error.value)
+
+
+@pytest.mark.parametrize("arguments", [
+    {"id": "exact-id", "parent_id": "exact-parent", "clear_parent": True},
+    {"id": "exact-id", "section_id": "exact-section", "clear_section": True},
+    {"id": "exact-id", "before_id": "one", "after_id": "two"},
+])
+def test_conflicting_move_intent_does_not_reach_go(monkeypatch, arguments):
+    backend, messages = simulated_go(monkeypatch)
+    server = create_mcp_server(None, reminders_service=backend)
+    result = asyncio.run(server._handle_call_tool(None, CallToolRequestParams(name="move_reminder", arguments=arguments)))
+    assert result.is_error
+    assert messages == []
+
+
+def test_native_sections_and_nested_results_survive_bridge_without_content_logs(monkeypatch, caplog):
+    payload = {"reminders": [{"id": "child", "title": PRIVATE, "parent_ref": "parent", "section_ref": "section", "depth": 1}],
+               "tree": [{"reminder": {"id": "parent", "title": PRIVATE}, "subtasks": [
+                   {"reminder": {"id": "child", "title": PRIVATE}, "subtasks": []},
+               ]}], "total": 1, "legend": {"≡": "Manual drag handle, not priority", "!!!": "High priority (1)"}}
+    backend, _ = simulated_go(monkeypatch, result={"content": [{"type": "text", "text": json.dumps(payload)}],
+                                                "structuredContent": payload})
+    logs = []
+    sink = logger.add(lambda message: logs.append(message.record["message"]))
+    try:
+        with caplog.at_level(logging.DEBUG):
+            server = create_mcp_server(None, reminders_service=backend)
+            result = asyncio.run(server._handle_call_tool(None, CallToolRequestParams(name="list_reminders", arguments={"view": "tree"})))
+    finally:
+        logger.remove(sink)
+    assert not result.is_error
+    assert result.structured_content == payload
+    assert PRIVATE not in "\n".join(logs) + caplog.text

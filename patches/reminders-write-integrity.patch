@@ -1,0 +1,1265 @@
+diff --git a/go.mod b/go.mod
+index dd57f22..d60495e 100644
+--- a/go.mod
++++ b/go.mod
+@@ -12,7 +12,7 @@ require (
+ )
+ 
+ require (
+-	github.com/google/jsonschema-go v0.4.3 // indirect
++	github.com/google/jsonschema-go v0.4.3
+ 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
+ 	github.com/segmentio/asm v1.1.3 // indirect
+ 	github.com/segmentio/encoding v0.5.4 // indirect
+diff --git a/internal/cache/cache.go b/internal/cache/cache.go
+index d5f379b..5a8b19d 100644
+--- a/internal/cache/cache.go
++++ b/internal/cache/cache.go
+@@ -44,17 +44,18 @@ type AssignmentData struct {
+ 
+ // Cache holds the local cache of reminders and lists.
+ type Cache struct {
+-	directory     string
+-	Reminders     map[string]*ReminderData      `json:"reminders"`
+-	Lists         map[string]string             `json:"lists"`
+-	SyncToken     *string                       `json:"sync_token,omitempty"`
+-	OwnerID       *string                       `json:"owner_id,omitempty"`
+-	UpdatedAt     *string                       `json:"updated_at,omitempty"`
+-	SchemaVersion int                           `json:"schema_version,omitempty"`
+-	ZoneTokens    map[string]string             `json:"zone_tokens,omitempty"`
+-	Scopes        map[string]models.RecordScope `json:"record_scopes,omitempty"`
+-	ListShares    map[string]string             `json:"list_shares,omitempty"`
+-	Assignments   map[string]*AssignmentData    `json:"assignments,omitempty"`
++	directory           string
++	Reminders           map[string]*ReminderData      `json:"reminders"`
++	Lists               map[string]string             `json:"lists"`
++	SyncToken           *string                       `json:"sync_token,omitempty"`
++	OwnerID             *string                       `json:"owner_id,omitempty"`
++	UpdatedAt           *string                       `json:"updated_at,omitempty"`
++	TitleDecoderVersion int                           `json:"title_decoder_version,omitempty"`
++	SchemaVersion       int                           `json:"schema_version,omitempty"`
++	ZoneTokens          map[string]string             `json:"zone_tokens,omitempty"`
++	Scopes              map[string]models.RecordScope `json:"record_scopes,omitempty"`
++	ListShares          map[string]string             `json:"list_shares,omitempty"`
++	Assignments         map[string]*AssignmentData    `json:"assignments,omitempty"`
+ }
+ 
+ // NewCache returns an empty Cache.
+@@ -87,6 +88,11 @@ func LoadFrom(directory string) *Cache {
+ 		c.directory = directory
+ 		return c
+ 	}
++	if c.TitleDecoderVersion != 1 {
++		c = NewCache()
++		c.directory = directory
++		return c
++	}
+ 	if c.Reminders == nil {
+ 		c.Reminders = make(map[string]*ReminderData)
+ 	}
+@@ -109,6 +115,7 @@ func (c *Cache) Save() error {
+ 	if directory == "" {
+ 		directory = ConfigDir
+ 	}
++	c.TitleDecoderVersion = 1
+ 	now := time.Now().Format("2006-01-02T15:04:05")
+ 	c.UpdatedAt = &now
+ 	data, err := json.MarshalIndent(c, "", "  ")
+diff --git a/internal/cloudkit/client.go b/internal/cloudkit/client.go
+index 966f91e..9499cc7 100644
+--- a/internal/cloudkit/client.go
++++ b/internal/cloudkit/client.go
+@@ -212,33 +212,10 @@ func (c *Client) ModifyRecords(ownerID string, operations []map[string]interface
+ 	}
+ 	result, err := c.post(c.databasePath("records/modify"), payload)
+ 	if err != nil {
+-		return nil, err
+-	}
+-	// A 2xx response alone does not confirm individual writes. Reject incomplete
+-	// responses before the writer publishes optimistic cache changes.
+-	records, ok := result["records"].([]interface{})
+-	if !ok || len(records) != len(operations) {
+-		return nil, fmt.Errorf("incomplete CloudKit write response")
++		return nil, unknownWrite(err)
+ 	}
+-	requestedIDs := make(map[string]int, len(operations))
+-	for _, operation := range operations {
+-		record, _ := operation["record"].(map[string]interface{})
+-		id, _ := record["recordName"].(string)
+-		requestedIDs[id]++
+-	}
+-	for _, value := range records {
+-		record, ok := value.(map[string]interface{})
+-		if !ok {
+-			return nil, fmt.Errorf("invalid CloudKit record response")
+-		}
+-		if code, _ := record["serverErrorCode"].(string); code != "" {
+-			continue
+-		}
+-		id, _ := record["recordName"].(string)
+-		if id == "" || requestedIDs[id] == 0 {
+-			return nil, fmt.Errorf("unconfirmed CloudKit record write")
+-		}
+-		requestedIDs[id]--
++	if err := confirmWrite(result, operations); err != nil {
++		return nil, err
+ 	}
+ 	return result, nil
+ }
+diff --git a/internal/cloudkit/sharing.go b/internal/cloudkit/sharing.go
+index b688133..0bf6759 100644
+--- a/internal/cloudkit/sharing.go
++++ b/internal/cloudkit/sharing.go
+@@ -5,6 +5,11 @@ import (
+ 	"icloud-reminders/pkg/models"
+ )
+ 
++// RecordNotFoundError is returned only for an explicit UNKNOWN_ITEM response.
++type RecordNotFoundError struct{}
++
++func (*RecordNotFoundError) Error() string { return "record not found" }
++
+ func (c *Client) ForScope(scope models.RecordScope) *Client {
+ 	copy := *c
+ 	copy.scope = scope
+@@ -88,6 +93,9 @@ func (c *Client) LookupRecords(ownerID string, names []string) ([]map[string]any
+ 		}
+ 		delete(expected, name)
+ 		if code, _ := record["serverErrorCode"].(string); code != "" {
++			if code == "UNKNOWN_ITEM" {
++				return nil, &RecordNotFoundError{}
++			}
+ 			return nil, fmt.Errorf("record lookup unavailable")
+ 		}
+ 		if record["deleted"] == true {
+diff --git a/internal/cloudkit/write_result.go b/internal/cloudkit/write_result.go
+new file mode 100644
+index 0000000..99cd14d
+--- /dev/null
++++ b/internal/cloudkit/write_result.go
+@@ -0,0 +1,91 @@
++package cloudkit
++
++import (
++	"errors"
++	"fmt"
++)
++
++// WriteFailure describes only evidence about the mutation, never inferred success.
++// Failed means a complete response rejected all records; missing/partial responses
++// and transport failures remain unknown. No layer automatically repeats a write.
++type WriteFailure struct {
++	Status       string
++	HTTPStatus   int
++	UpstreamCode string
++	Cause        error
++}
++
++func (e *WriteFailure) Error() string { return "CloudKit write " + e.Status }
++func (e *WriteFailure) Unwrap() error { return e.Cause }
++
++func unknownWrite(err error) *WriteFailure {
++	failure := &WriteFailure{Status: "unknown", Cause: err}
++	var api *APIError
++	if errors.As(err, &api) {
++		failure.HTTPStatus = api.StatusCode
++	}
++	return failure
++}
++
++func safeServerCode(code string) string {
++	switch code {
++	case "BAD_REQUEST", "AUTHENTICATION_REQUIRED", "ACCESS_DENIED", "NOT_FOUND", "UNKNOWN_ITEM", "CONFLICT", "SERVER_RECORD_CHANGED", "ZONE_NOT_FOUND", "QUOTA_EXCEEDED", "LIMIT_EXCEEDED", "THROTTLED", "SERVICE_UNAVAILABLE", "INTERNAL_ERROR", "BATCH_REQUEST_FAILED":
++		return code
++	}
++	return ""
++}
++
++func confirmWrite(result map[string]interface{}, operations []map[string]interface{}) error {
++	records, ok := result["records"].([]interface{})
++	if !ok || len(records) != len(operations) {
++		return unknownWrite(fmt.Errorf("incomplete write response"))
++	}
++	expected := make(map[string]string, len(operations))
++	for _, operation := range operations {
++		record, _ := operation["record"].(map[string]interface{})
++		id, _ := record["recordName"].(string)
++		kind, _ := operation["operationType"].(string)
++		if id == "" || expected[id] != "" {
++			return unknownWrite(fmt.Errorf("invalid operation identity"))
++		}
++		expected[id] = kind
++	}
++	failures, successes, upstream := 0, 0, ""
++	for _, value := range records {
++		record, ok := value.(map[string]interface{})
++		if !ok {
++			return unknownWrite(fmt.Errorf("invalid record response"))
++		}
++		if code, _ := record["serverErrorCode"].(string); code != "" {
++			failures++
++			if upstream == "" {
++				upstream = safeServerCode(code)
++			}
++			continue
++		}
++		id, _ := record["recordName"].(string)
++		kind := expected[id]
++		if kind == "" {
++			return unknownWrite(fmt.Errorf("unexpected record confirmation"))
++		}
++		if kind != "delete" {
++			tag, _ := record["recordChangeTag"].(string)
++			if tag == "" {
++				return unknownWrite(fmt.Errorf("missing record confirmation"))
++			}
++		}
++		delete(expected, id)
++		successes++
++	}
++	if failures > 0 {
++		status := "unknown"
++		if successes == 0 {
++			status = "failed"
++		}
++		return &WriteFailure{Status: status, HTTPStatus: 200, UpstreamCode: upstream}
++	}
++	if len(expected) != 0 {
++		return unknownWrite(fmt.Errorf("missing record confirmation"))
++	}
++	return nil
++}
+diff --git a/internal/mcpserver/server.go b/internal/mcpserver/server.go
+index 7e7a2ad..b1e2d7d 100644
+--- a/internal/mcpserver/server.go
++++ b/internal/mcpserver/server.go
+@@ -6,6 +6,7 @@ import (
+ 	"log/slog"
+ 	"time"
+ 
++	"github.com/google/jsonschema-go/jsonschema"
+ 	"github.com/google/uuid"
+ 	"github.com/modelcontextprotocol/go-sdk/mcp"
+ 
+@@ -42,8 +43,12 @@ func annotations(read, destructive, idempotent bool) *mcp.ToolAnnotations {
+ }
+ 
+ func register[In, Out any](server *mcp.Server, name, description string, annotations *mcp.ToolAnnotations, logger *slog.Logger, operation func(context.Context, In) (Out, error)) {
+-	mcp.AddTool(server, &mcp.Tool{Name: name, Description: description, Annotations: annotations},
+-		func(ctx context.Context, _ *mcp.CallToolRequest, in In) (*mcp.CallToolResult, Out, error) {
++	schema, err := jsonschema.For[Out](nil)
++	if err != nil {
++		panic("invalid tool output schema")
++	}
++	mcp.AddTool(server, &mcp.Tool{Name: name, Description: description, Annotations: annotations, OutputSchema: schema},
++		func(ctx context.Context, _ *mcp.CallToolRequest, in In) (*mcp.CallToolResult, any, error) {
+ 			started := time.Now()
+ 			callID := uuid.NewString()
+ 			if logger != nil {
+@@ -51,7 +56,9 @@ func register[In, Out any](server *mcp.Server, name, description string, annotat
+ 			}
+ 			out, err := operation(ctx, in)
+ 			outcome := "ok"
++			var details map[string]any
+ 			if err != nil {
++				details = reminders.ErrorDetails(err, name, callID, !annotations.ReadOnlyHint)
+ 				err = reminders.PublicError(err)
+ 				outcome = err.(*reminders.Error).Code
+ 			}
+@@ -60,9 +67,24 @@ func register[In, Out any](server *mcp.Server, name, description string, annotat
+ 				if err == nil {
+ 					fields = append(fields, "result_count", resultCount(out))
+ 				}
++				if details != nil {
++					for _, key := range []string{"write_status", "retry_class", "upstream_status", "upstream_error_code"} {
++						if value, ok := details[key]; ok {
++							fields = append(fields, key, value)
++						}
++					}
++				}
+ 				logger.Info("mcp_tool_complete", fields...)
+ 			}
+-			return nil, out, err
++			if err != nil {
++				return &mcp.CallToolResult{IsError: true, StructuredContent: details,
++					Content: []mcp.Content{&mcp.TextContent{Text: err.Error()}}}, nil, nil
++			}
++			if mutation, ok := any(out).(reminders.MutationResult); ok {
++				mutation.WriteStatus = "succeeded"
++				return nil, mutation, nil
++			}
++			return nil, out, nil
+ 		})
+ }
+ 
+diff --git a/internal/mcpserver/server_test.go b/internal/mcpserver/server_test.go
+index 4258c0e..f139040 100644
+--- a/internal/mcpserver/server_test.go
++++ b/internal/mcpserver/server_test.go
+@@ -54,6 +54,10 @@ func TestMCPHTTPDiscoveryAndErrors(t *testing.T) {
+ 			if err != nil || !result.IsError {
+ 				t.Fatalf("auth result: %+v, %v", result, err)
+ 			}
++			details, ok := result.StructuredContent.(map[string]any)
++			if !ok || details["error_code"] != "auth_required" || details["request_id"] == nil {
++				t.Fatal("structured error evidence was lost")
++			}
+ 			if !strings.Contains(result.Content[0].(*mcp.TextContent).Text, "auth_required") {
+ 				t.Fatal("missing auth status")
+ 			}
+diff --git a/internal/reminders/diagnostics.go b/internal/reminders/diagnostics.go
+new file mode 100644
+index 0000000..01ec40b
+--- /dev/null
++++ b/internal/reminders/diagnostics.go
+@@ -0,0 +1,85 @@
++package reminders
++
++import (
++	"errors"
++	"icloud-reminders/internal/cloudkit"
++)
++
++// DiagnosticError preserves deliberately safe evidence across service layers.
++type DiagnosticError struct {
++	Public       *Error
++	WriteStatus  string
++	RetryClass   string
++	HTTPStatus   int
++	UpstreamCode string
++}
++
++func (e *DiagnosticError) Error() string { return e.Public.Error() }
++func (e *DiagnosticError) Unwrap() error { return e.Public }
++
++func beforeWrite(err error) error {
++	public := PublicError(err)
++	retry := "retryable_safe"
++	switch public.Code {
++	case "invalid_argument", "not_found", "auth_required", "icloud_access_denied", "permission_denied", "not_shared":
++		retry = "not_retryable"
++	}
++	failure := &DiagnosticError{Public: public, WriteStatus: "not_sent", RetryClass: retry}
++	var api *cloudkit.APIError
++	if errors.As(err, &api) {
++		failure.HTTPStatus = api.StatusCode
++	}
++	return failure
++}
++
++func operationFailure(err error) error {
++	var existing *DiagnosticError
++	if errors.As(err, &existing) {
++		return existing
++	}
++	var write *cloudkit.WriteFailure
++	if errors.As(err, &write) {
++		retry := "retryable_after_read"
++		if write.Status == "failed" {
++			retry = "not_retryable"
++		}
++		return &DiagnosticError{Public: PublicError(err), WriteStatus: write.Status,
++			RetryClass: retry, HTTPStatus: write.HTTPStatus, UpstreamCode: write.UpstreamCode}
++	}
++	var public *Error
++	if errors.As(err, &public) {
++		switch public.Code {
++		case "invalid_argument", "not_found", "permission_denied", "not_shared", "unsupported_structure":
++			return beforeWrite(err)
++		}
++	}
++	return &DiagnosticError{Public: PublicError(err), WriteStatus: "unknown", RetryClass: "retryable_after_read"}
++}
++
++func ErrorDetails(err error, operation, requestID string, mutation bool) map[string]any {
++	public := PublicError(err)
++	out := map[string]any{"error_code": public.Code, "operation": operation, "request_id": requestID,
++		"retry_class": "retryable_safe"}
++	if mutation {
++		out["write_status"], out["retry_class"] = "unknown", "retryable_after_read"
++		switch public.Code {
++		case "invalid_argument", "not_found", "not_shared", "permission_denied":
++			out["write_status"], out["retry_class"] = "not_sent", "not_retryable"
++		}
++	}
++	var diagnostic *DiagnosticError
++	if errors.As(err, &diagnostic) {
++		if mutation {
++			out["write_status"] = diagnostic.WriteStatus
++		}
++		out["retry_class"] = diagnostic.RetryClass
++		if diagnostic.HTTPStatus != 0 {
++			out["upstream_status"] = diagnostic.HTTPStatus
++		}
++		if diagnostic.UpstreamCode != "" {
++			out["upstream_error_code"] = diagnostic.UpstreamCode
++		}
++	}
++	out["retryable"] = out["retry_class"] != "not_retryable"
++	return out
++}
+diff --git a/internal/reminders/idempotency.go b/internal/reminders/idempotency.go
+new file mode 100644
+index 0000000..9d98a00
+--- /dev/null
++++ b/internal/reminders/idempotency.go
+@@ -0,0 +1,101 @@
++package reminders
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"os"
++	"path/filepath"
++	"strings"
++
++	"github.com/google/uuid"
++	"icloud-reminders/internal/cloudkit"
++	"icloud-reminders/internal/storage"
++	syncengine "icloud-reminders/internal/sync"
++)
++
++type createReservation struct {
++	path      string
++	ID        string `json:"id"`
++	InputHash string `json:"input_hash"`
++	Done      bool   `json:"done"`
++}
++
++func (r *createReservation) save() error {
++	data, err := json.Marshal(r)
++	if err != nil {
++		return err
++	}
++	return storage.WritePrivate(r.path, data)
++}
++
++// Reserve before dispatch, under the service's account gate. The ledger never
++// stores titles/notes or participant information. Pending retries inspect the
++// exact reserved record in its original zone; every retry uses that same ID.
++func (s *Service) reserveCreate(engine *syncengine.Engine, in CreateInput) (*createReservation, error) {
++	if in.ClientRequestID == "" {
++		return nil, nil
++	}
++	key, err := uuid.Parse(in.ClientRequestID)
++	if err != nil {
++		return nil, invalid("client_request_id must be a UUID")
++	}
++	in.ClientRequestID = key.String()
++	if engine.Cache.OwnerID == nil {
++		return nil, beforeWrite(errors.New("owner unavailable"))
++	}
++	accountKey := *engine.Cache.OwnerID + "\x00" + in.ClientRequestID
++	identityHash := sha256.Sum256([]byte(accountKey))
++	payload, err := json.Marshal(in)
++	if err != nil {
++		return nil, beforeWrite(err)
++	}
++	inputHash := sha256.Sum256(payload)
++	reservation := &createReservation{
++		path:      filepath.Join(s.directory, "create-requests", hex.EncodeToString(identityHash[:])+".json"),
++		ID:        "Reminder/" + strings.ToUpper(uuid.NewSHA1(uuid.NameSpaceOID, []byte(accountKey)).String()),
++		InputHash: hex.EncodeToString(inputHash[:]),
++	}
++	data, err := os.ReadFile(reservation.path)
++	if errors.Is(err, os.ErrNotExist) {
++		if err := reservation.save(); err != nil {
++			return nil, beforeWrite(err)
++		}
++		return reservation, nil
++	}
++	if err != nil {
++		return nil, beforeWrite(err)
++	}
++	var previous createReservation
++	if err := json.Unmarshal(data, &previous); err != nil || previous.ID != reservation.ID {
++		return nil, beforeWrite(errors.New("invalid request state"))
++	}
++	if previous.InputHash != reservation.InputHash {
++		return nil, &DiagnosticError{Public: &Error{"idempotency_conflict", "client_request_id was already used with different arguments."}, WriteStatus: "not_sent", RetryClass: "not_retryable"}
++	}
++	if previous.Done {
++		reservation.Done = true
++		return reservation, nil
++	}
++	scope, ok := engine.Cache.Scopes[in.ListID]
++	if !ok {
++		return nil, beforeWrite(errors.New("list scope unavailable"))
++	}
++	records, err := engine.CK.ForScope(scope).LookupRecords(scope.OwnerRecordName, []string{reservation.ID})
++	if err != nil {
++		var absent *cloudkit.RecordNotFoundError
++		if errors.As(err, &absent) {
++			return reservation, nil
++		}
++		return nil, &DiagnosticError{Public: &Error{"write_result_unknown", "Could not establish the previous creation's state. Retry only with the same client_request_id."}, WriteStatus: "unknown", RetryClass: "retryable_after_read"}
++	}
++	if len(records) != 1 || stringValue(records[0], "recordType") != "Reminder" {
++		return nil, &DiagnosticError{Public: &Error{"write_result_unknown", "Could not verify the reserved reminder."}, WriteStatus: "unknown", RetryClass: "retryable_after_read"}
++	}
++	reservation.Done = true
++	if err := reservation.save(); err != nil {
++		return nil, beforeWrite(err)
++	}
++	return reservation, nil
++}
+diff --git a/internal/reminders/service.go b/internal/reminders/service.go
+index 34853a5..4b3efe1 100644
+--- a/internal/reminders/service.go
++++ b/internal/reminders/service.go
+@@ -30,6 +30,13 @@ func invalid(message string) error { return &Error{"invalid_argument", message}
+ // PublicError prevents upstream response bodies, URLs and credentials from
+ // escaping through MCP errors or logs.
+ func PublicError(err error) *Error {
++	var write *cloudkit.WriteFailure
++	if errors.As(err, &write) {
++		if write.Status == "failed" {
++			return &Error{"icloud_write_failed", "iCloud rejected the write."}
++		}
++		return &Error{"write_result_unknown", "iCloud did not confirm the write. Inspect the reminder before retrying."}
++	}
+ 	var public *Error
+ 	if errors.As(err, &public) {
+ 		return public
+@@ -64,12 +71,13 @@ type IDInput struct {
+ }
+ 
+ type CreateInput struct {
+-	Title    string `json:"title" jsonschema:"Reminder title"`
+-	ListID   string `json:"list_id" jsonschema:"Exact list ID returned by list_reminder_lists"`
+-	Due      string `json:"due,omitempty" jsonschema:"Due date in YYYY-MM-DD format"`
+-	Priority string `json:"priority,omitempty" jsonschema:"none, low, medium or high; default none"`
+-	Notes    string `json:"notes,omitempty" jsonschema:"Optional notes"`
+-	ParentID string `json:"parent_id,omitempty" jsonschema:"Exact parent reminder ID in the same list"`
++	ClientRequestID string `json:"client_request_id,omitempty" jsonschema:"Optional UUID idempotency key; reuse with identical arguments to recover an uncertain creation without duplicates"`
++	Title           string `json:"title" jsonschema:"Reminder title"`
++	ListID          string `json:"list_id" jsonschema:"Exact list ID returned by list_reminder_lists"`
++	Due             string `json:"due,omitempty" jsonschema:"Due date in YYYY-MM-DD format"`
++	Priority        string `json:"priority,omitempty" jsonschema:"none, low, medium or high; default none"`
++	Notes           string `json:"notes,omitempty" jsonschema:"Optional notes"`
++	ParentID        string `json:"parent_id,omitempty" jsonschema:"Exact parent reminder ID in the same list"`
+ }
+ 
+ type UpdateInput struct {
+@@ -112,8 +120,9 @@ type ReminderResult struct {
+ 	Reminder *models.Reminder `json:"reminder"`
+ }
+ type MutationResult struct {
+-	ID     string `json:"id"`
+-	Status string `json:"status"`
++	WriteStatus string `json:"write_status,omitempty"`
++	ID          string `json:"id"`
++	Status      string `json:"status"`
+ }
+ type SyncResult struct {
+ 	Reminders int `json:"reminders"`
+@@ -158,24 +167,24 @@ func (s *Service) run(ctx context.Context, full bool, operation func(*syncengine
+ 	defer cancel()
+ 	select {
+ 	case <-ctx.Done():
+-		return PublicError(ctx.Err())
++		return beforeWrite(ctx.Err())
+ 	case <-s.gate:
+ 	}
+ 	defer func() { s.gate <- struct{}{} }()
+ 	if err := ctx.Err(); err != nil {
+-		return PublicError(err)
++		return beforeWrite(err)
+ 	}
+ 	sessionFile := filepath.Join(s.directory, "session.json")
+ 	session, err := auth.NewNonInteractive(ctx).EnsureSession(sessionFile, false)
+ 	if err != nil {
+ 		if ctx.Err() != nil {
+-			return PublicError(ctx.Err())
++			return beforeWrite(ctx.Err())
+ 		}
+-		return PublicError(err)
++		return beforeWrite(err)
+ 	}
+ 	client, err := cloudkit.NewFromSession(session)
+ 	if err != nil {
+-		return PublicError(err)
++		return beforeWrite(err)
+ 	}
+ 	engine := syncengine.NewWithCache(client.WithContext(ctx), sessionFile, cache.LoadFrom(s.directory))
+ 	engine.NonInteractive = true
+@@ -183,20 +192,17 @@ func (s *Service) run(ctx context.Context, full bool, operation func(*syncengine
+ 	// must never reuse the previous account's records or delta token.
+ 	ownerID, err := engine.CK.GetOwnerID()
+ 	if err != nil {
+-		return PublicError(err)
++		return beforeWrite(err)
+ 	}
+ 	if engine.Cache.OwnerID != nil && *engine.Cache.OwnerID != ownerID {
+ 		engine.Cache = engine.Cache.Reset()
+ 	}
+ 	engine.Cache.OwnerID = &ownerID
+ 	if err := engine.Sync(full); err != nil {
+-		return PublicError(err)
++		return beforeWrite(err)
+ 	}
+ 	if err := operation(engine, writer.New(engine.CK, engine)); err != nil {
+-		if ctx.Err() != nil {
+-			return PublicError(ctx.Err())
+-		}
+-		return PublicError(err)
++		return operationFailure(err)
+ 	}
+ 	return nil
+ }
+@@ -317,6 +323,17 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (out MutationResul
+ 				return invalid("parent_id must belong to list_id")
+ 			}
+ 		}
++		reservation, err := s.reserveCreate(engine, in)
++		if err != nil {
++			return err
++		}
++		if reservation != nil {
++			if reservation.Done {
++				out = MutationResult{ID: reservation.ID, Status: "already_created"}
++				return nil
++			}
++			w.CreateRecordID = reservation.ID
++		}
+ 		result, err := w.AddReminder(in.Title, in.ListID, in.Due, in.Priority, in.Notes, in.ParentID)
+ 		if err := writeError(result, err); err != nil {
+ 			return err
+@@ -326,6 +343,12 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (out MutationResul
+ 			return &Error{"write_result_unknown", "The creation result is unknown. List reminders before retrying."}
+ 		}
+ 		out = MutationResult{ID: id, Status: "created"}
++		if reservation != nil {
++			reservation.Done = true
++			if err := reservation.save(); err != nil {
++				return &DiagnosticError{Public: &Error{"local_state_failed", "The creation succeeded but local request state could not be saved. Retry only with the same client_request_id."}, WriteStatus: "succeeded", RetryClass: "retryable_after_read"}
++			}
++		}
+ 		return nil
+ 	})
+ 	return
+diff --git a/internal/reminders/service_test.go b/internal/reminders/service_test.go
+index f5ae1cb..292b14f 100644
+--- a/internal/reminders/service_test.go
++++ b/internal/reminders/service_test.go
+@@ -200,8 +200,11 @@ func (f *cloudFixture) handle(w http.ResponseWriter, r *http.Request) {
+ 			changes, _ := operation.Record["fields"].(map[string]any)
+ 			for key, value := range changes {
+ 				if key == "Completed" {
+-					if nested, ok := value.(map[string]any); ok && nested["value"] == true {
+-						value = map[string]any{"value": 1}
++					nested, _ := value.(map[string]any)
++					if _, ok := nested["value"].(bool); ok {
++						w.WriteHeader(400)
++						_, _ = w.Write([]byte("private-upstream-body"))
++						return
+ 					}
+ 				}
+ 				fields[key] = value
+@@ -210,6 +213,10 @@ func (f *cloudFixture) handle(w http.ResponseWriter, r *http.Request) {
+ 		record["recordChangeTag"] = fmt.Sprintf("tag-%d", f.writes+1)
+ 		result = append(result, map[string]any{"recordName": id, "recordChangeTag": record["recordChangeTag"]})
+ 	}
++	if f.failure == "lost_create_response" {
++		_, _ = w.Write([]byte("{}"))
++		return
++	}
+ 	_ = json.NewEncoder(w).Encode(map[string]any{"records": result})
+ }
+ 
+diff --git a/internal/reminders/write_integrity_test.go b/internal/reminders/write_integrity_test.go
+new file mode 100644
+index 0000000..846ca8f
+--- /dev/null
++++ b/internal/reminders/write_integrity_test.go
+@@ -0,0 +1,108 @@
++package reminders
++
++import (
++	"context"
++	"github.com/google/uuid"
++	"strings"
++	"testing"
++	"time"
++)
++
++func TestRepeatedExactWriteLifecycle(t *testing.T) {
++	f := newCloud(t)
++	s := New(f.directory, 5*time.Second)
++	ctx := context.Background()
++	titles := []string{"Rollläden im Wohnzimmer getrennt steuerbar", "Glücklich sein und sich lieben! 🥰",
++		"3,43 % Sparkasse Dortmund, 10 Jahre Zinsbindung", "❤️", "ÄÖÜ äöü ß", "!#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"}
++	for index := 0; index < 100; index++ {
++		title := titles[index%len(titles)]
++		created, err := s.Create(ctx, CreateInput{Title: title, ListID: "List/1", Due: "2026-10-15", Priority: "high", Notes: title})
++		if err != nil {
++			t.Fatal(err)
++		}
++		read, err := s.Get(ctx, IDInput{ID: created.ID})
++		if err != nil || read.Reminder.Title != title || read.Reminder.Notes == nil || *read.Reminder.Notes != title || read.Reminder.Priority != 1 || read.Reminder.Due == nil || *read.Reminder.Due != "2026-10-15" {
++			t.Fatalf("roundtrip %d", index)
++		}
++		if _, err := s.Update(ctx, UpdateInput{ID: created.ID, Title: title + " updated"}); err != nil {
++			t.Fatal(err)
++		}
++		read, err = s.Get(ctx, IDInput{ID: created.ID})
++		if err != nil || read.Reminder.Title != title+" updated" {
++			t.Fatal("update did not roundtrip")
++		}
++		if _, err := s.Complete(ctx, IDInput{ID: created.ID}); err != nil {
++			t.Fatal(err)
++		}
++		read, err = s.Get(ctx, IDInput{ID: created.ID})
++		if err != nil || !read.Reminder.Completed {
++			t.Fatal("complete did not roundtrip")
++		}
++		if _, err := s.Delete(ctx, DeleteInput{ID: created.ID, Confirm: true}); err != nil {
++			t.Fatal(err)
++		}
++		if _, err := s.Get(ctx, IDInput{ID: created.ID}); err == nil {
++			t.Fatal("delete did not roundtrip")
++		}
++	}
++}
++
++func TestKeyedCreationRecoveryAcrossRestart(t *testing.T) {
++	f := newCloud(t)
++	ctx := context.Background()
++	s := New(f.directory, 5*time.Second)
++	in := CreateInput{Title: "Exact keyed title 🥰", ListID: "List/1", ClientRequestID: uuid.NewString()}
++	// The fake iCloud applies the write but drops the application response.
++	f.failure = "lost_create_response"
++	if _, err := s.Create(ctx, in); err == nil {
++		t.Fatal("lost response unexpectedly confirmed")
++	}
++	if f.writes != 1 {
++		t.Fatal("write automatically retried")
++	}
++	f.failure = ""
++	restarted := New(f.directory, 5*time.Second)
++	recovered, err := restarted.Create(ctx, in)
++	if err != nil || recovered.Status != "already_created" || recovered.ID == "" {
++		t.Fatalf("recovery: %v", err)
++	}
++	if f.writes != 1 {
++		t.Fatal("recovery created a duplicate")
++	}
++	again, err := New(f.directory, 5*time.Second).Create(ctx, in)
++	if err != nil || again.ID != recovered.ID || again.Status != "already_created" || f.writes != 1 {
++		t.Fatal("durable replay failed")
++	}
++	in.Title += " changed"
++	if _, err := restarted.Create(ctx, in); err == nil || PublicError(err).Code != "idempotency_conflict" {
++		t.Fatal("key reuse with different payload accepted")
++	}
++}
++
++func TestSafeWriteEvidence(t *testing.T) {
++	for _, failure := range []string{"http", "record", "empty", "lost_create_response"} {
++		t.Run(failure, func(t *testing.T) {
++			f := newCloud(t)
++			s := New(f.directory, 5*time.Second)
++			f.failure = failure
++			_, err := s.Create(context.Background(), CreateInput{Title: "safe title", ListID: "List/1"})
++			if err == nil {
++				t.Fatal("failure was accepted")
++			}
++			details := ErrorDetails(err, "create_reminder", "safe-request-id", true)
++			expected := "unknown"
++			if failure == "record" {
++				expected = "failed"
++			}
++			if details["write_status"] != expected {
++				t.Fatalf("incorrect write evidence: %+v", details)
++			}
++			if strings.Contains(err.Error(), "private-upstream-body") {
++				t.Fatal("private response escaped")
++			}
++			if f.writes != 1 {
++				t.Fatal("write retried")
++			}
++		})
++	}
++}
+diff --git a/internal/utils/utils.go b/internal/utils/utils.go
+index 03a46a9..eab399f 100644
+--- a/internal/utils/utils.go
++++ b/internal/utils/utils.go
+@@ -6,10 +6,9 @@ import (
+ 	"compress/gzip"
+ 	"crypto/rand"
+ 	"encoding/base64"
++	"encoding/binary"
+ 	"fmt"
+ 	"io"
+-	"regexp"
+-	"strings"
+ 	"time"
+ 	"unicode/utf8"
+ )
+@@ -131,49 +130,100 @@ func EncodeTitle(title string) (string, error) {
+ 	return base64.StdEncoding.EncodeToString(buf.Bytes()), nil
+ }
+ 
+-// printableRe matches printable runs of at least 2 characters.
+-var printableRe = regexp.MustCompile(`[^\x00-\x1f\x7f-\x9f]{2,}`)
+-
+-// ExtractTitle extracts the title text from a base64-encoded gzip CRDT TitleDocument.
++// ExtractTitle decodes the text field, never protobuf framing or CRDT metadata.
++// TitleDocument stores text at outer.document(2).note(3).text(2).
+ func ExtractTitle(tdB64 string) string {
+-	if tdB64 == "" {
+-		return ""
+-	}
+ 	raw, err := base64.StdEncoding.DecodeString(tdB64)
+-	if err != nil {
++	if err != nil || len(raw) == 0 {
+ 		return ""
+ 	}
+-
+-	var text string
+-	if len(raw) >= 2 && raw[0] == 0x1f && raw[1] == 0x8b {
+-		// Gzip compressed
++	compressed := len(raw) >= 2 && raw[0] == 0x1f && raw[1] == 0x8b
++	if compressed {
+ 		r, err := gzip.NewReader(bytes.NewReader(raw))
+ 		if err != nil {
+ 			return ""
+ 		}
+-		dec, err := io.ReadAll(r)
+-		if err != nil {
++		defer r.Close()
++		raw, err = io.ReadAll(io.LimitReader(r, (1<<20)+1))
++		if err != nil || len(raw) > 1<<20 {
+ 			return ""
+ 		}
+-		text = string(dec)
+-	} else {
+-		// Try plain UTF-8
+-		text = strings.TrimSpace(string(raw))
+-		if text != "" {
+-			return text
++	}
++	text, ok := documentText(raw)
++	if ok && utf8.Valid(text) {
++		return string(text)
++	}
++	// Legacy uncompressed plain text remains supported, with its whitespace.
++	if !compressed && utf8.Valid(raw) && len(raw) <= 1<<20 {
++		for _, b := range raw {
++			if b < 0x20 && b != '\n' && b != '\r' && b != '\t' {
++				return ""
++			}
+ 		}
+-		return ""
++		return string(raw)
+ 	}
++	return ""
++}
+ 
+-	// Extract printable runs
+-	matches := printableRe.FindAllString(text, -1)
+-	for _, s := range matches {
+-		s = strings.TrimSpace(s)
+-		if len([]rune(s)) >= 2 {
+-			return s
++func documentText(raw []byte) ([]byte, bool) {
++	for _, field := range []uint64{2, 3, 2} {
++		value, ok := protobufBytes(raw, field)
++		if !ok {
++			return nil, false
+ 		}
++		raw = value
+ 	}
+-	return ""
++	return raw, true
++}
++
++// protobufBytes skips unknown fields and validates the complete message.
++// A duplicate target field or malformed framing fails closed.
++func protobufBytes(raw []byte, field uint64) ([]byte, bool) {
++	var value []byte
++	found := false
++	for len(raw) > 0 {
++		tag, n := binary.Uvarint(raw)
++		if n <= 0 || tag>>3 == 0 {
++			return nil, false
++		}
++		raw = raw[n:]
++		var payload []byte
++		switch tag & 7 {
++		case 0:
++			_, n = binary.Uvarint(raw)
++			if n <= 0 {
++				return nil, false
++			}
++			raw = raw[n:]
++		case 1:
++			if len(raw) < 8 {
++				return nil, false
++			}
++			raw = raw[8:]
++		case 2:
++			length, n := binary.Uvarint(raw)
++			if n <= 0 || length > uint64(len(raw)-n) {
++				return nil, false
++			}
++			raw = raw[n:]
++			payload = raw[:int(length)]
++			raw = raw[int(length):]
++		case 5:
++			if len(raw) < 4 {
++				return nil, false
++			}
++			raw = raw[4:]
++		default:
++			return nil, false
++		}
++		if tag>>3 == field {
++			if found || tag&7 != 2 {
++				return nil, false
++			}
++			value, found = payload, true
++		}
++	}
++	return value, found
+ }
+ 
+ // TsToStr converts a millisecond timestamp to YYYY-MM-DD string.
+diff --git a/internal/utils/utils_test.go b/internal/utils/utils_test.go
+new file mode 100644
+index 0000000..9823229
+--- /dev/null
++++ b/internal/utils/utils_test.go
+@@ -0,0 +1,60 @@
++package utils
++
++import (
++	"bytes"
++	"compress/gzip"
++	"encoding/base64"
++	"strings"
++	"testing"
++)
++
++func TestTitleDocumentExactRoundTrip(t *testing.T) {
++	titles := []string{"", "X", "❤️", "ÄÖÜ äöü ß", "Rollläden im Wohnzimmer getrennt steuerbar",
++		"Nur noch schöne Dinge machen ❤️", "Glücklich sein und sich lieben! 🥰",
++		"3,43 % Sparkasse Dortmund, 10 Jahre Zinsbindung", "6 Monate bereitstellungsfreie Zeit",
++		"Arbeitsverträge von Wera an Herrn Moser senden", "Sondertilgung im November immer machen",
++		"Vertragsvorlage ohne unsere Namen von einem anderen Objekt",
++		"Alina fragen, ob sie eine Risikolebensversicherung abgeschlossen hat",
++		"Unterlagen für die Bank zusammenstellen", "Bank anrufen und erfragen, welche Unterlagen benötigt werden",
++		"!#$%&'()*+,-./:;<=>?@[\\]^_`{|}~", "  preserve whitespace\nsecond line\t ", strings.Repeat("😀", 300)}
++	// Cover every one-byte printable length, and multi-byte varint lengths.
++	for n := 1; n <= 4096; n++ {
++		titles = append(titles, strings.Repeat("x", n))
++	}
++	for _, title := range titles {
++		encoded, err := EncodeTitle(title)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if got := ExtractTitle(encoded); got != title {
++			t.Fatalf("text differs at length %d", len(title))
++		}
++	}
++}
++
++func compressed(raw []byte) string {
++	var out bytes.Buffer
++	zip := gzip.NewWriter(&out)
++	_, _ = zip.Write(raw)
++	_ = zip.Close()
++	return base64.StdEncoding.EncodeToString(out.Bytes())
++}
++
++func TestDocumentDecoderRejectsMalformedFramingAndMetadata(t *testing.T) {
++	for _, raw := range [][]byte{
++		{0x12, 0xff}, {0x12, 0x7f, 'x'}, {0x00}, {0x0a, 0x03, 'f', 'o', 'o'},
++		append(EncodeField(2, 2, []byte{0x1a, 0x02, 0x12, 0x00}), EncodeField(2, 2, []byte{})...),
++		[]byte(strings.Repeat("x", (1<<20)+1)),
++	} {
++		if got := ExtractTitle(compressed(raw)); got != "" {
++			t.Fatal("malformed/metadata text escaped")
++		}
++	}
++	if got := ExtractTitle("not-base64"); got != "" {
++		t.Fatal("invalid base64 escaped")
++	}
++	text := "  plain legacy notes\nwith whitespace  "
++	if got := ExtractTitle(base64.StdEncoding.EncodeToString([]byte(text))); got != text {
++		t.Fatal("legacy text changed")
++	}
++}
+diff --git a/internal/writer/writer.go b/internal/writer/writer.go
+index 409f653..bad5dce 100644
+--- a/internal/writer/writer.go
++++ b/internal/writer/writer.go
+@@ -18,6 +18,8 @@ import (
+ type Writer struct {
+ 	CK   *cloudkit.Client
+ 	Sync *sync.Engine
++	// CreateRecordID is reserved durably by the server for keyed creations.
++	CreateRecordID string
+ }
+ 
+ // New creates a new Writer.
+@@ -42,14 +44,14 @@ func (w *Writer) ownerID() (string, error) {
+ func (w *Writer) AddReminder(title, listName, dueDate, priority, notes, parentID string) (map[string]interface{}, error) {
+ 	ownerID, err := w.ownerID()
+ 	if err != nil {
+-		return errResult(err), nil
++		return nil, err
+ 	}
+ 
+ 	listID := ""
+ 	if listName != "" {
+ 		listID = w.Sync.FindListByName(listName)
+ 		if listID == "" {
+-			return errResult(fmt.Errorf("list '%s' not found", listName)), nil
++			return nil, fmt.Errorf("list '%s' not found", listName)
+ 		}
+ 	}
+ 
+@@ -57,7 +59,7 @@ func (w *Writer) AddReminder(title, listName, dueDate, priority, notes, parentID
+ 	if parentID != "" {
+ 		parentRef = w.Sync.FindReminderByID(parentID)
+ 		if parentRef == "" {
+-			return errResult(fmt.Errorf("parent reminder '%s' not found", parentID)), nil
++			return nil, fmt.Errorf("parent reminder '%s' not found", parentID)
+ 		}
+ 		// Inherit list from parent if not specified
+ 		if listID == "" {
+@@ -71,17 +73,21 @@ func (w *Writer) AddReminder(title, listName, dueDate, priority, notes, parentID
+ 
+ 	op, recordName, err := buildCreateOp(title, listID, parentRef, dueDate, priorityVal, notes)
+ 	if err != nil {
+-		return errResult(err), nil
++		return nil, err
+ 	}
+ 
++	if w.CreateRecordID != "" {
++		recordName = w.CreateRecordID
++		op["record"].(map[string]interface{})["recordName"] = recordName
++	}
+ 	logger.Debugf("add: creating record %s in list %s", recordName, listID)
+ 	result, err := w.modifyInScope(listID, ownerID, []map[string]interface{}{op})
+ 	if err != nil {
+-		return errResult(err), nil
++		return nil, err
+ 	}
+ 
+ 	if err := checkRecordErrors(result); err != nil {
+-		return errResult(err), nil
++		return nil, err
+ 	}
+ 
+ 	logger.Infof("Created reminder: %q → %s", title, listName)
+@@ -128,19 +134,19 @@ func (w *Writer) AddReminder(title, listName, dueDate, priority, notes, parentID
+ // AddRemindersBatch adds multiple reminders in a single CloudKit request.
+ func (w *Writer) AddRemindersBatch(titles []string, listName, parentID string) (map[string]interface{}, error) {
+ 	if len(titles) == 0 {
+-		return errResult(fmt.Errorf("no titles provided")), nil
++		return nil, fmt.Errorf("no titles provided")
+ 	}
+ 
+ 	ownerID, err := w.ownerID()
+ 	if err != nil {
+-		return errResult(err), nil
++		return nil, err
+ 	}
+ 
+ 	listID := ""
+ 	if listName != "" {
+ 		listID = w.Sync.FindListByName(listName)
+ 		if listID == "" {
+-			return errResult(fmt.Errorf("list '%s' not found", listName)), nil
++			return nil, fmt.Errorf("list '%s' not found", listName)
+ 		}
+ 	}
+ 
+@@ -148,7 +154,7 @@ func (w *Writer) AddRemindersBatch(titles []string, listName, parentID string) (
+ 	if parentID != "" {
+ 		parentRef = w.Sync.FindReminderByID(parentID)
+ 		if parentRef == "" {
+-			return errResult(fmt.Errorf("parent reminder '%s' not found", parentID)), nil
++			return nil, fmt.Errorf("parent reminder '%s' not found", parentID)
+ 		}
+ 		if listID == "" {
+ 			if pd := w.Sync.Cache.Reminders[parentRef]; pd != nil && pd.ListRef != nil {
+@@ -167,7 +173,7 @@ func (w *Writer) AddRemindersBatch(titles []string, listName, parentID string) (
+ 	for _, title := range titles {
+ 		op, recordName, err := buildCreateOp(title, listID, parentRef, "", 0, "")
+ 		if err != nil {
+-			return errResult(err), nil
++			return nil, err
+ 		}
+ 		ops = append(ops, op)
+ 		createdList = append(createdList, created{recordName, title})
+@@ -176,10 +182,10 @@ func (w *Writer) AddRemindersBatch(titles []string, listName, parentID string) (
+ 	logger.Debugf("add-batch: creating %d records in list %s", len(ops), listID)
+ 	result, err := w.modifyInScope(listID, ownerID, ops)
+ 	if err != nil {
+-		return errResult(err), nil
++		return nil, err
+ 	}
+ 	if err := checkRecordErrors(result); err != nil {
+-		return errResult(err), nil
++		return nil, err
+ 	}
+ 
+ 	logger.Infof("Created %d reminders in %q", len(createdList), listName)
+@@ -217,17 +223,17 @@ func (w *Writer) AddRemindersBatch(titles []string, listName, parentID string) (
+ func (w *Writer) CompleteReminder(reminderID string) (map[string]interface{}, error) {
+ 	ownerID, err := w.ownerID()
+ 	if err != nil {
+-		return errResult(err), nil
++		return nil, err
+ 	}
+ 
+ 	fullID := w.Sync.FindReminderByID(reminderID)
+ 	if fullID == "" {
+-		return errResult(fmt.Errorf("reminder '%s' not found", reminderID)), nil
++		return nil, fmt.Errorf("reminder '%s' not found", reminderID)
+ 	}
+ 
+ 	rd := w.Sync.Cache.Reminders[fullID]
+ 	if rd == nil || rd.ChangeTag == nil || *rd.ChangeTag == "" {
+-		return errResult(fmt.Errorf("missing change tag for '%s' — try running 'sync' first", reminderID)), nil
++		return nil, fmt.Errorf("missing change tag for '%s' — try running 'sync' first", reminderID)
+ 	}
+ 
+ 	now := time.Now().UnixMilli()
+@@ -238,7 +244,7 @@ func (w *Writer) CompleteReminder(reminderID string) (map[string]interface{}, er
+ 			"recordName":      fullID,
+ 			"recordChangeTag": *rd.ChangeTag,
+ 			"fields": map[string]interface{}{
+-				"Completed":      map[string]interface{}{"value": true},
++				"Completed":      map[string]interface{}{"value": 1},
+ 				"CompletionDate": map[string]interface{}{"value": now},
+ 			},
+ 		},
+@@ -247,10 +253,10 @@ func (w *Writer) CompleteReminder(reminderID string) (map[string]interface{}, er
+ 	logger.Debugf("complete: updating record %s", fullID)
+ 	result, err := w.modifyInScope(fullID, ownerID, []map[string]interface{}{op})
+ 	if err != nil {
+-		return errResult(err), nil
++		return nil, err
+ 	}
+ 	if err := checkRecordErrors(result); err != nil {
+-		return errResult(err), nil
++		return nil, err
+ 	}
+ 	if _, hasErr := result["error"]; !hasErr {
+ 		rd.Completed = true
+@@ -276,17 +282,17 @@ func (w *Writer) CompleteReminder(reminderID string) (map[string]interface{}, er
+ func (w *Writer) DeleteReminder(reminderID string) (map[string]interface{}, error) {
+ 	ownerID, err := w.ownerID()
+ 	if err != nil {
+-		return errResult(err), nil
++		return nil, err
+ 	}
+ 
+ 	fullID := w.Sync.FindReminderByID(reminderID)
+ 	if fullID == "" {
+-		return errResult(fmt.Errorf("reminder '%s' not found", reminderID)), nil
++		return nil, fmt.Errorf("reminder '%s' not found", reminderID)
+ 	}
+ 
+ 	rd := w.Sync.Cache.Reminders[fullID]
+ 	if rd == nil || rd.ChangeTag == nil || *rd.ChangeTag == "" {
+-		return errResult(fmt.Errorf("missing change tag for '%s' — try running 'sync' first", reminderID)), nil
++		return nil, fmt.Errorf("missing change tag for '%s' — try running 'sync' first", reminderID)
+ 	}
+ 
+ 	op := map[string]interface{}{
+@@ -304,10 +310,10 @@ func (w *Writer) DeleteReminder(reminderID string) (map[string]interface{}, erro
+ 	logger.Debugf("delete: removing record %s", fullID)
+ 	result, err := w.modifyInScope(fullID, ownerID, []map[string]interface{}{op})
+ 	if err != nil {
+-		return errResult(err), nil
++		return nil, err
+ 	}
+ 	if err := checkRecordErrors(result); err != nil {
+-		return errResult(err), nil
++		return nil, err
+ 	}
+ 	if _, hasErr := result["error"]; !hasErr {
+ 		delete(w.Sync.Cache.Reminders, fullID)
+@@ -325,21 +331,21 @@ func (w *Writer) DeleteReminder(reminderID string) (map[string]interface{}, erro
+ func (w *Writer) EditReminder(reminderID, title, dueDate, notes, priority string) (map[string]interface{}, error) {
+ 	ownerID, err := w.ownerID()
+ 	if err != nil {
+-		return errResult(err), nil
++		return nil, err
+ 	}
+ 
+ 	fullID := w.Sync.FindReminderByID(reminderID)
+ 	if fullID == "" {
+-		return errResult(fmt.Errorf("reminder '%s' not found", reminderID)), nil
++		return nil, fmt.Errorf("reminder '%s' not found", reminderID)
+ 	}
+ 
+ 	rd := w.Sync.Cache.Reminders[fullID]
+ 	if rd == nil || rd.ChangeTag == nil || *rd.ChangeTag == "" {
+-		return errResult(fmt.Errorf("missing change tag for '%s' — try running 'sync' first", reminderID)), nil
++		return nil, fmt.Errorf("missing change tag for '%s' — try running 'sync' first", reminderID)
+ 	}
+ 
+ 	if title == "" && dueDate == "" && notes == "" && priority == "" {
+-		return errResult(fmt.Errorf("no changes specified — use --title, --due, --notes, or --priority")), nil
++		return nil, fmt.Errorf("no changes specified — use --title, --due, --notes, or --priority")
+ 	}
+ 
+ 	fields := map[string]interface{}{}
+@@ -347,7 +353,7 @@ func (w *Writer) EditReminder(reminderID, title, dueDate, notes, priority string
+ 	if title != "" {
+ 		encoded, err := utils.EncodeTitle(title)
+ 		if err != nil {
+-			return errResult(fmt.Errorf("encode title: %w", err)), nil
++			return nil, fmt.Errorf("encode title: %w", err)
+ 		}
+ 		fields["TitleDocument"] = map[string]interface{}{"value": encoded}
+ 	}
+@@ -357,14 +363,14 @@ func (w *Writer) EditReminder(reminderID, title, dueDate, notes, priority string
+ 		if err == nil {
+ 			fields["DueDate"] = map[string]interface{}{"value": ts}
+ 		} else {
+-			return errResult(fmt.Errorf("invalid due date %q (expected YYYY-MM-DD): %w", dueDate, err)), nil
++			return nil, fmt.Errorf("invalid due date %q (expected YYYY-MM-DD): %w", dueDate, err)
+ 		}
+ 	}
+ 
+ 	if notes != "" {
+ 		encodedNotes, err := utils.EncodeTitle(notes)
+ 		if err != nil {
+-			return errResult(fmt.Errorf("encode notes: %w", err)), nil
++			return nil, fmt.Errorf("encode notes: %w", err)
+ 		}
+ 		fields["NotesDocument"] = map[string]interface{}{"value": encodedNotes}
+ 	}
+@@ -372,7 +378,7 @@ func (w *Writer) EditReminder(reminderID, title, dueDate, notes, priority string
+ 	if priority != "" {
+ 		priorityVal, ok := models.PriorityMap[priority]
+ 		if !ok {
+-			return errResult(fmt.Errorf("invalid priority %q (use: high, medium, low, none)", priority)), nil
++			return nil, fmt.Errorf("invalid priority %q (use: high, medium, low, none)", priority)
+ 		}
+ 		fields["Priority"] = map[string]interface{}{"value": priorityVal}
+ 	}
+@@ -390,10 +396,10 @@ func (w *Writer) EditReminder(reminderID, title, dueDate, notes, priority string
+ 	logger.Debugf("edit: updating record %s", fullID)
+ 	result, err := w.modifyInScope(fullID, ownerID, []map[string]interface{}{op})
+ 	if err != nil {
+-		return errResult(err), nil
++		return nil, err
+ 	}
+ 	if err := checkRecordErrors(result); err != nil {
+-		return errResult(err), nil
++		return nil, err
+ 	}
+ 
+ 	// Update local cache

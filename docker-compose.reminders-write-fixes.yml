@@ -1,0 +1,9 @@
+# Explicit overlay while the parallel structure work is integrated upstream.
+# Use with: docker compose -f docker-compose.yml -f docker-compose.reminders-write-fixes.yml ...
+services:
+  reminders:
+    build:
+      context: .
+      dockerfile: Dockerfile.reminders-write-fixes
+      additional_contexts:
+        reminders-source: https://github.com/Tooker/icloud-reminders-cli.git#f4d480349fa6a15d651e2c38444a40811c2d9233

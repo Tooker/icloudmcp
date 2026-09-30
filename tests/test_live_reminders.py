@@ -26,20 +26,25 @@ def test_live_python_go_reminders_read_only():
                     assert REMINDER_TOOLS | {"list_calendars", "search_emails", "get_email_attachment"} <= names
                     lists = await client.call_tool("list_reminder_lists", {})
                     assert not lists.is_error, "Reminders read failed; check the Go login or device approval."
-                    active = await client.call_tool("list_reminders", {"include_completed": False, "limit": 5})
+                    active = await client.call_tool("list_reminders", {"include_completed": False, "limit": 5, "view": "tree"})
                     assert not active.is_error, "Active-reminder read failed."
                     assert isinstance(lists.structured_content.get("lists"), list)
                     page = active.structured_content
                     assert isinstance(page.get("reminders"), list)
                     assert all(not item["completed"] for item in page["reminders"])
+                    assert isinstance(page.get("legend"), dict)
                     sampled = 0
                     if page["reminders"]:
                         item = await client.call_tool("get_reminder", {"id": page["reminders"][0]["id"]})
                         assert not item.is_error, "Individual-reminder read failed."
                         assert isinstance(item.structured_content.get("reminder"), dict)
                         sampled = 1
-                    shared_lists = participants = 0
+                    shared_lists = participants = sections = 0
                     for reminder_list in lists.structured_content["lists"]:
+                        headings = await client.call_tool("list_reminder_sections", {"list_id": reminder_list["id"]})
+                        if headings.is_error or not isinstance(headings.structured_content.get("sections"), list):
+                            raise AssertionError("Native section read failed; no list details logged.")
+                        sections += len(headings.structured_content["sections"])
                         people = await client.call_tool("list_reminder_participants", {"list_id": reminder_list["id"]})
                         if people.is_error:
                             raise AssertionError("Shared-list participant read failed.")
@@ -54,12 +59,12 @@ def test_live_python_go_reminders_read_only():
                             participants += len(ids)
                         elif ids:
                             raise AssertionError("A private list returned collaborators.")
-                    return len(lists.structured_content["lists"]), page["total"], sampled, shared_lists, participants
+                    return len(lists.structured_content["lists"]), page["total"], sampled, shared_lists, participants, sections
 
     try:
-        lists, active, sampled, shared_lists, participants = asyncio.run(smoke())
+        lists, active, sampled, shared_lists, participants, sections = asyncio.run(smoke())
     except AssertionError:
         raise
     except Exception as error:
         raise AssertionError(f"Live Reminders smoke failed: {error.__class__.__name__}") from None
-    print(f"Read-only Python/Go smoke passed: lists={lists} shared_lists={shared_lists} participants={participants} active={active} sampled={sampled}")
+    print(f"Read-only Python/Go smoke passed: lists={lists} shared_lists={shared_lists} participants={participants} sections={sections} active={active} sampled={sampled}")
