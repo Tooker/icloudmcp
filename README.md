@@ -351,14 +351,14 @@ fresh hits for that data type.
 
 ## Go Reminders integration
 
-Python remains the single MCP endpoint at `/mcp` and `/mcp/`. Its eight typed
+Python remains the single MCP endpoint at `/mcp` and `/mcp/`. Its ten typed
 Reminders tools call the separate Go backend over MCP Streamable HTTP at
 `http://reminders:8080/mcp`. Calendar, Mail and attachment resources continue to
 use the existing Python services. The tunnel still connects only to Python.
 
 The optional `reminders` Compose service builds directly from
 [Tooker/icloud-reminders-cli](https://github.com/Tooker/icloud-reminders-cli),
-pinned to commit `a0a3da50f288d6fc519c9c7eeee6ec0b1272c422`. No Go source is
+pinned to commit `f4d480349fa6a15d651e2c38444a40811c2d9233`. No Go source is
 copied into this repository and no second checkout or submodule is required.
 To upgrade, review a new Go commit and update the pinned build context. For
 local development, `REMINDERS_BUILD_CONTEXT=../icloud-reminders-cli` builds
@@ -424,13 +424,31 @@ trying again. The default 210-second total bridge deadline allows for Go's
 three-minute operation timeout and the connection handshake.
 
 Available tools are `list_reminder_lists`, `list_reminders`, `get_reminder`,
-`create_reminder`, `update_reminder`, `complete_reminder`, `delete_reminder` and
-`sync_reminders`. They preserve Go's structured results, exact IDs, filters and
+`create_reminder`, `update_reminder`, `complete_reminder`, `delete_reminder`,
+`sync_reminders`, `list_reminder_participants` and `assign_reminder`.
+They preserve Go's structured results, exact IDs, filters and
 pagination. Creation requires an existing list; dates use `YYYY-MM-DD` and
 priorities are `none`, `low`, `medium` or `high`. Deletion requires explicit
 `confirm=true`. Clearing notes/due dates and creating/deleting lists are not
 supported. For details, see the
-[Go backend documentation](https://github.com/Tooker/icloud-reminders-cli/blob/a0a3da50f288d6fc519c9c7eeee6ec0b1272c422/docs/mcp.md).
+[Go backend documentation](https://github.com/Tooker/icloud-reminders-cli/blob/f4d480349fa6a15d651e2c38444a40811c2d9233/docs/mcp.md).
+
+For assignments, first call `list_reminder_participants(list_id=...)` for the
+reminder's list. It returns accepted collaborators with their exact participant
+IDs, available names/contact details, permissions and `is_current_user`.
+Call `assign_reminder(id=..., participant_id=...)` to assign or reassign to one
+of that list's accepted collaborators with write access, including yourself.
+Call `assign_reminder(id=..., clear=true)` to remove the assignment. The two
+options are mutually exclusive; names and email addresses are not participant
+IDs. Reminder reads include `assignee_id` when assigned.
+
+Private lists return `shared=false` with no participants and reject assignment.
+The Go backend refreshes membership and checks the current user's write access
+before each assignment. It syncs both owned lists and incoming shared lists,
+keeping every read/write in its original CloudKit database and owner zone.
+The first sync after upgrading rebuilds the cache to include sharing and
+assignment records. Assignment records and the reminder link are written in
+one atomic batch; an uncertain write is never automatically retried.
 
 For a local Python process talking to the standalone Go container:
 
@@ -447,7 +465,8 @@ RUN_LIVE_REMINDERS_TESTS=1 uv run pytest tests/test_live_reminders.py -q -s
 ```
 
 This opt-in smoke test connects to Python's existing endpoint, discovers all
-three groups of tools, lists active reminders and reads one item when present.
+three groups of tools, lists active reminders, reads one item when present,
+and checks participant discovery for each list.
 It never calls write tools or initiates login/device approval, and reports only
 counts. Override the target with `LIVE_REMINDERS_MCP_URL` (default
 `http://127.0.0.1:8080/mcp`). Normal tests use a simulated Go MCP endpoint and

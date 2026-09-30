@@ -29,6 +29,9 @@ def register_reminders_tools(server: MCPServer, service: GoRemindersService | No
                 if name == "delete_reminder" and arguments.get("confirm") is not True:
                     outcome = "invalid_argument"
                     raise ToolError("delete_reminder requires confirm=true")
+                if name == "assign_reminder" and bool(arguments.get("participant_id")) == arguments.get("clear", False):
+                    outcome = "invalid_argument"
+                    raise ToolError("assign_reminder requires exactly one of participant_id or clear=true")
                 if service is None:
                     outcome = "not_configured"
                     raise ToolError("Reminders is not configured. Set REMINDERS_MCP_URL to the Go backend's private MCP endpoint.")
@@ -36,7 +39,7 @@ def register_reminders_tools(server: MCPServer, service: GoRemindersService | No
                 outcome = "ok"
                 payload = result.structured_content
                 if isinstance(payload, dict):
-                    for key in ("reminders", "lists"):
+                    for key in ("reminders", "lists", "participants"):
                         if isinstance(payload.get(key), list):
                             count = len(payload[key])
                             break
@@ -115,3 +118,18 @@ def register_reminders_tools(server: MCPServer, service: GoRemindersService | No
     ))
     async def sync_reminders(full: bool = False) -> CallToolResult:
         return await call("sync_reminders", full=full)
+
+    @server.tool(annotations=annotations(True), description=(
+        "List accepted participants of one shared Reminders list, including exact IDs, names and "
+        "permissions. Obtain list_id from list_reminder_lists. Private lists return shared=false."
+    ))
+    async def list_reminder_participants(list_id: str) -> CallToolResult:
+        return await call("list_reminder_participants", list_id=list_id)
+
+    @server.tool(annotations=annotations(False, destructive=True), description=(
+        "Assign a reminder to an accepted participant of its shared list. Use an exact participant_id "
+        "from list_reminder_participants. To remove the assignment, set clear=true and omit participant_id. "
+        "This changes iCloud data; inspect an uncertain write before retrying."
+    ))
+    async def assign_reminder(id: str, participant_id: str | None = None, clear: bool = False) -> CallToolResult:
+        return await call("assign_reminder", id=id, participant_id=participant_id, clear=clear)

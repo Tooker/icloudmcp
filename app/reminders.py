@@ -20,15 +20,19 @@ from app.timing import measure_phase
 REMINDER_TOOLS = frozenset({
     "list_reminder_lists", "list_reminders", "get_reminder", "create_reminder",
     "update_reminder", "complete_reminder", "delete_reminder", "sync_reminders",
+    "list_reminder_participants", "assign_reminder",
 })
 
 _PUBLIC_ERRORS = {
+    "not_found": "Reminder or list not found. Refresh the available lists and reminders and use their exact IDs.",
+    "not_shared": "Only reminders in a shared list can be assigned to a participant.",
+    "permission_denied": "The current participant cannot modify this shared list.",
     "auth_required": "Stop the Go backend, run reminders auth with its data directory, then start it again.",
     "icloud_access_denied": (
         "Enable iCloud web data access, stop the Go backend, run reminders auth --approve-web-access "
         "with its data directory and approve on a trusted device, then start it again."
     ),
-    "invalid_argument": "Reminders rejected the arguments. Check exact IDs, dates, priority and pagination.",
+    "invalid_argument": "Reminders rejected the arguments. Check exact IDs, dates, priority and pagination; assignment needs one accepted participant ID from this list or clear=true.",
     "request_timeout": "Request ended before completion. A write may have succeeded; inspect the reminder before retrying.",
     "icloud_request_failed": "iCloud request failed. A write may have succeeded; inspect the reminder before retrying.",
     "backend_unavailable": "The Go Reminders backend could not complete the request. Check its service and bearer token. A write may have succeeded; inspect before retrying.",

@@ -79,6 +79,9 @@ def simulated_go(monkeypatch, *, result=None, failure=None, delay=0):
     ("complete_reminder", {"id": "exact-id"}),
     ("delete_reminder", {"id": "exact-id", "confirm": True}),
     ("sync_reminders", {"full": True}),
+    ("list_reminder_participants", {"list_id": "exact-list"}),
+    ("assign_reminder", {"id": "exact-id", "participant_id": "exact-person"}),
+    ("assign_reminder", {"id": "exact-id", "clear": True}),
 ])
 def test_python_tools_forward_through_real_mcp_client_once_and_keep_results_private(monkeypatch, caplog, name, arguments):
     backend, messages = simulated_go(monkeypatch)
@@ -104,7 +107,7 @@ def test_python_tools_forward_through_real_mcp_client_once_and_keep_results_priv
     assert PRIVATE not in "\n".join(logs) + caplog.text
 
 
-@pytest.mark.parametrize("code", ["auth_required", "icloud_access_denied", "request_timeout", "invalid_argument", "unknown"])
+@pytest.mark.parametrize("code", ["auth_required", "icloud_access_denied", "request_timeout", "invalid_argument", "not_found", "not_shared", "permission_denied", "unknown"])
 def test_upstream_tool_errors_use_safe_local_messages_without_retry(monkeypatch, caplog, code):
     backend, messages = simulated_go(monkeypatch, result={
         "content": [{"type": "text", "text": f"{code}: {PRIVATE}"}], "isError": True,
@@ -158,6 +161,39 @@ def test_timeout_and_cancellation_end_calls_without_retry(monkeypatch):
 
     asyncio.run(run())
     assert len([message for message in messages if message["method"] == "tools/call"]) == 2
+
+
+@pytest.mark.parametrize("arguments", [{"id": "exact-id"}, {"id": "exact-id", "clear": True, "participant_id": "exact-person"}])
+def test_invalid_assignment_intent_never_reaches_go(monkeypatch, arguments):
+    backend, messages = simulated_go(monkeypatch)
+    server = create_mcp_server(None, reminders_service=backend)
+    result = asyncio.run(server._handle_call_tool(None, CallToolRequestParams(name="assign_reminder", arguments=arguments)))
+    assert result.is_error
+    assert messages == []
+
+
+def test_participant_results_preserve_contact_details_without_logging_them(monkeypatch, caplog):
+    payload = {"list_id": "exact-list", "shared": True, "participants": [
+        {"id": PRIVATE, "name": PRIVATE, "email": PRIVATE, "permission": "READ_WRITE", "is_current_user": True},
+        {"id": "another-person", "name": PRIVATE, "phone": PRIVATE, "permission": "READ_WRITE", "is_current_user": False},
+    ]}
+    backend, _ = simulated_go(monkeypatch, result={
+        "content": [{"type": "text", "text": json.dumps(payload)}], "structuredContent": payload,
+    })
+    server = create_mcp_server(None, reminders_service=backend)
+    logs = []
+    sink = logger.add(lambda message: logs.append(message.record["message"]))
+    try:
+        with caplog.at_level(logging.DEBUG):
+            result = asyncio.run(server._handle_call_tool(None, CallToolRequestParams(
+                name="list_reminder_participants", arguments={"list_id": "exact-list"},
+            )))
+    finally:
+        logger.remove(sink)
+    assert not result.is_error
+    assert result.structured_content == payload
+    assert any("result_count=2" in message for message in logs)
+    assert PRIVATE not in "\n".join(logs) + caplog.text
 
 
 def test_parallel_calls_own_independent_sessions(monkeypatch):
