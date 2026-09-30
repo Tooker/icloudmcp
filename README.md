@@ -1,11 +1,12 @@
 # IcloudCruncher
 
 Python proxy for shared iCloud calendars plus a read/write MCP server for iCloud
-Calendar and iCloud Mail. The MCP integration is exposed over Streamable HTTP at
+Calendar, iCloud Mail and optional iCloud Reminders. The MCP integration is exposed over Streamable HTTP at
 `/mcp`.
 
-Calendar uses CalDAV; Mail uses IMAP over SSL. Contacts, Notes, Reminders, Files,
-and SMTP mail sending are out of scope.
+Calendar uses CalDAV; Mail uses IMAP over SSL. Reminders uses a separate Go MCP
+backend on the private Docker network. Contacts, Notes, Files and SMTP mail
+sending are out of scope.
 
 ## Local Setup
 
@@ -355,6 +356,110 @@ env \
 
 For Docker Compose, put the numbered keys under `environment` as quoted YAML keys.
 
+## Go Reminders integration
+
+Python remains the single MCP endpoint at `/mcp` and `/mcp/`. Its eight typed
+Reminders tools call the separate Go backend over MCP Streamable HTTP at
+`http://reminders:8080/mcp`. Calendar, Mail and attachment resources continue to
+use the existing Python services. The tunnel still connects only to Python.
+
+The optional `reminders` Compose service builds directly from
+[Tooker/icloud-reminders-cli](https://github.com/Tooker/icloud-reminders-cli),
+pinned to commit `a0a3da50f288d6fc519c9c7eeee6ec0b1272c422`. No Go source is
+copied into this repository and no second checkout or submodule is required.
+To upgrade, review a new Go commit and update the pinned build context. For
+local development, `REMINDERS_BUILD_CONTEXT=../icloud-reminders-cli` builds
+your adjacent checkout instead. Docker supports this through its
+[Git build contexts](https://docs.docker.com/build/concepts/context/#git-repositories).
+
+Enable it in your untracked `.env`:
+
+```dotenv
+COMPOSE_PROFILES=reminders
+REMINDERS_MCP_URL=http://reminders:8080/mcp
+REMINDERS_MCP_TOKEN=replace-with-a-private-random-token
+REMINDERS_MCP_TIMEOUT_SECONDS=210
+```
+
+If semantic search is already enabled, use `COMPOSE_PROFILES=search,reminders`.
+The same optional bearer token is passed to Python and Go; it is independent
+of Apple credentials. The Go service publishes no host port. Neither calendar
+app-specific passwords nor the Go session files are passed through MCP tools.
+
+For a new Reminders account:
+
+```bash
+docker compose build reminders icloud-cruncher
+docker compose run --rm reminders auth
+# With Advanced Data Protection, approve on a trusted device:
+docker compose run --rm reminders auth --approve-web-access --approval-timeout 3m
+docker compose up -d reminders icloud-cruncher
+docker compose ps
+```
+
+Go owns its login and cache in the `reminders-data` volume. If you already have
+a standalone Go login, stop that server first. You can copy only `session.json`
+into the new volume, without exposing its contents or copying the old cache:
+
+```bash
+docker compose -f ../icloud-reminders-cli/compose.yaml stop reminders
+docker compose run --rm --entrypoint sh \
+  -v icloud-reminders-cli_reminders-data:/existing:ro reminders \
+  -c 'test ! -e /data/session.json && cp -p /existing/session.json /data/session.json'
+docker compose up -d reminders icloud-cruncher
+```
+
+Replace the source volume name if the standalone project uses a different
+Compose project name. The copy refuses to overwrite an existing account.
+Do not run administrative CLI commands while the Go server holds its data
+directory lock. Renew login or temporary ADP approval with:
+
+```bash
+docker compose stop reminders
+docker compose run --rm reminders auth --approve-web-access --approval-timeout 3m
+# Use ordinary `auth` instead if the login has expired.
+docker compose up -d reminders
+```
+
+Python never requests 2FA or device approval. Missing login returns
+`auth_required`; blocked private-database access returns `icloud_access_denied`.
+Go outages do not stop Python startup, tool discovery, Calendar, Mail or native
+attachment resources. A later Reminders call opens a fresh MCP session, so
+restarting Go does not require restarting Python. Reads and writes are not
+automatically retried; after an uncertain write, inspect current data before
+trying again. The default 210-second total bridge deadline allows for Go's
+three-minute operation timeout and the connection handshake.
+
+Available tools are `list_reminder_lists`, `list_reminders`, `get_reminder`,
+`create_reminder`, `update_reminder`, `complete_reminder`, `delete_reminder` and
+`sync_reminders`. They preserve Go's structured results, exact IDs, filters and
+pagination. Creation requires an existing list; dates use `YYYY-MM-DD` and
+priorities are `none`, `low`, `medium` or `high`. Deletion requires explicit
+`confirm=true`. Clearing notes/due dates and creating/deleting lists are not
+supported. For details, see the
+[Go backend documentation](https://github.com/Tooker/icloud-reminders-cli/blob/a0a3da50f288d6fc519c9c7eeee6ec0b1272c422/docs/mcp.md).
+
+For a local Python process talking to the standalone Go container:
+
+```bash
+REMINDERS_MCP_URL=http://127.0.0.1:8081/mcp \
+  uv run uvicorn app.main:app --host 127.0.0.1 --port 8080
+```
+
+Set `REMINDERS_MCP_TOKEN` to the existing Go token if bearer access is enabled.
+To verify the complete Python-to-Go-to-iCloud read path after setup:
+
+```bash
+RUN_LIVE_REMINDERS_TESTS=1 uv run pytest tests/test_live_reminders.py -q -s
+```
+
+This opt-in smoke test connects to Python's existing endpoint, discovers all
+three groups of tools, lists active reminders and reads one item when present.
+It never calls write tools or initiates login/device approval, and reports only
+counts. Override the target with `LIVE_REMINDERS_MCP_URL` (default
+`http://127.0.0.1:8080/mcp`). Normal tests use a simulated Go MCP endpoint and
+skip real account access.
+
 ## Docker
 
 ```bash
@@ -364,12 +469,14 @@ ${EDITOR:-vi} .env
 docker compose up --build
 ```
 
-The Compose file starts two containers:
+The Compose file starts two containers by default:
 
 - `icloud-cruncher` serves the MCP endpoint and the legacy shared-calendar
   proxy. Its port is bound to loopback only.
 - `openai-tunnel` runs OpenAI's outbound-only Secure MCP Tunnel client and
   forwards tunnel traffic to `http://icloud-cruncher:8080/mcp`.
+
+The optional `reminders` profile adds the private Go backend described above.
 
 Before starting the tunnel, create a tunnel in [OpenAI Platform tunnel
 settings](https://platform.openai.com/settings/organization/tunnels), put its

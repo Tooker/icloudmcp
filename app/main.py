@@ -39,12 +39,14 @@ from app.config import (
     load_calendars,
     load_imap_config,
     load_icloud_config,
+    load_reminders_config,
     public_url_for_token,
 )
 from app.icloud import ICloudCalendarService
 from app.icloud_cache import SQLiteICloudCalendarCache
 from app.imap import ICloudIMAPService
 from app.mcp_server import create_mcp_server
+from app.reminders import GoRemindersService
 from app.search_config import load_mail_search_config
 from app.semantic_search import SemanticMailSearch
 
@@ -102,6 +104,7 @@ def create_app(
     icloud_service: ICloudCalendarService | None = None,
     imap_service: ICloudIMAPService | None = None,
     mail_search: SemanticMailSearch | None = None,
+    reminders_service: GoRemindersService | None = None,
 ) -> FastAPI:
     _configure_healthcheck_access_logging()
     calendars = load_calendars(config_path, environ)
@@ -146,7 +149,9 @@ def create_app(
         if search_config.enabled:
             logger.warning("mail_search action=start status=not_configured api_key_present={} mail_cache_present={}",
                            bool(search_config.api_key), getattr(mail_service, "_cache", None) is not None)
-    mcp_server = create_mcp_server(service, mail_service, search_service)
+    reminders_config = load_reminders_config(environ)
+    reminders_backend = reminders_service or (GoRemindersService(reminders_config) if reminders_config else None)
+    mcp_server = create_mcp_server(service, mail_service, search_service, reminders_backend)
     mcp_http_app = mcp_server.streamable_http_app(
         streamable_http_path="/",
         host="0.0.0.0",
@@ -239,6 +244,7 @@ def create_app(
     app.state.icloud_cache = shared_cache
     app.state.imap_service = mail_service
     app.state.mail_search = search_service
+    app.state.reminders_service = reminders_backend
     app.state.mcp_server = mcp_server
     logger.info("calendar_cache ttl_seconds={}", cache.ttl_seconds)
     if shared_cache is not None:

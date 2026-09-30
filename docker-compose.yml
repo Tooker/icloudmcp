@@ -32,6 +32,10 @@ services:
       IMAP_EMAIL_CACHE_CRAWL_BATCH_SIZE: ${IMAP_EMAIL_CACHE_CRAWL_BATCH_SIZE:-25}
       IMAP_EMAIL_CACHE_CRAWL_INTERVAL_SECONDS: ${IMAP_EMAIL_CACHE_CRAWL_INTERVAL_SECONDS:-0.1}
       IMAP_EMAIL_CACHE_MAX_MESSAGE_BYTES: ${IMAP_EMAIL_CACHE_MAX_MESSAGE_BYTES:-25000000}
+      # Optional Go Reminders backend, enabled with the reminders profile.
+      REMINDERS_MCP_URL: ${REMINDERS_MCP_URL:-}
+      REMINDERS_MCP_TOKEN: ${REMINDERS_MCP_TOKEN:-}
+      REMINDERS_MCP_TIMEOUT_SECONDS: ${REMINDERS_MCP_TIMEOUT_SECONDS:-210}
       # Optional semantic search. Only extracted text is embedded; Qdrant stays local.
       MAIL_SEARCH_ENABLED: ${MAIL_SEARCH_ENABLED:-false}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
@@ -83,6 +87,20 @@ services:
       HEALTH_LISTEN_ADDR: :8081
     restart: unless-stopped
 
+  # Build the separately maintained Go project at a fixed, reviewed commit.
+  # No published ports: only Python connects to its private MCP endpoint.
+  reminders:
+    profiles: ["reminders"]
+    build:
+      context: ${REMINDERS_BUILD_CONTEXT:-https://github.com/Tooker/icloud-reminders-cli.git#a0a3da50f288d6fc519c9c7eeee6ec0b1272c422}
+    volumes:
+      - reminders-data:/data
+    environment:
+      REMINDERS_MCP_TOKEN: ${REMINDERS_MCP_TOKEN:-}
+    init: true
+    stop_grace_period: 15s
+    restart: unless-stopped
+
   # No published ports: access is limited to the private Compose network.
   # Start with: docker compose --profile search up -d qdrant
   qdrant:
@@ -98,3 +116,4 @@ services:
 volumes:
   icloud-cache:
   qdrant-storage:
+  reminders-data:

@@ -14,6 +14,8 @@ from mcp_types import CallToolResult, TextContent, ToolAnnotations
 from app.icloud import ICloudCalendarService, ICloudServiceError
 from app.imap import ICloudIMAPService, IMAPServiceError
 from app.mcp_resources import AttachmentMCPServer
+from app.reminders import GoRemindersService
+from app.reminders_tools import register_reminders_tools
 from app.search_clients import MailSearchError
 from app.semantic_search import SemanticMailSearch
 from app.timing import call_id, log_elapsed, measure_phase, tool_trace
@@ -44,21 +46,25 @@ def create_mcp_server(
     service: ICloudCalendarService | None,
     imap_service: ICloudIMAPService | None = None,
     mail_search: SemanticMailSearch | None = None,
+    reminders_service: GoRemindersService | None = None,
 ) -> MCPServer:
     server = AttachmentMCPServer(
         name="icloud-cruncher",
-        title="iCloud Calendar & Mail",
+        title="iCloud Calendar, Mail & Reminders",
         description=(
-            "Read and write iCloud Calendar and iCloud Mail through CalDAV and IMAP."
+            "Read and write iCloud Calendar and Mail through CalDAV/IMAP, and Reminders through the Go backend."
         ),
         instructions=(
             "Use list_calendars before selecting a calendar when the calendar is unknown. "
             "Use ISO 8601 timestamps for timed events and YYYY-MM-DD for all-day events. "
             "Write and delete operations change the user's iCloud data; summarize the "
             "planned change and obtain user approval before calling them. Draft tools "
-            "upload messages to IMAP but never send them; the user sends drafts manually."
+            "upload messages to IMAP but never send them; the user sends drafts manually. "
+            "Use list_reminder_lists and list_reminders to get exact IDs before Reminders operations. "
+            "Never blindly retry a failed or timed-out Reminders write; inspect current data first. "
+            "Reminders authentication and device approval are separate administrative Go CLI operations."
         ),
-        version="0.6.0",
+        version="0.7.0",
     )
 
     async def call_service(
@@ -634,4 +640,5 @@ def create_mcp_server(
             imap_missing,
         )
 
+    register_reminders_tools(server, reminders_service)
     return server

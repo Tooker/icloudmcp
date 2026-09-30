@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -57,6 +58,43 @@ class IMAPConfig:
     port: int = DEFAULT_IMAP_PORT
     default_mailbox: str = DEFAULT_IMAP_MAILBOX
     drafts_mailbox: str = DEFAULT_IMAP_DRAFTS_MAILBOX
+
+
+@dataclass(frozen=True)
+class RemindersConfig:
+    mcp_url: str
+    token: str = field(default="", repr=False)
+    timeout_seconds: int = 210
+
+
+def load_reminders_config(environ: dict[str, str] | None = None) -> RemindersConfig | None:
+    """Connect to the separately authenticated Go backend; no Apple credentials."""
+    env = os.environ if environ is None else environ
+    endpoint = env.get("REMINDERS_MCP_URL", "").strip()
+    if not endpoint:
+        return None
+    try:
+        parsed = urlsplit(endpoint)
+        valid_port = parsed.port is None or 1 <= parsed.port <= 65535
+    except ValueError:
+        raise ValueError("REMINDERS_MCP_URL must be an HTTP(S) MCP endpoint") from None
+    if (
+        parsed.scheme not in ("http", "https") or not parsed.hostname or not valid_port
+        or parsed.username is not None or parsed.password is not None
+        or parsed.path not in ("/mcp", "/mcp/") or parsed.query or parsed.fragment
+        or any(character.isspace() for character in endpoint)
+    ):
+        raise ValueError("REMINDERS_MCP_URL must end in /mcp or /mcp/ without credentials, query or fragment")
+    token = env.get("REMINDERS_MCP_TOKEN", "")
+    if token != token.strip() or any(ord(character) < 32 or ord(character) > 126 for character in token):
+        raise ValueError("REMINDERS_MCP_TOKEN must be printable ASCII without surrounding whitespace")
+    try:
+        timeout = int(env.get("REMINDERS_MCP_TIMEOUT_SECONDS", "210"))
+    except ValueError:
+        raise ValueError("REMINDERS_MCP_TIMEOUT_SECONDS must be an integer from 1 to 900") from None
+    if not 1 <= timeout <= 900:
+        raise ValueError("REMINDERS_MCP_TIMEOUT_SECONDS must be an integer from 1 to 900")
+    return RemindersConfig(endpoint, token, timeout)
 
 
 def normalize_source_url(source_url: str) -> str:
