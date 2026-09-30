@@ -224,6 +224,7 @@ def create_app(
                 await asyncio.to_thread(close)
 
     app = FastAPI(
+        version="1.0.0",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,

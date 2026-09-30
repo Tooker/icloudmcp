@@ -64,7 +64,7 @@ def create_mcp_server(
             "Never blindly retry a failed or timed-out Reminders write; inspect current data first. "
             "Reminders authentication and device approval are separate administrative Go CLI operations."
         ),
-        version="0.7.0",
+        version="1.0.0",
     )
 
     async def call_service(
