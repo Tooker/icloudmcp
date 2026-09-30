@@ -1,8 +1,7 @@
 # IcloudCruncher
 
-Python proxy for shared iCloud calendars plus a read/write MCP server for iCloud
-Calendar, iCloud Mail and optional iCloud Reminders. The MCP integration is exposed over Streamable HTTP at
-`/mcp`.
+Read/write MCP server for iCloud Calendar, iCloud Mail and optional iCloud
+Reminders. The MCP integration is exposed over Streamable HTTP at `/mcp`.
 
 Calendar uses CalDAV; Mail uses IMAP over SSL. Reminders uses a separate Go MCP
 backend on the private Docker network. Contacts, Notes, Files and SMTP mail
@@ -16,13 +15,14 @@ sending are out of scope.
    uv sync
    ```
 
-2. Create local config:
+2. Create local account config:
 
    ```bash
    cp config.example.yaml config.yaml
    ```
 
-3. Edit `config.yaml` and add your shared iCloud `webcal://` URLs.
+3. Edit the `icloud` block in `config.yaml` with your Apple Account email and
+   app-specific password. Mail reuses these credentials by default.
 
 4. Run locally:
 
@@ -30,11 +30,14 @@ sending are out of scope.
    uv run uvicorn app.main:app --host 127.0.0.1 --port 8080
    ```
 
-5. Test a configured token:
+5. Check the application health:
 
    ```bash
-   curl -i http://127.0.0.1:8080/11111111-1111-4111-8111-111111111111
+   curl -i http://127.0.0.1:8080/healthz
    ```
+
+`config.yaml` is optional. You can instead export the `ICLOUD_*` and `IMAP_*`
+environment variables described below. Docker Compose reads them from `.env`.
 
 ## Read/write iCloud MCP
 
@@ -314,47 +317,37 @@ stops with the application and logs only safe counts, durations and error classe
 
 ## Configuration
 
-`config.yaml` is intentionally ignored by git because shared calendar URLs and
-iCloud credentials are secrets.
+Credentials can be supplied through environment variables or an optional
+`config.yaml`. Environment variables take precedence. Both `.env` and
+`config.yaml` are ignored by git because iCloud credentials are secrets.
 
 ```yaml
-calendars:
-  - token: "11111111-1111-4111-8111-111111111111"
-    source_url: "webcal://p106-caldav.icloud.com/published/2/..."
+icloud:
+  username: "your-apple-id@example.com"
+  app_specific_password: "xxxx-xxxx-xxxx-xxxx"
+  default_calendar: null
+  timezone: "Europe/Berlin"
+imap:
+  host: "imap.mail.me.com"
+  port: 993
+  default_mailbox: "INBOX"
 ```
 
-If `token` is omitted, the app generates a temporary UUID4 at startup and logs it. Add that token to `config.yaml` if the public URL must survive restarts.
+See `config.example.yaml` for all account options. Set `ICLOUD_CRUNCHER_CONFIG`
+to use a different file path. Docker Compose uses `.env` without a config-file
+mount. To use YAML in Docker, add this to `docker-compose.override.yml`:
 
-You can also configure calendars via environment variables. The numeric part groups one calendar:
-
-```bash
-ICLOUDCRUNCHER.0.token="your-secret-token"
-ICLOUDCRUNCHER.0.URL="webcal://p106-caldav.icloud.com/published/2/..."
-ICLOUDCRUNCHER.1.token="another-secret-token"
-ICLOUDCRUNCHER.1.URL="webcal://p106-caldav.icloud.com/published/2/..."
+```yaml
+services:
+  icloud-cruncher:
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
 ```
 
-YAML and environment calendars are combined. Set `ICLOUDCRUNCHER.BASE_URL` if startup logs should show full external URLs instead of only `/<token>`.
-
-Calendar responses are cached in memory for 300 seconds by default. Override with `ICLOUDCRUNCHER.CACHE_TTL_SECONDS`. Set it to `0` to disable fresh cache hits while still keeping the last successful response as an upstream-error fallback.
-
-The MCP cache can be tuned independently with `ICLOUD_CACHE_TTL_SECONDS` for
+The MCP cache can be tuned with `ICLOUD_CACHE_TTL_SECONDS` for
 events, `ICLOUD_CALENDARS_CACHE_TTL_SECONDS` for calendar lists, and
 `ICLOUD_CACHE_PATH` for the SQLite file path. Set either TTL to `0` to disable
 fresh hits for that data type.
-
-Because dots are not valid in normal shell variable assignment, use one of these forms for env-only local testing:
-
-```bash
-env \
-  'ICLOUDCRUNCHER.0.token=first-token' \
-  'ICLOUDCRUNCHER.0.URL=webcal://p106-caldav.icloud.com/published/2/...' \
-  'ICLOUDCRUNCHER.1.token=second-token' \
-  'ICLOUDCRUNCHER.1.URL=webcal://p106-caldav.icloud.com/published/2/...' \
-  uv run uvicorn app.main:app --host 127.0.0.1 --port 8080
-```
-
-For Docker Compose, put the numbered keys under `environment` as quoted YAML keys.
 
 ## Go Reminders integration
 
@@ -464,15 +457,13 @@ skip real account access.
 
 ```bash
 cp .env.example .env
-cp config.example.yaml config.yaml
 ${EDITOR:-vi} .env
 docker compose up --build
 ```
 
 The Compose file starts two containers by default:
 
-- `icloud-cruncher` serves the MCP endpoint and the legacy shared-calendar
-  proxy. Its port is bound to loopback only.
+- `icloud-cruncher` serves the MCP endpoint. Its port is bound to loopback only.
 - `openai-tunnel` runs OpenAI's outbound-only Secure MCP Tunnel client and
   forwards tunnel traffic to `http://icloud-cruncher:8080/mcp`.
 
@@ -493,11 +484,14 @@ write-capable and this example intentionally keeps it on the Docker host's
 loopback interface. Use an authenticated, stable HTTPS proxy and an explicit
 authorization design if a public endpoint is needed.
 
-Use `docker compose build` only after code, dependency, or Dockerfile changes. For changes in `config.yaml` or Compose environment values, use `docker compose up` to recreate the container without rebuilding the image. If only `config.yaml` changed and the service is already running, `docker compose restart icloud-cruncher` is enough because the app reads config at startup.
+Use `docker compose build` after code, dependency, or Dockerfile changes. For
+changes in `.env` or Compose environment values, use `docker compose up -d` to
+recreate the container without rebuilding the image. If only an optionally
+mounted `config.yaml` changed, `docker compose restart icloud-cruncher` is enough
+because the app reads it at startup.
 
 ## Endpoints
 
-- `GET /<token>` forwards the matching calendar as `text/calendar`.
 - `GET /healthz` returns `{"status":"ok"}`. The Docker health check probes this
   endpoint, so `docker compose ps` shows whether the MCP container is healthy.
   It intentionally checks only the local application and does not contact iCloud
@@ -505,11 +499,15 @@ Use `docker compose build` only after code, dependency, or Dockerfile changes. F
   used.
 - `POST/GET/DELETE /mcp` and `/mcp/` serve the Streamable HTTP MCP transport.
 
-There is no calendar listing endpoint. Unknown tokens return a neutral `404`.
+Other paths return `404`.
 
 ## Logging
 
-The app uses `loguru` and logs incoming requests plus upstream iCloud fetch results. Upstream logs include token, status, duration, content type, and response size, but not the configured iCloud source URL. Every MCP call logs `mcp_tool_start` and `mcp_tool_complete` with the tool name, outcome, duration, and (where applicable) result count. Cache logs identify read hits/misses/bypasses, refresh writes, and invalidations with counts; they never log event contents, email headers, message bodies, or credentials.
+The app uses `loguru` and logs incoming requests with method, path, status and
+duration. Every MCP call logs `mcp_tool_start` and `mcp_tool_complete` with the
+tool name, outcome, duration, and (where applicable) result count. Cache logs
+identify read hits/misses/bypasses, refresh writes, and invalidations with counts;
+they never log event contents, email headers, message bodies, or credentials.
 
 MCP start/completion logs include an opaque `call_id`. Detailed `mcp_phase` logs
 share that ID and add `span_id`, `parent_span`, `phase`, `outcome` and `duration_ms`.
@@ -520,8 +518,8 @@ Durations include child spans; do not add parent and child durations together.
 Phase logs never include arguments, queries, result contents or exception messages.
 Background workers retain their aggregate progress logs instead of detailed spans.
 
-At startup, the app logs every URL path it answers. With `ICLOUDCRUNCHER.BASE_URL=https://calendar.example.com`, it logs full external URLs.
-Cache logs include `cache_hit` for fresh public-calendar responses, `public_calendar_cache action=write` for refreshed public feeds, and `cache_stale_fallback` when iCloud is unavailable but a previous response can still be served. Calendar MCP cache logs use `icloud_cache tool=<name> action=<read|write|invalidate>`, and IMAP cache logs use `imap_cache tool=<name> action=<read|write|invalidate>`.
+Calendar MCP cache logs use `icloud_cache tool=<name> action=<read|write|invalidate>`,
+and IMAP cache logs use `imap_cache tool=<name> action=<read|write|invalidate>`.
 
 ## Useful references
 

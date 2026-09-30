@@ -1,7 +1,7 @@
 [project]
 name = "icloud-cruncher"
 version = "0.1.0"
-description = "iCloud calendar proxy and read/write MCP server"
+description = "Read/write MCP server for iCloud Calendar, Mail and Reminders"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

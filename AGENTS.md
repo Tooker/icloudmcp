@@ -4,7 +4,7 @@
 - This directory is a Git repository; the initial MVP files may still be untracked until explicitly committed.
 - Python FastAPI app managed with `uv`; dependencies live in `pyproject.toml` and `uv.lock`.
 - Runtime entrypoint is `app.main:app`; config loading is in `app/config.py`.
-- Local calendar sources belong in `config.yaml`, which is gitignored because shared iCloud calendar URLs are secrets.
+- Account credentials can come from environment variables or optional `config.yaml`; both `.env` and `config.yaml` are gitignored because they contain secrets.
 
 ## Commands
 - Install/sync dependencies: `uv sync`.
@@ -12,22 +12,18 @@
 - Run locally: `uv run uvicorn app.main:app --host 127.0.0.1 --port 8080`.
 - Validate Docker Compose config: `docker compose config`.
 - Build Docker image after code/dependency/Dockerfile changes: `docker compose build`.
-- Run with Docker: create `config.yaml` first, then `docker compose up`.
-- After changing only `config.yaml`, restart the service with `docker compose restart icloud-cruncher`; no image rebuild is needed.
+- Run with Docker: configure `.env`, then `docker compose up`. No `config.yaml` is required or mounted by default.
+- After changing `.env`, recreate the service with `docker compose up -d icloud-cruncher`; no image rebuild is needed. If using an optional YAML mount and changing only `config.yaml`, `docker compose restart icloud-cruncher` is enough.
 - The MCP container has a Docker health check for `/healthz`; use `docker compose ps` to see `healthy` or `unhealthy`.
 
-## Calendar Proxy Behavior
-- `webcal://` source URLs are normalized to `https://`; plain `http://` sources are rejected.
-- Public calendar URLs are `/<token>` only. Do not add routes or docs that expose calendar names, `ical`, `ics`, or source URL details in paths.
-- Missing tokens are allowed but temporary: startup generates a UUID4 and logs a warning to persist it in `config.yaml`.
-- Calendars may come from `config.yaml` or env vars shaped as `ICLOUDCRUNCHER.0.token` and `ICLOUDCRUNCHER.0.URL`; YAML and env calendars are combined.
-- `ICLOUDCRUNCHER.BASE_URL` is only for startup logs that show answered external URLs.
-- Calendar responses use an in-memory TTL cache; default is 300 seconds and can be changed with `ICLOUDCRUNCHER.CACHE_TTL_SECONDS`.
-- Unknown tokens must stay neutral `404`; do not add calendar listing endpoints.
+## Project Scope
+- This project provides authenticated iCloud Calendar, Mail and optional Reminders access through MCP.
+- The standalone shared-calendar proxy is outside this project. Do not add public calendar feeds, token routes or source-URL configuration.
+- HTTP endpoints are `/healthz`, `/mcp` and `/mcp/`; other paths return `404`.
 
 ## Local Testing Notes
-- Use `cp config.example.yaml config.yaml` before running the app manually or via Docker.
-- `config.example.yaml` intentionally contains placeholder iCloud URLs only; never paste real shared calendar URLs into committed files.
+- For local YAML configuration, copy `config.example.yaml` to `config.yaml` and replace the placeholder account credentials. Exporting credentials as environment variables also works without a config file.
+- Docker uses `.env`; `config.yaml` can be mounted explicitly with a Compose override if needed. Never paste real credentials into committed files.
 - VS Code tasks are in `.vscode/tasks.json` for sync, local run, tests, and Docker compose.
 
 ## iCloud Read/Write MCP

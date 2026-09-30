@@ -4,7 +4,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
-# Local calendar sources are secrets.
+# Local account credentials are secrets.
 config.yaml
 .env
 secrets/

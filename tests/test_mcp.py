@@ -12,7 +12,8 @@ from app.icloud import ICloudServiceError
 from app.mcp_server import create_mcp_server
 
 
-def test_streamable_http_mcp_endpoint_exposes_calendar_tools(tmp_path: Path) -> None:
+@pytest.mark.parametrize("endpoint", ["/mcp", "/mcp/"])
+def test_streamable_http_mcp_endpoint_exposes_calendar_tools(tmp_path: Path, endpoint: str) -> None:
     app = create_app(tmp_path / "missing.yaml", environ={})
     headers = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
     initialize = {
@@ -27,13 +28,13 @@ def test_streamable_http_mcp_endpoint_exposes_calendar_tools(tmp_path: Path) -> 
     }
 
     with TestClient(app) as client:
-        response = client.post("/mcp", json=initialize, headers=headers, follow_redirects=False)
+        response = client.post(endpoint, json=initialize, headers=headers, follow_redirects=False)
 
         assert response.status_code == 200
         session_id = response.headers["mcp-session-id"]
 
         tools_response = client.post(
-            "/mcp",
+            endpoint,
             json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
             headers={**headers, "mcp-session-id": session_id},
         )
@@ -47,6 +48,30 @@ def test_streamable_http_mcp_endpoint_exposes_calendar_tools(tmp_path: Path) -> 
     assert '"name":"create_draft"' in tools_response.text
     assert '"name":"update_draft"' in tools_response.text
     assert '"name":"mark_email_read"' in tools_response.text
+
+
+@pytest.mark.parametrize("legacy_config", [False, True])
+def test_app_has_no_public_calendar_proxy(tmp_path: Path, legacy_config: bool) -> None:
+    config_path = tmp_path / "config.yaml"
+    environ = {}
+    if legacy_config:
+        config_path.write_text(
+            "calendars:\n  - token: former-token\n    source_url: https://example.com/calendar\n",
+            encoding="utf-8",
+        )
+        environ = {
+            "ICLOUDCRUNCHER.0.token": "env-token",
+            "ICLOUDCRUNCHER.0.URL": "invalid-unused-source",
+            "ICLOUDCRUNCHER.CACHE_TTL_SECONDS": "invalid-unused-ttl",
+        }
+
+    app = create_app(config_path, environ=environ)
+    with TestClient(app) as client:
+        assert client.get("/healthz").json() == {"status": "ok"}
+        for path in ("/former-token", "/env-token", "/unknown-token", "/"):
+            response = client.get(path)
+            assert response.status_code == 404
+            assert response.json() == {"detail": "Not Found"}
 
 
 def test_calendar_delete_schema_requires_explicit_scope_and_confirmation():

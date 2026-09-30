@@ -8,10 +8,8 @@ services:
       # the private Compose network; do not bind this to 0.0.0.0 without auth.
       - "127.0.0.1:8080:8080"
     volumes:
-      - ./config.yaml:/app/config.yaml:ro
       - icloud-cache:/data
     environment:
-      ICLOUD_CRUNCHER_CONFIG: /app/config.yaml
       ICLOUD_USERNAME: ${ICLOUD_USERNAME:-}
       ICLOUD_APP_PASSWORD: ${ICLOUD_APP_PASSWORD:-}
       ICLOUD_DEFAULT_CALENDAR: ${ICLOUD_DEFAULT_CALENDAR:-}
@@ -48,21 +46,12 @@ services:
       MAIL_SEARCH_EMBEDDING_MODE: ${MAIL_SEARCH_EMBEDDING_MODE:-batch}
       MAIL_SEARCH_BATCH_SIZE: ${MAIL_SEARCH_BATCH_SIZE:-100}
       MAIL_SEARCH_POLL_SECONDS: ${MAIL_SEARCH_POLL_SECONDS:-30}
-      # Optional: used only for startup logs showing answered external URLs.
-      # ICLOUDCRUNCHER.BASE_URL: https://calendar.example.com
-      # Optional: in-memory calendar cache TTL in seconds. Default: 300.
-      # ICLOUDCRUNCHER.CACHE_TTL_SECONDS: "300"
       # Persistent MCP read cache. Events default to 60 seconds, calendars to 300.
       ICLOUD_CACHE_PATH: /data/icloud-calendar-cache.sqlite3
       ICLOUD_CACHE_TTL_SECONDS: ${ICLOUD_CACHE_TTL_SECONDS:-60}
       ICLOUD_CALENDARS_CACHE_TTL_SECONDS: ${ICLOUD_CALENDARS_CACHE_TTL_SECONDS:-300}
       ICLOUD_CACHE_REFRESH_ENABLED: ${ICLOUD_CACHE_REFRESH_ENABLED:-true}
       ICLOUD_CACHE_REFRESH_INTERVAL_SECONDS: ${ICLOUD_CACHE_REFRESH_INTERVAL_SECONDS:-30}
-      # Optional env-only calendars. Quote keys because they contain dots.
-      # ICLOUDCRUNCHER.0.token: your-secret-token
-      # ICLOUDCRUNCHER.0.URL: webcal://p106-caldav.icloud.com/published/2/...
-      # ICLOUDCRUNCHER.1.token: another-secret-token
-      # ICLOUDCRUNCHER.1.URL: webcal://p106-caldav.icloud.com/published/2/...
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
       interval: 30s
