@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 import logging
 import re
@@ -24,6 +24,7 @@ REMINDER_TOOLS = frozenset({
     "update_reminder", "complete_reminder", "delete_reminder", "sync_reminders",
     "list_reminder_participants", "assign_reminder",
     "list_reminder_sections", "create_reminder_section", "move_reminder", "reorder_reminders",
+<<<<<<< HEAD
 })
 
 _PUBLIC_ERRORS = {
@@ -33,6 +34,12 @@ _PUBLIC_ERRORS = {
     "idempotency_conflict": "This client_request_id was already used with different creation arguments. Use the original arguments or a new ID.",
     "local_state_failed": "The creation succeeded but local request state could not be saved. Recover using the same client_request_id.",
     "unsupported_backend": "This Go backend does not support client_request_id. Upgrade it before making a keyed creation.",
+=======
+    "batch_update_reminders",
+})
+
+_PUBLIC_ERRORS = {
+>>>>>>> codex/reminders-batch-update
     "not_found": "Reminder, list or section not found. Refresh the available lists and reminders and use their exact IDs.",
     "not_shared": "Only reminders in a shared list can be assigned to a participant.",
     "permission_denied": "The current participant cannot modify this shared list.",
@@ -41,8 +48,14 @@ _PUBLIC_ERRORS = {
         "Enable iCloud web data access, stop the Go backend, run reminders auth --approve-web-access "
         "with its data directory and approve on a trusted device, then start it again."
     ),
+<<<<<<< HEAD
     "invalid_argument": "Reminders rejected the arguments. Check exact IDs, dates, priority, pagination, same-list parent/section references and ordering anchors; assignment needs one accepted participant ID from this list or clear=true.",
     "unsupported_structure": "This list uses an unsupported structure format. No write was attempted; refresh or inspect the list in Apple Reminders.",
+=======
+    "invalid_argument": "Reminders rejected the arguments. Check exact IDs, dates, priority, pagination, same-list parent/section references and ordering anchors. Batches require every existing reminder, including completed tasks, and all existing sections in current order, within the documented bounds. Assignment needs one accepted participant ID from this list or clear=true.",
+    "unsupported_structure": "This list uses an unsupported structure format. No write was attempted; refresh or inspect the list in Apple Reminders.",
+    "backend_upgrade_required": "The Go backend lacks tools required for this structure. Upgrade the backend before applying the batch. No write was attempted.",
+>>>>>>> codex/reminders-batch-update
     "write_result_unknown": "iCloud did not confirm the complete write. Inspect current reminders and sections before retrying.",
     "icloud_write_failed": "iCloud rejected the write. Inspect current reminders and sections before retrying.",
     "request_timeout": "Request ended before completion. A write may have succeeded; inspect the reminder before retrying.",
@@ -177,6 +190,15 @@ def _contains_timeout(error: BaseException) -> bool:
     return False
 
 
+def _reminders_error_code(error: BaseException) -> str | None:
+    # AnyIO may wrap an application error thrown inside a live MCP session.
+    if isinstance(error, RemindersError):
+        return error.code
+    if isinstance(error, BaseExceptionGroup):
+        return next((code for item in error.exceptions if (code := _reminders_error_code(item))), None)
+    return None
+
+
 class GoRemindersService:
     def __init__(self, config: RemindersConfig) -> None:
         self.config = config
@@ -186,6 +208,7 @@ class GoRemindersService:
         if request_id == "none":
             request_id = uuid4().hex[:16]
         if name not in REMINDER_TOOLS:
+<<<<<<< HEAD
             raise RemindersError("invalid_argument", operation=name, request_id=request_id)
         if name == "create_reminder" and "client_request_id" in arguments:
             try:
@@ -193,6 +216,19 @@ class GoRemindersService:
             except (ValueError, TypeError, AttributeError):
                 raise RemindersError("invalid_argument", operation=name, request_id=request_id,
                                      write_status="not_sent") from None
+=======
+            raise RemindersError("invalid_argument")
+        if name == "batch_update_reminders":
+            from app.reminders_batch import run_batch
+
+            return await run_batch(self, arguments)
+        async with self.tool_session() as session:
+            return await self.invoke(session, name, arguments)
+
+    @asynccontextmanager
+    async def tool_session(self):
+        """One fresh session and one total deadline, including every batch step."""
+>>>>>>> codex/reminders-batch-update
         headers = {"Authorization": f"Bearer {self.config.token}"} if self.config.token else {}
         dispatched = False
         response_status = None
@@ -223,6 +259,7 @@ class GoRemindersService:
                             ) as session:
                                 with measure_phase("reminders_mcp_connect"):
                                     await session.initialize()
+<<<<<<< HEAD
                                 if name == "create_reminder" and arguments.get("client_request_id") is not None:
                                     with measure_phase("reminders_mcp_capabilities"):
                                         available = await session.list_tools()
@@ -251,6 +288,19 @@ class GoRemindersService:
                 retry = "not_retryable"
             raise RemindersError(code, operation=name, request_id=request_id, write_status=write_status,
                                  retry_class=retry, http_status=status) from None
+=======
+                                yield session
+        except RemindersError:
+            raise
+        except Exception as error:
+            code = "request_timeout" if _contains_timeout(error) else _reminders_error_code(error) or "backend_unavailable"
+            raise RemindersError(code) from None
+
+    @staticmethod
+    async def invoke(session: ClientSession, name: str, arguments: dict[str, Any]) -> CallToolResult:
+        with measure_phase("reminders_mcp_call"):
+            result = await session.call_tool(name, arguments)
+>>>>>>> codex/reminders-batch-update
         if not isinstance(result, CallToolResult):
             raise RemindersError("backend_protocol_error", operation=name, request_id=request_id,
                                  write_status="unknown" if name not in READ_TOOLS else None,

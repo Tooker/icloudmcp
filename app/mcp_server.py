@@ -63,6 +63,11 @@ def create_mcp_server(
             "Use list_reminder_lists and list_reminders to get exact IDs before Reminders operations. "
             "Native section headings are separate from reminders. Use list_reminder_sections for section IDs. "
             "Use view=tree for nested subtasks, move_reminder for indentation/sections and reorder_reminders for manual order. "
+<<<<<<< HEAD
+=======
+            "Use batch_update_reminders for a complete target tree with sections and subtasks: preview with dry_run=true, "
+            "then apply the approved structure with dry_run=false. Include completed tasks; batches are not atomic. "
+>>>>>>> codex/reminders-batch-update
             "Priority numbers: 0=none, 9=low (!), 5=medium (!!), 1=high (!!!); ≡ is a manual drag handle, not priority. "
             "• means pending, ✓ complete and ↳ a subtask. These are display symbols, never title text. "
             "Never blindly retry a failed or timed-out Reminders write; inspect current data first. "

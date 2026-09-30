@@ -11,5 +11,8 @@
   tool descriptions, read results and the Go CLI's `list --legend`.
 - Preserve existing CloudKit metadata and shared-owner zones; refresh write
   permissions and reject cycles, cross-list references and unsupported formats.
+- Preserve safe structured write diagnostics and reject keyed creation before
+  dispatch when the selected backend does not support it.
 - Align application/MCP/package versions to 1.1.0 and add a local paired-source
-  Docker build override with versioned image tags.
+  Docker build override with versioned image tags; pin the published Go release
+  in the default deployment.

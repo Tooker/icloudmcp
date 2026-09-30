@@ -81,7 +81,7 @@ services:
   reminders:
     profiles: ["reminders"]
     build:
-      context: ${REMINDERS_BUILD_CONTEXT:-https://github.com/Tooker/icloud-reminders-cli.git#f4d480349fa6a15d651e2c38444a40811c2d9233}
+      context: ${REMINDERS_BUILD_CONTEXT:-https://github.com/Tooker/icloud-reminders-cli.git#f68c6f24681f7b85232996e1c651b556e03f7de8}
     volumes:
       - reminders-data:/data
     environment:
