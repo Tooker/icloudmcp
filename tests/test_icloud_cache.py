@@ -1,4 +1,6 @@
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+import sqlite3
 
 import pytest
 
@@ -64,6 +66,16 @@ def test_sqlite_cache_indexes_events_and_can_invalidate_them(tmp_path: Path) -> 
     assert cache.get_event("work", "event-1") is None
 
 
+def test_calendar_cache_ignores_summaries_written_before_occurrence_expansion(tmp_path):
+    cache = SQLiteICloudCalendarCache(tmp_path / "cache.sqlite3")
+    event = {"uid": "event", "calendar_id": "work", "calendar_name": "Work"}
+    cache._set("events:" + cache._digest("work", "start", "end"), [event])
+    cache._set("event:" + cache._digest("work", "event"), event)
+    assert cache.get_events("work", "start", "end") is None
+    assert cache.get_event("work", "event") is None
+    assert cache.invalidate_events() == 2
+
+
 def test_sqlite_cache_keeps_latest_email_headers_with_a_bound(tmp_path: Path) -> None:
     cache = SQLiteICloudCalendarCache(
         tmp_path / "cache.sqlite3",
@@ -86,6 +98,40 @@ def test_sqlite_cache_keeps_latest_email_headers_with_a_bound(tmp_path: Path) ->
 
     cache.invalidate_emails("INBOX")
     assert cache.get_emails("INBOX") is None
+
+
+def test_full_message_summaries_are_unbounded_generation_checked_and_account_scoped(tmp_path):
+    cache = SQLiteICloudCalendarCache(tmp_path / "cache.sqlite3", email_max_messages=1)
+    alice = cache.for_account("imap", "mail.example.com:993", "alice@example.com")
+    bob = cache.for_account("imap", "mail.example.com:993", "bob@example.com")
+    alice.sync_uid_validity("INBOX", "7")
+    messages = [{
+        "mailbox": "INBOX", "uid": str(uid), "uid_validity": "7",
+        "summary": {"subject": "Stored header"}, "raw_message": b"PRIVATE_BLOB",
+    } for uid in range(1, 1002)]
+    alice.set_email_messages(messages)
+    assert alice.has_email_summaries("INBOX") is True
+    assert bob.has_email_summaries("INBOX") is False
+    assert alice.has_email_summaries("Archive") is False
+    assert len(alice.get_email_summaries("INBOX", [str(uid) for uid in range(1, 1002)], uid_validity="7")) == 1001
+    assert bob.get_email_summaries("INBOX", ["1"], uid_validity="7") == {}
+    assert alice.get_email_summaries("INBOX", ["1"], uid_validity="99") == {}
+    assert alice.get_email_summaries("INBOX", ["1"], uid_validity="") == {}
+    alice.sync_uid_validity("INBOX", "99")
+    assert alice.get_email_summaries("INBOX", ["1"], uid_validity="7") == {}
+
+
+def test_unchanged_uid_validation_does_not_wait_for_embedding_writer(tmp_path):
+    cache = SQLiteICloudCalendarCache(tmp_path / "cache.sqlite3")
+    cache.sync_uid_validity("INBOX", "7")
+    with sqlite3.connect(cache.path) as writer, ThreadPoolExecutor() as pool:
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute("INSERT INTO mailbox_states VALUES ('another-account', '99')")
+        future = pool.submit(cache.sync_uid_validity, "INBOX", "7")
+        try:
+            assert future.result(timeout=1) == 0
+        finally:
+            writer.rollback()
 
 
 def test_sqlite_cache_persists_mailboxes_and_full_messages(tmp_path: Path) -> None:

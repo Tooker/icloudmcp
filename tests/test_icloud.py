@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from copy import deepcopy
+from datetime import datetime, timedelta
 from typing import Any, Iterator
 
 import pytest
@@ -26,12 +27,19 @@ class FakeResource:
     def get_icalendar_component(self) -> Any:
         return deepcopy(next(component for component in self._calendar.subcomponents if component.name == "VEVENT"))
 
+    def get_icalendar_instance(self) -> Any:
+        return deepcopy(self._calendar)
+
+    @contextmanager
+    def edit_icalendar_instance(self) -> Iterator[Any]:
+        yield self._calendar
+
     @contextmanager
     def edit_icalendar_component(self) -> Iterator[Any]:
         component = next(component for component in self._calendar.subcomponents if component.name == "VEVENT")
         yield component
 
-    def save(self) -> None:
+    def save(self, **_: Any) -> None:
         self.saved = True
         self.parent.resources[self.id] = self
 
@@ -131,7 +139,7 @@ def test_create_update_and_delete_event() -> None:
     assert updated["summary"] == "Planning updated"
     assert updated["description"] is None
 
-    deleted = service.delete_event("Work", created["uid"])
+    deleted = service.delete_event("Work", created["uid"], scope="series")
     assert deleted["deleted"] is True
     assert service.list_events(calendar="Work") == []
 
@@ -189,7 +197,7 @@ def test_list_events_filters_query_and_serializes_all_day() -> None:
         all_day=True,
     )
 
-    events = service.list_events(calendar="Personal", query="hol")
+    events = service.list_events(calendar="Personal", query="hol", start="2026-01-01", end="2026-02-01")
 
     assert events[0]["uid"] == created["uid"]
     assert events[0]["start"] == "2026-01-03"
@@ -254,3 +262,49 @@ def test_cached_and_live_event_searches_span_all_calendars_with_a_write_default(
         start="2026-01-02T11:00:00Z", end="2026-01-02T12:00:00Z",
     )
     assert created["calendar_name"] == "Work"
+
+
+def test_default_event_window_reuses_cache_when_request_time_changes(tmp_path, monkeypatch):
+    import app.icloud as module
+
+    class Clock(datetime):
+        instant = datetime(2026, 9, 30, 9, 10, 11)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.instant.replace(tzinfo=tz)
+
+    monkeypatch.setattr(module, "datetime", Clock)
+    client = FakeClient([FakeCalendar("work", "Work")])
+    service = ICloudCalendarService(
+        ICloudConfig(username="user@example.com", app_specific_password="password"),
+        client_factory=lambda **_: client,
+        cache=SQLiteICloudCalendarCache(tmp_path / "cache.sqlite3"),
+    )
+    assert service.list_events() == []
+    Clock.instant += timedelta(minutes=2)
+    assert service.list_events() == []
+    assert client.get_calendars_calls == 1
+
+
+def test_event_search_preserves_fresh_calendar_results_on_partial_cache_miss(tmp_path):
+    class CountingCalendar(FakeCalendar):
+        searches = 0
+
+        def search(self, **kwargs):
+            self.searches += 1
+            return super().search(**kwargs)
+
+    work, home = CountingCalendar("work", "Work"), CountingCalendar("home", "Home")
+    client = FakeClient([work, home])
+    service = ICloudCalendarService(
+        ICloudConfig(username="user@example.com", app_specific_password="password"),
+        client_factory=lambda **_: client,
+        cache=SQLiteICloudCalendarCache(tmp_path / "cache.sqlite3"),
+    )
+    service._cache.set_calendars([{"id": "work", "name": "Work"}, {"id": "home", "name": "Home"}])
+    start, end = service._search_window("2026-09-01", "2026-10-01")
+    service._cache.set_events("work", service._cache_datetime(start), service._cache_datetime(end), [])
+    service.list_events(start="2026-09-01", end="2026-10-01")
+    assert work.searches == 0
+    assert home.searches == 1

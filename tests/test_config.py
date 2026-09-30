@@ -6,6 +6,8 @@ import pytest
 from app.config import (
     cache_ttl_seconds,
     icloud_cache_path,
+    icloud_cache_refresh_enabled,
+    icloud_cache_refresh_interval_seconds,
     icloud_cache_ttl_seconds,
     icloud_calendars_cache_ttl_seconds,
     imap_email_cache_days,
@@ -136,6 +138,18 @@ def test_cache_ttl_seconds_defaults_and_reads_environment() -> None:
 def test_cache_ttl_seconds_rejects_negative_values() -> None:
     with pytest.raises(ValueError, match="must not be negative"):
         cache_ttl_seconds(environ={"ICLOUDCRUNCHER.CACHE_TTL_SECONDS": "-1"})
+
+
+def test_calendar_cache_refresh_settings():
+    assert icloud_cache_refresh_enabled({}) is True
+    assert icloud_cache_refresh_enabled({"ICLOUD_CACHE_REFRESH_ENABLED": "off"}) is False
+    assert icloud_cache_refresh_interval_seconds({}) == 30
+    assert icloud_cache_refresh_interval_seconds({"ICLOUD_CACHE_REFRESH_INTERVAL_SECONDS": "10"}) == 10
+    with pytest.raises(ValueError):
+        icloud_cache_refresh_enabled({"ICLOUD_CACHE_REFRESH_ENABLED": "invalid"})
+    for value in ("0", "-1", "3601", "invalid"):
+        with pytest.raises(ValueError):
+            icloud_cache_refresh_interval_seconds({"ICLOUD_CACHE_REFRESH_INTERVAL_SECONDS": value})
 
 
 def test_icloud_cache_settings_have_separate_defaults_and_overrides(tmp_path: Path) -> None:

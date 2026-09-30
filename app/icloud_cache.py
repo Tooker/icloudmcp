@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from app.timing import measure_phase, timed_phase
+
 
 @dataclass(frozen=True)
 class CacheEntry:
@@ -82,18 +84,28 @@ class SQLiteICloudCalendarCache:
     def _scoped_key(self, key: str) -> str:
         return self._namespace + key
 
+    @property
+    def account_namespace(self) -> str:
+        """Opaque account identity for derived indexes in the same database."""
+        return self._namespace
+
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.path, timeout=10)
+        with measure_phase("sqlite_connect"):
+            connection = sqlite3.connect(self.path, timeout=10)
         try:
             connection.execute("PRAGMA busy_timeout = 10000")
-            yield connection
-            connection.commit()
+            with measure_phase("sqlite_transaction"):
+                yield connection
+                with measure_phase("sqlite_commit"):
+                    connection.commit()
         finally:
             connection.close()
 
     def _initialize(self) -> None:
         with self._connection() as connection:
+            # Embedding writes must not block concurrent cache readers.
+            connection.execute("PRAGMA journal_mode = WAL")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS cache_entries (
@@ -131,11 +143,19 @@ class SQLiteICloudCalendarCache:
                 "mailbox_key TEXT PRIMARY KEY, uid_validity TEXT NOT NULL)"
             )
 
+    @timed_phase("sqlite_uid_validity_sync")
     def sync_uid_validity(self, mailbox: str, uid_validity: str) -> int:
         """Invalidate one mailbox atomically when its UID generation changes."""
 
         mailbox_key = self._scoped_key(mailbox.casefold())
         with self._connection() as connection:
+            # The common case is read-only. Do not take the global SQLite
+            # writer lock just to confirm an unchanged mailbox generation.
+            row = connection.execute(
+                "SELECT uid_validity FROM mailbox_states WHERE mailbox_key = ?", (mailbox_key,)
+            ).fetchone()
+            if row is not None and row[0] == uid_validity:
+                return 0
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 "SELECT uid_validity FROM mailbox_states WHERE mailbox_key = ?", (mailbox_key,)
@@ -162,6 +182,7 @@ class SQLiteICloudCalendarCache:
         ).fetchone()
         return row is None or (bool(uid_validity) and row[0] == uid_validity)
 
+    @timed_phase("sqlite_calendars_read")
     def get_calendars(self) -> CacheEntry | None:
         return self._get("calendars", self.calendars_ttl_seconds)
 
@@ -174,6 +195,7 @@ class SQLiteICloudCalendarCache:
     def set_mailboxes(self, mailboxes: list[dict[str, Any]]) -> None:
         self._set("mailboxes", mailboxes)
 
+    @timed_phase("sqlite_events_read")
     def get_events(
         self,
         calendar_id: str,
@@ -182,6 +204,7 @@ class SQLiteICloudCalendarCache:
     ) -> CacheEntry | None:
         return self._get(self._events_key(calendar_id, start, end), self.events_ttl_seconds)
 
+    @timed_phase("sqlite_events_write")
     def set_events(
         self,
         calendar_id: str,
@@ -199,7 +222,9 @@ class SQLiteICloudCalendarCache:
         ]
         for event in events:
             uid = str(event.get("uid") or "").strip()
-            if uid:
+            # An expanded occurrence must never replace get_event's master
+            # summary, whose lookup is keyed only by calendar and series UID.
+            if uid and not event.get("is_recurring") and not event.get("recurrence_id"):
                 rows.append(
                     (
                         self._scoped_key(self._event_key(str(event.get("calendar_id") or calendar_id), uid)),
@@ -229,7 +254,7 @@ class SQLiteICloudCalendarCache:
             rows = connection.execute(
                 "SELECT value_json, fetched_at FROM cache_entries "
                 "WHERE cache_key LIKE ?",
-                (self._scoped_key("event:") + "%",),
+                (self._scoped_key("event:v2:") + "%",),
             ).fetchall()
 
         newest: tuple[float, dict[str, Any]] | None = None
@@ -264,9 +289,11 @@ class SQLiteICloudCalendarCache:
             )
             return max(cursor.rowcount, 0)
 
+    @timed_phase("sqlite_header_cache_read")
     def get_emails(self, mailbox: str) -> CacheEntry | None:
         return self._get(self._email_key(mailbox), self.email_ttl_seconds)
 
+    @timed_phase("sqlite_header_cache_write")
     def set_emails(
         self,
         mailbox: str,
@@ -317,6 +344,7 @@ class SQLiteICloudCalendarCache:
                 total += max(cursor.rowcount, 0)
             return total
 
+    @timed_phase("sqlite_message_read")
     def get_email_message(
         self, mailbox: str, uid: str, *, uid_validity: str | None = None,
     ) -> CacheEntry | None:
@@ -346,6 +374,7 @@ class SQLiteICloudCalendarCache:
             fetched_at=row[3],
         )
 
+    @timed_phase("sqlite_messages_write")
     def set_email_messages(self, messages: list[dict[str, Any]]) -> None:
         if not messages:
             return
@@ -384,6 +413,51 @@ class SQLiteICloudCalendarCache:
                 "summary_json, raw_message, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
+
+    @timed_phase("sqlite_summary_presence")
+    def has_email_summaries(self, mailbox: str) -> bool:
+        """Check for reusable headers without reading any message BLOBs."""
+        with self._connection() as connection:
+            return connection.execute(
+                "SELECT 1 FROM email_messages e LEFT JOIN mailbox_states m "
+                "ON m.mailbox_key = e.mailbox_key WHERE e.mailbox_key = ? "
+                "AND e.uid_validity != '' "
+                "AND (m.uid_validity IS NULL OR m.uid_validity = e.uid_validity) LIMIT 1",
+                (self._scoped_key(mailbox.casefold()),),
+            ).fetchone() is not None
+
+    @timed_phase("sqlite_matched_headers_read")
+    def get_email_summaries(
+        self, mailbox: str, uids: list[str], *, uid_validity: str,
+    ) -> dict[str, dict[str, Any]]:
+        """Reuse immutable headers for live-matched UIDs, regardless of age.
+
+        Caller checks UIDVALIDITY and refreshes mutable flags/INTERNALDATE
+        from IMAP. Reading summary_json never loads or parses .eml BLOBs.
+        """
+        if not uids or not uid_validity:
+            return {}
+        result = {}
+        with self._connection() as connection:
+            for offset in range(0, len(uids), 900):
+                batch = uids[offset:offset + 900]
+                placeholders = ",".join("?" for _ in batch)
+                rows = connection.execute(
+                    "SELECT e.uid, e.summary_json FROM email_messages e "
+                    "LEFT JOIN mailbox_states m ON m.mailbox_key = e.mailbox_key "
+                    "WHERE e.mailbox_key = ? AND e.uid_validity = ? "
+                    "AND (m.uid_validity IS NULL OR m.uid_validity = e.uid_validity) "
+                    f"AND e.uid IN ({placeholders})",
+                    (self._scoped_key(mailbox.casefold()), uid_validity, *batch),
+                ).fetchall()
+                for uid, raw_summary in rows:
+                    try:
+                        summary = json.loads(raw_summary)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    if isinstance(summary, dict):
+                        result[uid] = {**summary, "uid": uid, "mailbox": mailbox}
+        return result
 
     def email_cache_stats(self) -> dict[str, int]:
         """Return aggregate content-cache counters without exposing message data."""
@@ -484,11 +558,12 @@ class SQLiteICloudCalendarCache:
 
     @staticmethod
     def _events_key(calendar_id: str, start: str, end: str) -> str:
-        return "events:" + SQLiteICloudCalendarCache._digest(calendar_id, start, end)
+        # Ignore persisted summaries from before occurrence expansion.
+        return "events:v2:" + SQLiteICloudCalendarCache._digest(calendar_id, start, end)
 
     @staticmethod
     def _event_key(calendar_id: str, uid: str) -> str:
-        return "event:" + SQLiteICloudCalendarCache._digest(calendar_id, uid)
+        return "event:v2:" + SQLiteICloudCalendarCache._digest(calendar_id, uid)
 
     @staticmethod
     def _email_key(mailbox: str) -> str:

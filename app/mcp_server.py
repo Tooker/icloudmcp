@@ -14,6 +14,9 @@ from mcp_types import CallToolResult, TextContent, ToolAnnotations
 from app.icloud import ICloudCalendarService, ICloudServiceError
 from app.imap import ICloudIMAPService, IMAPServiceError
 from app.mcp_resources import AttachmentMCPServer
+from app.search_clients import MailSearchError
+from app.semantic_search import SemanticMailSearch
+from app.timing import call_id, log_elapsed, measure_phase, tool_trace
 
 ResultT = TypeVar("ResultT")
 
@@ -40,6 +43,7 @@ DELETE_ANNOTATIONS = ToolAnnotations(
 def create_mcp_server(
     service: ICloudCalendarService | None,
     imap_service: ICloudIMAPService | None = None,
+    mail_search: SemanticMailSearch | None = None,
 ) -> MCPServer:
     server = AttachmentMCPServer(
         name="icloud-cruncher",
@@ -54,7 +58,7 @@ def create_mcp_server(
             "planned change and obtain user approval before calling them. Draft tools "
             "upload messages to IMAP but never send them; the user sends drafts manually."
         ),
-        version="0.5.0",
+        version="0.6.0",
     )
 
     async def call_service(
@@ -63,41 +67,50 @@ def create_mcp_server(
         function: Callable[[], ResultT],
         missing_message: str,
     ) -> ResultT:
-        started = perf_counter()
-        logger.info("mcp_tool_start tool={}", operation)
-        if target is None:
-            _log_tool_complete(operation, started, "not_configured")
-            raise ToolError(missing_message)
-        try:
-            result = await asyncio.to_thread(function)
-            _log_tool_complete(
-                operation,
-                started,
-                "ok",
-                result_count=_result_count(result),
-            )
-            return result
-        except (ICloudServiceError, IMAPServiceError, ValueError) as exc:
-            _log_tool_complete(
-                operation,
-                started,
-                "validation_error",
-                error_type=exc.__class__.__name__,
-            )
-            raise ToolError(str(exc)) from None
-        except Exception as exc:
-            # Client exceptions can contain request details. Keep them out of
-            # the MCP response and log only a stable exception class.
-            logger.warning(
-                "mcp_tool_complete tool={} outcome=error duration_ms={:.1f} error_type={}",
-                operation,
-                (perf_counter() - started) * 1000,
-                exc.__class__.__name__,
-            )
-            # The SDK logs unexpected exceptions with their entire chain.
-            # An expected ToolError with no cause keeps private client details
-            # out of both the response and the SDK's logs.
-            raise ToolError("iCloud service request failed") from None
+        with tool_trace(operation):
+            started = perf_counter()
+            logger.info("mcp_tool_start tool={} call_id={}", operation, call_id())
+            if target is None:
+                _log_tool_complete(operation, started, "not_configured")
+                raise ToolError(missing_message)
+            try:
+                queued = perf_counter()
+
+                def invoke():
+                    log_elapsed("worker_queue", queued)
+                    with measure_phase("service"):
+                        return function()
+
+                result = await asyncio.to_thread(invoke)
+                _log_tool_complete(
+                    operation,
+                    started,
+                    "ok",
+                    result_count=_result_count(result),
+                )
+                return result
+            except (ICloudServiceError, IMAPServiceError, MailSearchError, ValueError) as exc:
+                _log_tool_complete(
+                    operation,
+                    started,
+                    "validation_error",
+                    error_type=exc.__class__.__name__,
+                )
+                raise ToolError(str(exc)) from None
+            except Exception as exc:
+                # Client exceptions can contain request details. Keep them out of
+                # the MCP response and log only a stable exception class.
+                logger.warning(
+                    "mcp_tool_complete tool={} call_id={} outcome=error duration_ms={:.1f} error_type={}",
+                    operation,
+                    call_id(),
+                    (perf_counter() - started) * 1000,
+                    exc.__class__.__name__,
+                )
+                # The SDK logs unexpected exceptions with their entire chain.
+                # An expected ToolError with no cause keeps private client details
+                # out of both the response and the SDK's logs.
+                raise ToolError("iCloud service request failed") from None
 
     def _log_tool_complete(
         operation: str,
@@ -109,10 +122,11 @@ def create_mcp_server(
     ) -> None:
         fields: list[Any] = [
             operation,
+            call_id(),
             outcome,
             (perf_counter() - started) * 1000,
         ]
-        message = "mcp_tool_complete tool={} outcome={} duration_ms={:.1f}"
+        message = "mcp_tool_complete tool={} call_id={} outcome={} duration_ms={:.1f}"
         if result_count is not None:
             message += " result_count={}"
             fields.append(result_count)
@@ -147,7 +161,10 @@ def create_mcp_server(
         description=(
             "List events in one calendar or across all calendars. By default, return events "
             "from 30 days in the past through 365 days in the future. Use ISO 8601 start/end "
-            "filters for a narrower range and query for summary, description, or location text."
+            "filters for a narrower range (end exclusive) and query for summary, description, or location text. "
+            "Recurring events are expanded with their actual occurrence start/end, series_uid, "
+            "occurrence_id and recurrence_id. Use that recurrence_id unchanged to delete one occurrence; "
+            "it identifies the original slot even when an occurrence has moved."
         ),
         annotations=READ_ANNOTATIONS,
     )
@@ -270,18 +287,27 @@ def create_mcp_server(
         name="delete_event",
         title="Delete an iCloud calendar event",
         description=(
-            "Permanently delete an event from iCloud. This is destructive and requires "
-            "confirm=true in addition to the client's approval flow."
+            "Permanently delete one occurrence or an entire event/series from iCloud. "
+            "scope is required: occurrence requires the exact recurrence_id from list_events; "
+            "series deletes the entire event/series and must omit recurrence_id. "
+            "A UID alone identifies the series. Never use scope=series for requests to delete only one day. "
+            "This is destructive and requires confirm=true in addition to the client's approval flow."
         ),
         annotations=DELETE_ANNOTATIONS,
     )
-    async def delete_event(calendar: str, uid: str, confirm: bool) -> dict[str, Any]:
+    async def delete_event(
+        calendar: str,
+        uid: str,
+        confirm: bool,
+        scope: Literal["occurrence", "series"],
+        recurrence_id: str | None = None,
+    ) -> dict[str, Any]:
         if not confirm:
             raise ValueError("delete_event requires confirm=true")
         return await call_service(
             service,
             "delete_event",
-            partial(service.delete_event, calendar, uid) if service else lambda: {},
+            partial(service.delete_event, calendar, uid, scope=scope, recurrence_id=recurrence_id) if service else lambda: {},
             calendar_missing,
         )
 
@@ -338,6 +364,43 @@ def create_mcp_server(
         )
 
     @server.tool(
+        name="semantic_search_emails",
+        title="Search mail and attachments by meaning",
+        description=(
+            "Search the local SQLite mail snapshots by meaning, including extracted PDF/text "
+            "attachments. The query is embedded with OpenAI; matching text excerpts come from "
+            "the local Qdrant index. This covers cached mail only, not a live or complete IMAP "
+            "search. Results include mailbox, uid, uid_validity, score, source and attachment_id. "
+            "Use get_email/get_email_attachment to retrieve the current original; snapshots may "
+            "be older than iCloud. source may be body or attachment. Scans need OCR and are skipped. "
+            "The response includes indexing progress and omitted/truncated source counts."
+        ),
+        annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True),
+    )
+    async def semantic_search_emails(
+        query: str,
+        mailbox: str | None = None,
+        source: Literal["body", "attachment"] | None = None,
+        limit: int = 10,
+    ) -> dict[str, Any]:
+        return await call_service(
+            mail_search, "semantic_search_emails",
+            partial(mail_search.search if mail_search else lambda **_: {}, query=query, mailbox=mailbox, source=source, limit=limit),
+            "Semantic mail search is not configured. Set MAIL_SEARCH_ENABLED=true and OPENAI_API_KEY, and start Qdrant.",
+        )
+
+    @server.tool(
+        name="email_search_index_status",
+        title="Check mail search index progress",
+        description="Return local mail index counts, model, worker state and omitted/truncated counts without reading iCloud or calling OpenAI.",
+        annotations=READ_ANNOTATIONS,
+    )
+    async def email_search_index_status() -> dict[str, Any]:
+        if mail_search is None:
+            return {"configured": False, "source": "sqlite_cached_emails"}
+        return await call_service(mail_search, "email_search_index_status", mail_search.status, "Semantic mail search is not configured.")
+
+    @server.tool(
         name="get_email",
         title="Read an iCloud Mail message",
         description=(
@@ -352,6 +415,7 @@ def create_mcp_server(
         uid: str,
         mailbox: str | None = None,
         max_body_chars: int = 20_000,
+        expected_uid_validity: str | None = None,
     ) -> dict[str, Any]:
         return await call_service(
             imap_service,
@@ -361,6 +425,7 @@ def create_mcp_server(
                 mailbox=mailbox,
                 uid=uid,
                 max_body_chars=max_body_chars,
+                **({"expected_uid_validity": expected_uid_validity} if expected_uid_validity is not None else {}),
             ),
             imap_missing,
         )
@@ -389,6 +454,7 @@ def create_mcp_server(
         format: Literal["file", "text", "base64"] = "file",
         offset: int = 0,
         limit: int = 20_000,
+        expected_uid_validity: str | None = None,
     ) -> CallToolResult:
         attachment = await call_service(
             imap_service,
@@ -401,6 +467,7 @@ def create_mcp_server(
                 format=format,
                 offset=offset,
                 limit=limit,
+                **({"expected_uid_validity": expected_uid_validity} if expected_uid_validity is not None else {}),
             ),
             imap_missing,
         )

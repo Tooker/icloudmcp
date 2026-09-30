@@ -21,6 +21,7 @@ from typing import Any
 from app.config import IMAPConfig
 from app.icloud_cache import SQLiteICloudCalendarCache
 from app.mail_attachments import extract_attachment_text
+from app.timing import measure_phase, measured_lock, timed_phase
 
 
 class IMAPServiceError(RuntimeError):
@@ -109,7 +110,8 @@ class ICloudIMAPService:
     @contextmanager
     def _connected(self, operation: str) -> Iterator[Any]:
         acquire_started = perf_counter()
-        client = self._connection_pool.get()
+        with measure_phase("imap_pool_wait"):
+            client = self._connection_pool.get()
         reused = client is not None
         logger.info(
             "imap_phase tool={} phase=connection_acquire reused={} duration_ms={:.1f}",
@@ -134,20 +136,23 @@ class ICloudIMAPService:
                 client = None
             self._connection_pool.put_nowait(client)
 
+    @timed_phase("imap_connection_open")
     def _open_connection(self, operation: str) -> Any:
         started = perf_counter()
         client: Any | None = None
         try:
-            client = self._client_factory(
-                self.config.host,
-                self.config.port,
-                ssl_context=ssl.create_default_context(),
-                timeout=30,
-            )
-            status, _ = client.login(
-                self.config.username,
-                self.config.app_specific_password,
-            )
+            with measure_phase("imap_tls_connect"):
+                client = self._client_factory(
+                    self.config.host,
+                    self.config.port,
+                    ssl_context=ssl.create_default_context(),
+                    timeout=30,
+                )
+            with measure_phase("imap_login"):
+                status, _ = client.login(
+                    self.config.username,
+                    self.config.app_specific_password,
+                )
             self._ensure_ok(status, "IMAP login failed")
             self._enable_utf8(client, operation)
         except imaplib.IMAP4.error as exc:
@@ -232,7 +237,7 @@ class ICloudIMAPService:
     def _refresh_lock(self, key: str) -> Iterator[None]:
         with self._refresh_locks_guard:
             lock = self._refresh_locks.setdefault(key, threading.Lock())
-        with lock:
+        with measured_lock(lock):
             yield
 
     def list_mailboxes(self) -> list[dict[str, Any]]:
@@ -302,6 +307,9 @@ class ICloudIMAPService:
             from_address=from_address, to_address=to_address, subject=subject,
             since=since, before=before, unread_only=unread_only, limit=limit,
         )
+        if self._cache is not None and self._cache.has_email_summaries(selected_mailbox):
+            logger.info("imap_cache tool=search_emails action=read status=reuse reason=full_message_headers")
+            return self._search_live(selected_mailbox, query=query, **filters).emails
         cache_enabled = self._email_cache_enabled()
         cache_range_supported = (
             self._cache_range_supported(since, before)
@@ -351,6 +359,7 @@ class ICloudIMAPService:
         )
         return self._search_live(selected_mailbox, query=query, **filters).emails
 
+    @timed_phase("mail_search_live")
     def _search_live(
         self,
         selected_mailbox: str,
@@ -384,7 +393,8 @@ class ICloudIMAPService:
         with self._connected("search_emails") as client:
             uid_validity = self._select(client, selected_mailbox, readonly=True, operation="search_emails")
             started = perf_counter()
-            status, data = client.uid("SEARCH", None, *criteria)
+            with measure_phase("imap_search"):
+                status, data = client.uid("SEARCH", None, *criteria)
             self._ensure_ok(status, "IMAP search failed")
             uids = self._parse_uids(data)
             logger.info(
@@ -397,14 +407,28 @@ class ICloudIMAPService:
             # candidates first makes the limit useful for large inboxes.
             selected_uids = list(reversed(uids[-limit:]))
             result_by_uid: dict[str, dict[str, Any]] = {}
-            for offset in range(0, len(selected_uids), self._HEADER_FETCH_BATCH_SIZE):
-                batch = selected_uids[offset : offset + self._HEADER_FETCH_BATCH_SIZE]
+            cached = self._cache.get_email_summaries(
+                selected_mailbox, selected_uids, uid_validity=uid_validity,
+            ) if self._cache is not None else {}
+            if cached:
+                logger.info("imap_cache tool=search_emails action=read status=hit entries={}", len(cached))
+                cached_uids = [uid for uid in selected_uids if uid in cached]
+                for offset in range(0, len(cached_uids), self._HEADER_FETCH_BATCH_SIZE):
+                    batch = cached_uids[offset:offset + self._HEADER_FETCH_BATCH_SIZE]
+                    with measure_phase("imap_flags_fetch"):
+                        status, fetched = client.uid("FETCH", ",".join(batch), "(UID FLAGS INTERNALDATE)")
+                    self._ensure_ok(status, "IMAP message metadata fetch failed")
+                    with measure_phase("mail_metadata_parse"):
+                        metadata = self._parse_metadata_fetch(fetched)
+                        for uid, values in metadata.items():
+                            if uid in cached:
+                                result_by_uid[uid] = {**cached[uid], **values}
+            missing_uids = [uid for uid in selected_uids if uid not in cached]
+            for offset in range(0, len(missing_uids), self._HEADER_FETCH_BATCH_SIZE):
+                batch = missing_uids[offset : offset + self._HEADER_FETCH_BATCH_SIZE]
                 started = perf_counter()
-                status, fetched = client.uid(
-                    "FETCH",
-                    ",".join(batch),
-                    self._FETCH_HEADERS,
-                )
+                with measure_phase("imap_header_fetch"):
+                    status, fetched = client.uid("FETCH", ",".join(batch), self._FETCH_HEADERS)
                 self._ensure_ok(status, "IMAP header fetch failed")
                 logger.info(
                     "imap_phase tool=search_emails phase=header_fetch duration_ms={:.1f} batch_entries={}",
@@ -542,6 +566,7 @@ class ICloudIMAPService:
         return int(uid) if uid.isdigit() else 0
 
     @classmethod
+    @timed_phase("mail_header_parse")
     def _parse_header_fetch(
         cls,
         data: Any,
@@ -582,6 +607,29 @@ class ICloudIMAPService:
                     ).isoformat()
                 except (ValueError, TypeError, OverflowError):
                     pass
+        return result
+
+    @classmethod
+    def _parse_metadata_fetch(cls, data: Any) -> dict[str, dict[str, Any]]:
+        result = {}
+        for item in data or []:
+            metadata = item[0] if isinstance(item, tuple) and item else item
+            if not isinstance(metadata, bytes):
+                continue
+            match = re.search(rb"\bUID\s+(\d+)\b", metadata)
+            if match is None:
+                continue
+            flags = cls._fetch_flags([metadata])
+            values = {"flags": flags, "read": any(flag.casefold() == r"\seen" for flag in flags)}
+            received = re.search(rb'INTERNALDATE "([^"]+)"', metadata)
+            if received:
+                try:
+                    values["internal_date"] = parsedate_to_datetime(
+                        received.group(1).decode("ascii").replace("-", " ", 2)
+                    ).isoformat()
+                except (ValueError, TypeError, OverflowError):
+                    pass
+            result[match.group(1).decode("ascii")] = values
         return result
 
     @classmethod
@@ -649,12 +697,13 @@ class ICloudIMAPService:
         mailbox: str | None,
         uid: str,
         max_body_chars: int = 20_000,
+        expected_uid_validity: str | None = None,
     ) -> dict[str, Any]:
         uid = self._uid(uid)
         if not 1 <= max_body_chars <= self._MAX_BODY_CHARS:
             raise ValueError(f"max_body_chars must be between 1 and {self._MAX_BODY_CHARS}")
         selected_mailbox = self._mailbox(mailbox)
-        message, summary = self._load_email_message(selected_mailbox, uid, "get_email")
+        message, summary = self._load_email_message(selected_mailbox, uid, "get_email", expected_uid_validity)
         result = dict(summary)
         result.update(self._message_body(message, max_body_chars))
         return result
@@ -667,6 +716,7 @@ class ICloudIMAPService:
         format: str = "text",
         offset: int = 0,
         limit: int = 20_000,
+        expected_uid_validity: str | None = None,
     ) -> dict[str, Any]:
         uid = self._uid(uid)
         if not attachment_id.isascii() or not attachment_id.isdigit() or int(attachment_id) < 1:
@@ -680,7 +730,7 @@ class ICloudIMAPService:
         if format != "file" and not 1 <= limit <= self._MAX_BODY_CHARS:
             raise ValueError(f"limit must be between 1 and {self._MAX_BODY_CHARS}")
         selected_mailbox = self._mailbox(mailbox)
-        message, _ = self._load_email_message(selected_mailbox, uid, "get_email_attachment")
+        message, summary = self._load_email_message(selected_mailbox, uid, "get_email_attachment", expected_uid_validity)
         attachments = (part for part in self._message_parts(message) if self._is_attachment(part))
         for index, part in enumerate(attachments, start=1):
             if index != int(attachment_id):
@@ -689,6 +739,7 @@ class ICloudIMAPService:
             result = {
                 "uid": uid,
                 "mailbox": selected_mailbox,
+                "uid_validity": summary["uid_validity"],
                 **self._attachment_metadata(part, index, payload),
                 "format": format,
                 "offset": offset,
@@ -718,8 +769,12 @@ class ICloudIMAPService:
 
     def _load_email_message(
         self, selected_mailbox: str, uid: str, operation: str,
+        expected_uid_validity: str | None = None,
     ) -> tuple[Message, dict[str, Any]]:
         """Share generation-checked, read-only message loading with attachment reads."""
+
+        if expected_uid_validity is not None and (not expected_uid_validity or not expected_uid_validity.isascii() or not expected_uid_validity.isdigit()):
+            raise ValueError("expected_uid_validity must be a UIDVALIDITY returned by mail search")
 
         with self._refresh_lock(f"message:{selected_mailbox.casefold()}:{uid}"):
             with self._connected(operation) as client:
@@ -727,6 +782,8 @@ class ICloudIMAPService:
                 uid_validity = self._select(
                     client, selected_mailbox, readonly=True, operation=operation
                 )
+                if expected_uid_validity is not None and uid_validity != expected_uid_validity:
+                    raise EmailNotFoundError("Email source reference is no longer valid; search again.")
                 if self._cache is not None:
                     cached = self._cache.get_email_message(
                         selected_mailbox, uid, uid_validity=uid_validity
@@ -740,13 +797,14 @@ class ICloudIMAPService:
                         summary = cached.value.get("summary")
                         if not isinstance(raw_message, bytes) or not isinstance(summary, dict):
                             raise IMAPServiceError("Cached email content is invalid")
-                        return self._parse_message(raw_message), summary
+                        return self._parse_message(raw_message), {**summary, "uid_validity": uid_validity}
                     logger.info(
                         "imap_cache tool={} action=read status={}", operation,
                         "stale" if cached is not None else "miss",
                     )
                 started = perf_counter()
-                status, fetched = client.uid("FETCH", uid, "(UID FLAGS BODY.PEEK[])")
+                with measure_phase("imap_message_fetch"):
+                    status, fetched = client.uid("FETCH", uid, "(UID FLAGS BODY.PEEK[])")
                 self._ensure_ok(status, "IMAP message fetch failed")
                 raw_message = self._literal_bytes(fetched)
                 logger.info(
@@ -761,6 +819,7 @@ class ICloudIMAPService:
                     message, uid=uid, mailbox=selected_mailbox,
                     flags=self._fetch_flags(fetched),
                 )
+                summary["uid_validity"] = uid_validity
                 logger.info(
                     "imap_phase tool={} phase=parse duration_ms={:.1f}",
                     operation, (perf_counter() - parse_started) * 1000,
@@ -1360,6 +1419,7 @@ class ICloudIMAPService:
         # connection may mark additional messages deleted between commands.
         return False
 
+    @timed_phase("imap_select")
     def _select(
         self,
         client: Any,
@@ -1586,6 +1646,7 @@ class ICloudIMAPService:
         return flags
 
     @staticmethod
+    @timed_phase("mail_mime_parse")
     def _parse_message(raw: bytes) -> Message:
         try:
             return BytesParser(policy=policy.default).parsebytes(raw)
@@ -1646,6 +1707,7 @@ class ICloudIMAPService:
                 yield from cls._message_parts(part)
 
     @staticmethod
+    @timed_phase("mail_part_decode")
     def _part_payload(part: Message) -> bytes:
         payload = part.get_payload(decode=True)
         if isinstance(payload, bytes):
@@ -1665,6 +1727,7 @@ class ICloudIMAPService:
         }
 
     @classmethod
+    @timed_phase("mail_body_decode")
     def _message_body(cls, message: Message, max_chars: int) -> dict[str, Any]:
         plain_parts: list[str] = []
         html_parts: list[str] = []

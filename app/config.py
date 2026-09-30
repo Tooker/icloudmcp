@@ -376,6 +376,21 @@ def icloud_calendars_cache_ttl_seconds(environ: dict[str, str] | None = None) ->
     )
 
 
+def icloud_cache_refresh_enabled(environ: dict[str, str] | None = None) -> bool:
+    env = os.environ if environ is None else environ
+    value = env.get("ICLOUD_CACHE_REFRESH_ENABLED", "true").strip().casefold()
+    if value not in {"0", "1", "false", "true", "no", "yes", "off", "on"}:
+        raise ValueError("ICLOUD_CACHE_REFRESH_ENABLED must be a boolean")
+    return value in {"1", "true", "yes", "on"}
+
+
+def icloud_cache_refresh_interval_seconds(environ: dict[str, str] | None = None) -> int:
+    return _bounded_int(
+        environ, ("ICLOUD_CACHE_REFRESH_INTERVAL_SECONDS",), 30,
+        "ICLOUD_CACHE_REFRESH_INTERVAL_SECONDS", minimum=1, maximum=3600,
+    )
+
+
 def imap_email_cache_ttl_seconds(environ: dict[str, str] | None = None) -> int:
     return _positive_or_zero_int(
         environ,

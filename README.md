@@ -65,14 +65,18 @@ IMAP_EMAIL_CACHE_MAX_MESSAGES=1000
 The MCP server provides:
 
 - `list_calendars` — list calendar names and opaque CalDAV ids.
-- `list_events` — read events by calendar, date range, text query, and limit.
+- `list_events` — read individual occurrences by calendar, date range, text query,
+  and limit, with their actual start/end times and original recurrence IDs.
 - `get_event` — read one event by UID.
 - `create_event` — create a timed or all-day event.
 - `update_event` — update only supplied event fields.
-- `delete_event` — delete an event; it requires `confirm=true` and should also
-  be protected by the client's MCP approval flow.
+- `delete_event` — delete one occurrence or a whole event/series; explicit `scope`
+  and `confirm=true` are required, in addition to the client's MCP approval flow.
 - `list_mailboxes` — list IMAP mailboxes.
 - `search_emails` — search by sender, recipient, subject, text, dates, or unread status.
+- `semantic_search_emails` — search cached mail bodies and PDF/text attachments by meaning,
+  returning excerpts plus safe references to their original mail and attachment.
+- `email_search_index_status` — inspect indexing progress and omitted/truncated counts.
 - `get_email` — read one message by its mailbox-local UID without marking it read. Bodies
   are bounded; attachments include metadata and an `attachment_id` for reading their contents.
 - `get_email_attachment` — return the complete original attachment as a native binary
@@ -87,6 +91,48 @@ The MCP server provides:
 - `move_email` — copy a message to another mailbox and mark the source for deletion.
 - `delete_email` — delete a message; it requires `confirm=true` and may leave a safe
   deletion marker when the server cannot isolate an IMAP expunge.
+
+Calendar date windows include their start and exclude their end. For example,
+`list_events(calendar="calendar-id", start="2026-09-30", end="2026-10-01")`
+returns occurrences overlapping September 30 in the configured timezone. Each
+recurring result includes the series `uid`/`series_uid`, a stable `occurrence_id`,
+and `recurrence_id`. Its `start` and `end` describe the actual occurrence; its
+`recurrence_id` identifies the original slot, even if it was moved to another day.
+`get_event(calendar, uid)` continues to return the series master summary.
+
+To delete only the selected occurrence, copy its `recurrence_id` unchanged:
+
+```json
+{
+  "calendar": "calendar-id",
+  "uid": "series-uid",
+  "scope": "occurrence",
+  "recurrence_id": "2026-09-30T18:00:00+02:00",
+  "confirm": true
+}
+```
+
+Timed IDs require a full ISO datetime: include an offset for zoned events, or
+omit the offset for floating events. All-day IDs use `YYYY-MM-DD`. Equivalent
+UTC timestamps are accepted for zoned events. Date-only IDs for timed events,
+nonexistent series slots, missing IDs and missing/invalid scopes are rejected.
+There is no fallback to deleting the series. To delete a whole event or series,
+use `scope="series"` and omit `recurrence_id`. This also applies to nonrecurring
+events; callers using the previous UID-only deletion interface must supply scope.
+
+Occurrence deletion adds an `EXDATE` of the same type/timezone as the master
+and removes matching single-occurrence overrides from the complete CalDAV resource.
+`RANGE=THISANDFUTURE` anchors are retained so later modified occurrences remain
+intact. The result explicitly confirms `scope`, `recurrence_id`, `occurrence_date`
+(the original slot's date), and `affected_date` (the actual occurrence's date in
+the series timezone). Repeating the deletion returns `already_deleted=true` and
+does not add duplicate exceptions. Successful writes invalidate calendar caches;
+expanded occurrences never replace UID-keyed master summaries in SQLite.
+
+Expansion uses the same
+[recurring-ical-events library](https://recurring-ical-events.readthedocs.io/en/v3.8.2/user-guide/examples.html)
+as the installed CalDAV client. Exception identities follow
+[RFC 5545, section 3.8.4.4](https://www.rfc-editor.org/rfc/rfc5545.html#section-3.8.4.4).
 
 IMAP operations use mailbox-local UIDs, so callers should use the UID together with the
 mailbox returned by `search_emails`. Drafts default to the `Drafts` mailbox and can be
@@ -121,12 +167,18 @@ The server uses the official Python MCP SDK's `MCPServer`, formerly named `FastM
 Native file results use the SDK's MCP content types directly; the separate `fastmcp`
 package is not required for this feature.
 
-The IMAP read cache keeps up to the 1,000 newest message headers per mailbox from the
-last 100 days in the same persistent SQLite volume as the calendar cache. It refreshes
-every 300 seconds by default. Mailbox listings are cached for 30 minutes by default.
-Header searches use the cache only when an explicit `since` date falls within
-its complete coverage. Unbounded searches and searches exceeding the cached
-message limit run directly on IMAP, so the cache never hides matching mail.
+Mail searches reuse the header summaries already stored alongside full `.eml`
+messages in SQLite, without a 1,000-message coverage limit. IMAP SEARCH still finds
+current matches across the whole mailbox; only the selected UIDs are loaded.
+Cached headers avoid downloading/parsing headers again. Flags and INTERNALDATE
+are refreshed from IMAP, while missing headers are fetched only for those UIDs.
+Mail bodies and attachment BLOBs are not read for a header search.
+
+For mailboxes without full-message snapshots, the older header cache keeps up to
+the 1,000 newest headers from the last 100 days. It refreshes every 300 seconds
+by default and answers searches only when an explicit `since` date falls within
+its complete coverage. Other searches run directly on IMAP, so the cache never
+hides matching mail. Mailbox listings are cached for 30 minutes by default.
 Full `.eml` messages, including message bodies and attachment bytes, are stored in a
 separate SQLite BLOB table for 24 hours by default. On startup, a background crawler
 walks configured mailboxes from newest to oldest in batches and skips already cached
@@ -138,6 +190,69 @@ refreshes.
 Mailbox UIDVALIDITY is checked before cached searches and message reads. A
 changed generation invalidates that mailbox's headers and message content;
 messages are never reused when the server's UIDVALIDITY is unavailable.
+
+### Semantic mail and PDF search
+
+Optional semantic search uses **existing, account-scoped `.eml` BLOBs in SQLite**.
+It does not perform additional IMAP fetches and does not index calendar entries.
+The IMAP crawler fills SQLite independently. SQLite retains originals and cached
+vectors; Qdrant is a derived index in its own persistent `qdrant-storage` volume.
+Qdrant has no published ports and stores vectors/payloads on disk. No GPU is needed:
+OpenAI computes the embeddings from mail headers, body text, and extracted attachment
+text. Search queries are also sent to OpenAI. Original PDF/.eml files are not uploaded.
+
+Set these values in the ignored `.env`:
+
+```dotenv
+MAIL_SEARCH_ENABLED=true
+OPENAI_API_KEY=your-key
+OPENAI_EMBEDDING_MODEL=text-embedding-3-large
+MAIL_SEARCH_EMBEDDING_MODE=batch
+```
+
+Start Qdrant and recreate the application so it receives the environment:
+
+```bash
+docker compose --profile search up -d --build qdrant icloud-cruncher
+```
+
+Background indexing uses the [OpenAI Batch API](https://developers.openai.com/api/docs/guides/batch)
+by default: JSONL requests are uploaded, submitted with a `24h` completion window,
+and polled every `MAIL_SEARCH_POLL_SECONDS` (default 30 seconds). One job is in flight
+at a time, containing at most 1000 new, distinct text inputs. Each pass prepares up
+to `MAIL_SEARCH_BATCH_SIZE` messages (default 100). Index progress, remote batch ID
+and status are available through `email_search_index_status`. Batch processing costs
+50% less than the standard endpoint; search queries use the standard endpoint for an
+immediate response. Set `MAIL_SEARCH_EMBEDDING_MODE=standard` for immediate background
+indexing, with up to 16 text chunks per API request.
+
+Model defaults are 3072 dimensions for `text-embedding-3-large` and 1536 for
+`text-embedding-3-small`; `OPENAI_EMBEDDING_DIMENSIONS` may reduce them. Changing the
+account, model, dimensions, or extraction version selects a separate collection.
+Unchanged inputs reuse persisted embeddings across restarts and rebuilds. Batch IDs
+and input mappings survive restarts; reordered results are matched by input hash,
+and partial results are retained. Completed input/output/error files are deleted
+from OpenAI after ingestion. An ambiguous submission is recovered by its metadata;
+if no corresponding remote job can be found, the worker reports `submitting`/retrying
+and requires checking Platform before retrying rather than creating duplicate jobs.
+
+`semantic_search_emails(query="bezahlte Heizkostenrechnung", source="attachment")`
+returns `matches` with score, excerpt, mailbox, UID, UIDVALIDITY, attachment ID,
+filename, and ready-to-use `email`/`attachment` MCP tool arguments. These include
+`expected_uid_validity`; `get_email` and `get_email_attachment` reject a reference
+after its mailbox's UID generation changes. The attachment reference retrieves the
+original file through the existing native MCP resource output.
+
+Search covers cached snapshots, including expired snapshots until invalidated, and
+may lag behind iCloud. Successful mail mutations and known generation changes remove
+the source from SQLite; old matches are suppressed immediately and Qdrant points are
+removed by the worker. Use normal `search_emails` for live IMAP coverage.
+
+Text inputs have a conservative 6500 UTF-8-byte bound with overlapping chunks. A
+message contributes at most 64 chunks, 20 attachments, and 100000 characters per
+body/attachment; omitted or truncated inputs are counted in index status. Scanned,
+encrypted, unsupported or unreadable attachments are skipped; OCR is not included.
+Only aggregate counts/statuses are logged, without text, queries, headers or keys.
 
 IMAP uses a small reusable connection pool (4 connections by default) so sequential
 requests do not repeat the TLS login/logout roundtrip. Set `IMAP_CONNECTION_POOL_SIZE`
@@ -173,6 +288,28 @@ not credentials. The Docker Compose setup stores the database in the named
 Persistent cache entries are isolated by protocol, server, and account using
 opaque hashed namespaces. Changing an account or server does not reuse another
 account's data. Legacy cache entries without an owner are ignored and refreshed.
+
+Implicit event-search bounds use local midnight (30 days before today through
+365 days after today), keeping range-cache keys stable between requests. Explicit
+timestamps remain exact. A missing/expired result for one calendar does not discard
+fresh results for other calendars. SQLite uses WAL so embedding writes can run
+alongside cache reads. Unchanged UIDVALIDITY checks do not acquire a writer lock.
+
+Calendar cache polling is enabled by default. The application warms the rolling
+default event window at startup and refreshes it every 30 seconds in a background
+thread. Successful event-list requests also register up to eight recent unfiltered
+calendar/time windows; they remain active for one hour after their last use. Query
+text and result limits do not restrict the cached data. Recent windows are kept in
+memory; the default window is warmed again after a restart.
+
+Set `ICLOUD_CACHE_REFRESH_ENABLED=false` to disable polling or
+`ICLOUD_CACHE_REFRESH_INTERVAL_SECONDS` to adjust it. The effective interval is
+capped at half the event-cache TTL; TTL 0 disables polling. Cached results remain
+subject to the normal TTL. New windows, polling failures or slow refreshes can
+therefore require a foreground iCloud request. Failures preserve previous snapshots
+and retry with backoff. Successful writes immediately invalidate event entries;
+an older refresh in flight cannot republish them after invalidation. The poller
+stops with the application and logs only safe counts, durations and error classes.
 
 ## Configuration
 
@@ -266,6 +403,15 @@ There is no calendar listing endpoint. Unknown tokens return a neutral `404`.
 ## Logging
 
 The app uses `loguru` and logs incoming requests plus upstream iCloud fetch results. Upstream logs include token, status, duration, content type, and response size, but not the configured iCloud source URL. Every MCP call logs `mcp_tool_start` and `mcp_tool_complete` with the tool name, outcome, duration, and (where applicable) result count. Cache logs identify read hits/misses/bypasses, refresh writes, and invalidations with counts; they never log event contents, email headers, message bodies, or credentials.
+
+MCP start/completion logs include an opaque `call_id`. Detailed `mcp_phase` logs
+share that ID and add `span_id`, `parent_span`, `phase`, `outcome` and `duration_ms`.
+This correlates parallel calls and nested steps: worker-queue and cache/pool waits,
+TLS/login, UIDVALIDITY checks, IMAP search/fetch, SQLite reads/writes/commit,
+MIME/PDF parsing, CalDAV discovery/event searches, and query embedding/Qdrant search.
+Durations include child spans; do not add parent and child durations together.
+Phase logs never include arguments, queries, result contents or exception messages.
+Background workers retain their aggregate progress logs instead of detailed spans.
 
 At startup, the app logs every URL path it answers. With `ICLOUDCRUNCHER.BASE_URL=https://calendar.example.com`, it logs full external URLs.
 Cache logs include `cache_hit` for fresh public-calendar responses, `public_calendar_cache action=write` for refreshed public feeds, and `cache_stale_fallback` when iCloud is unavailable but a previous response can still be served. Calendar MCP cache logs use `icloud_cache tool=<name> action=<read|write|invalidate>`, and IMAP cache logs use `imap_cache tool=<name> action=<read|write|invalidate>`.

@@ -49,6 +49,56 @@ def test_streamable_http_mcp_endpoint_exposes_calendar_tools(tmp_path: Path) -> 
     assert '"name":"mark_email_read"' in tools_response.text
 
 
+def test_calendar_delete_schema_requires_explicit_scope_and_confirmation():
+    server = create_mcp_server(None)
+    tool = next(tool for tool in asyncio.run(server.list_tools()) if tool.name == "delete_event")
+    assert {"calendar", "uid", "scope", "confirm"} <= set(tool.input_schema["required"])
+    assert tool.input_schema["properties"]["scope"]["enum"] == ["occurrence", "series"]
+    assert tool.annotations.destructive_hint is True
+
+
+@pytest.mark.parametrize("arguments", [
+    {"confirm": True},
+    {"scope": "occurrence", "recurrence_id": "2026-09-30T18:00:00+02:00", "confirm": False},
+    {"scope": "occurrence", "confirm": True},
+    {"scope": "occurrence", "recurrence_id": "2026-09-30", "confirm": True},
+    {"scope": "series", "recurrence_id": "2026-09-30T18:00:00+02:00", "confirm": True},
+    {"scope": "invalid", "confirm": True},
+])
+def test_mcp_incomplete_or_unconfirmed_calendar_deletes_do_not_mutate(arguments):
+    from test_calendar_occurrences import CALENDAR_ID, UID, setup_series
+
+    service, resource = setup_series()
+    server = create_mcp_server(service)
+    result = asyncio.run(server._handle_call_tool(
+        None, CallToolRequestParams(name="delete_event", arguments={
+            "calendar": CALENDAR_ID, "uid": UID, **arguments,
+        })
+    ))
+    assert result.is_error is True
+    assert resource.deleted is resource.saved is False
+
+
+def test_mcp_calendar_occurrence_delete_forwards_id_and_returns_explicit_date():
+    from test_calendar_occurrences import CALENDAR_ID, UID, day_events, setup_series
+
+    service, resource = setup_series()
+    server = create_mcp_server(service)
+    result = asyncio.run(server._handle_call_tool(
+        None, CallToolRequestParams(name="delete_event", arguments={
+            "calendar": CALENDAR_ID, "uid": UID, "scope": "occurrence",
+            "recurrence_id": "2026-09-30T18:00:00+02:00", "confirm": True,
+        })
+    ))
+    assert result.is_error is False
+    assert result.structured_content["scope"] == "occurrence"
+    assert result.structured_content["affected_date"] == "2026-09-30"
+    assert result.structured_content["recurrence_id"] == "2026-09-30T18:00:00+02:00"
+    assert resource.deleted is False
+    assert day_events(service) == []
+    assert len(day_events(service, "2026-10-07", "2026-10-08")) == 1
+
+
 @pytest.mark.parametrize("error", [RuntimeError, ValueError, ICloudServiceError])
 def test_mcp_errors_do_not_log_private_exception_causes(caplog, error) -> None:
     marker = "PRIVATE_UPSTREAM_DETAIL_DO_NOT_LOG"

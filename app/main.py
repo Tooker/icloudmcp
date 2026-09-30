@@ -22,6 +22,8 @@ from app.config import (
     IMAPConfig,
     cache_ttl_seconds,
     icloud_cache_path,
+    icloud_cache_refresh_enabled,
+    icloud_cache_refresh_interval_seconds,
     icloud_cache_ttl_seconds,
     icloud_calendars_cache_ttl_seconds,
     imap_connection_pool_size,
@@ -43,6 +45,8 @@ from app.icloud import ICloudCalendarService
 from app.icloud_cache import SQLiteICloudCalendarCache
 from app.imap import ICloudIMAPService
 from app.mcp_server import create_mcp_server
+from app.search_config import load_mail_search_config
+from app.semantic_search import SemanticMailSearch
 
 
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
@@ -97,6 +101,7 @@ def create_app(
     environ: dict[str, str] | None = None,
     icloud_service: ICloudCalendarService | None = None,
     imap_service: ICloudIMAPService | None = None,
+    mail_search: SemanticMailSearch | None = None,
 ) -> FastAPI:
     _configure_healthcheck_access_logging()
     calendars = load_calendars(config_path, environ)
@@ -131,7 +136,17 @@ def create_app(
     else:
         mail_service = None
         mail_service_created = False
-    mcp_server = create_mcp_server(service, mail_service)
+    search_config = load_mail_search_config(environ)
+    if mail_search is not None:
+        search_service = mail_search
+    elif search_config.enabled and search_config.api_key and getattr(mail_service, "_cache", None) is not None:
+        search_service = SemanticMailSearch(mail_service._cache, search_config)
+    else:
+        search_service = None
+        if search_config.enabled:
+            logger.warning("mail_search action=start status=not_configured api_key_present={} mail_cache_present={}",
+                           bool(search_config.api_key), getattr(mail_service, "_cache", None) is not None)
+    mcp_server = create_mcp_server(service, mail_service, search_service)
     mcp_http_app = mcp_server.streamable_http_app(
         streamable_http_path="/",
         host="0.0.0.0",
@@ -153,7 +168,21 @@ def create_app(
         # Mounted Starlette applications do not run their own lifespan under
         # FastAPI, so the MCP session manager is owned by the host app.
         crawl_task: asyncio.Task | None = None
+        search_task: asyncio.Task | None = None
+        calendar_refresh_task: asyncio.Task | None = None
         try:
+            if (
+                isinstance(service, ICloudCalendarService)
+                and service.cache_refresh_supported
+                and icloud_cache_refresh_enabled(environ)
+            ):
+                calendar_refresh_task = asyncio.create_task(
+                    asyncio.to_thread(service.run_cache_refresh, icloud_cache_refresh_interval_seconds(environ)),
+                    name="icloud-calendar-cache-refresh",
+                )
+            if search_service is not None:
+                logger.info("mail_search action=start status=scheduled model={} dimensions={}", search_service.config.model, search_service.config.dimensions)
+                search_task = asyncio.create_task(asyncio.to_thread(search_service.run), name="mail-search-index")
             if mail_service_created and imap_email_cache_crawl_enabled(environ):
                 logger.info(
                     "imap_cache tool=crawl_email_cache action=launch status=scheduled batch_size={} interval_seconds={} max_message_bytes={}",
@@ -168,6 +197,22 @@ def create_app(
             async with mcp_server.session_manager.run():
                 yield
         finally:
+            if calendar_refresh_task is not None:
+                service.stop_cache_refresh()
+            if search_service is not None:
+                search_service.stop()
+            if search_task is not None:
+                try:
+                    await asyncio.wait_for(asyncio.shield(search_task), timeout=35)
+                except (asyncio.CancelledError, TimeoutError):
+                    search_task.cancel()
+            if search_service is not None:
+                await asyncio.to_thread(search_service.close)
+            if calendar_refresh_task is not None:
+                try:
+                    await asyncio.wait_for(asyncio.shield(calendar_refresh_task), timeout=35)
+                except (asyncio.CancelledError, TimeoutError):
+                    calendar_refresh_task.cancel()
             if crawl_task is not None and not crawl_task.done():
                 stop = getattr(mail_service, "stop_crawl", None)
                 if callable(stop):
@@ -193,6 +238,7 @@ def create_app(
     app.state.icloud_service = service
     app.state.icloud_cache = shared_cache
     app.state.imap_service = mail_service
+    app.state.mail_search = search_service
     app.state.mcp_server = mcp_server
     logger.info("calendar_cache ttl_seconds={}", cache.ttl_seconds)
     if shared_cache is not None:

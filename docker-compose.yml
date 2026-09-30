@@ -1,6 +1,7 @@
 services:
   icloud-cruncher:
     container_name: icloud-cruncher-mcp
+    stop_grace_period: 45s
     build: .
     ports:
       # Keep the write-capable MCP endpoint local. The tunnel reaches it over
@@ -31,6 +32,18 @@ services:
       IMAP_EMAIL_CACHE_CRAWL_BATCH_SIZE: ${IMAP_EMAIL_CACHE_CRAWL_BATCH_SIZE:-25}
       IMAP_EMAIL_CACHE_CRAWL_INTERVAL_SECONDS: ${IMAP_EMAIL_CACHE_CRAWL_INTERVAL_SECONDS:-0.1}
       IMAP_EMAIL_CACHE_MAX_MESSAGE_BYTES: ${IMAP_EMAIL_CACHE_MAX_MESSAGE_BYTES:-25000000}
+      # Optional semantic search. Only extracted text is embedded; Qdrant stays local.
+      MAIL_SEARCH_ENABLED: ${MAIL_SEARCH_ENABLED:-false}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-text-embedding-3-large}
+      # Empty means the selected model's default dimension (3072 / 1536).
+      OPENAI_EMBEDDING_DIMENSIONS: ${OPENAI_EMBEDDING_DIMENSIONS:-}
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      QDRANT_COLLECTION_PREFIX: ${QDRANT_COLLECTION_PREFIX:-icloud-mail}
+      MAIL_SEARCH_EMBEDDING_MODE: ${MAIL_SEARCH_EMBEDDING_MODE:-batch}
+      MAIL_SEARCH_BATCH_SIZE: ${MAIL_SEARCH_BATCH_SIZE:-100}
+      MAIL_SEARCH_POLL_SECONDS: ${MAIL_SEARCH_POLL_SECONDS:-30}
       # Optional: used only for startup logs showing answered external URLs.
       # ICLOUDCRUNCHER.BASE_URL: https://calendar.example.com
       # Optional: in-memory calendar cache TTL in seconds. Default: 300.
@@ -39,6 +52,8 @@ services:
       ICLOUD_CACHE_PATH: /data/icloud-calendar-cache.sqlite3
       ICLOUD_CACHE_TTL_SECONDS: ${ICLOUD_CACHE_TTL_SECONDS:-60}
       ICLOUD_CALENDARS_CACHE_TTL_SECONDS: ${ICLOUD_CALENDARS_CACHE_TTL_SECONDS:-300}
+      ICLOUD_CACHE_REFRESH_ENABLED: ${ICLOUD_CACHE_REFRESH_ENABLED:-true}
+      ICLOUD_CACHE_REFRESH_INTERVAL_SECONDS: ${ICLOUD_CACHE_REFRESH_INTERVAL_SECONDS:-30}
       # Optional env-only calendars. Quote keys because they contain dots.
       # ICLOUDCRUNCHER.0.token: your-secret-token
       # ICLOUDCRUNCHER.0.URL: webcal://p106-caldav.icloud.com/published/2/...
@@ -68,5 +83,18 @@ services:
       HEALTH_LISTEN_ADDR: :8081
     restart: unless-stopped
 
+  # No published ports: access is limited to the private Compose network.
+  # Start with: docker compose --profile search up -d qdrant
+  qdrant:
+    image: qdrant/qdrant:${QDRANT_VERSION:-v1.19.1}
+    profiles: ["search"]
+    volumes:
+      - qdrant-storage:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:-}
+      QDRANT__TELEMETRY_DISABLED: "true"
+    restart: unless-stopped
+
 volumes:
   icloud-cache:
+  qdrant-storage:

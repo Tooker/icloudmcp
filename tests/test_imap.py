@@ -417,6 +417,19 @@ def pdf_attachment(*pages: str, encrypted: bool = False) -> bytes:
     return output.getvalue()
 
 
+@pytest.mark.parametrize("attachment", [False, True])
+def test_old_source_reference_is_rejected_before_fetching_a_reused_uid(attachment) -> None:
+    client = FakeIMAP()
+    client.uid_validity = "99"
+    mail = ICloudIMAPService(IMAPConfig("user@example.com", "password"), client_factory=lambda *_, **__: client)
+    with pytest.raises(EmailNotFoundError, match="source reference"):
+        if attachment:
+            mail.get_email_attachment("INBOX", "42", "1", expected_uid_validity="7")
+        else:
+            mail.get_email("INBOX", "42", expected_uid_validity="7")
+    assert not any(operation == "FETCH" for operation, _ in client.calls)
+
+
 def attachment_message(payload: bytes, filename: str = "invoice.pdf", content_type: str = "application/pdf") -> bytes:
     message = EmailMessage()
     message["Subject"] = "Mail with attachment"
@@ -640,6 +653,74 @@ def test_unbounded_header_search_includes_matches_older_than_cache_window(tmp_pa
     mail = service_with(client, cache=SQLiteICloudCalendarCache(tmp_path / "cache.sqlite3"))
     assert [message["uid"] for message in mail.search_emails(subject="Rechnung")] == ["1"]
     assert not any("SINCE" in args for command, args in client.calls if command == "SEARCH")
+
+
+class MetadataOnlyIMAP(SearchMailboxIMAP):
+    def uid(self, command: str, *args: Any) -> tuple[str, list[Any]]:
+        if command == "FETCH" and args[1] == "(UID FLAGS INTERNALDATE)":
+            self.calls.append((command, args))
+            return "OK", [
+                f'{uid} (UID {uid} FLAGS () INTERNALDATE "29-Sep-2026 10:00:00 +0200")'.encode()
+                for uid in str(args[0]).split(",") if uid in self.messages
+            ]
+        return super().uid(command, *args)
+
+
+def seed_full_message_headers(mail, uid, subject):
+    mail._cache.sync_uid_validity("INBOX", "7")
+    mail._cache.set_email_messages([{
+        "mailbox": "INBOX", "uid": uid, "uid_validity": "7",
+        "summary": {"subject": subject, "flags": [r"\Seen"], "read": True},
+        "raw_message": b"A stored message whose BLOB must not be fetched or parsed",
+    }])
+
+
+def test_search_reuses_full_message_headers_beyond_legacy_limit_with_live_flags(tmp_path):
+    client = MetadataOnlyIMAP(["Rechnung"] + ["Other"] * 1001)
+    mail = service_with(client, cache=SQLiteICloudCalendarCache(tmp_path / "cache.sqlite3"))
+    seed_full_message_headers(mail, "1", "Rechnung")
+    result = mail.search_emails(subject="Rechnung", since=mail._email_cache_since(), unread_only=True)
+    assert [item["uid"] for item in result] == ["1"]
+    assert result[0]["read"] is False
+    assert result[0]["flags"] == []
+    assert result[0]["internal_date"] == "2026-09-29T10:00:00+02:00"
+    assert sum(command == "SEARCH" for command, _ in client.calls) == 1
+    fetches = [args for command, args in client.calls if command == "FETCH"]
+    assert fetches == [("1", "(UID FLAGS INTERNALDATE)")]
+    assert mail._cache.get_emails("INBOX") is None
+
+
+def test_search_fetches_only_headers_missing_from_full_message_cache(tmp_path):
+    client = MetadataOnlyIMAP(["First", "Second"])
+    mail = service_with(client, cache=SQLiteICloudCalendarCache(tmp_path / "cache.sqlite3"))
+    seed_full_message_headers(mail, "1", "First")
+    result = mail.search_emails()
+    assert [(item["uid"], item["subject"]) for item in result] == [("2", "Second"), ("1", "First")]
+    fetches = [args for command, args in client.calls if command == "FETCH"]
+    assert fetches == [("1", "(UID FLAGS INTERNALDATE)"), ("2", mail._FETCH_HEADERS)]
+
+
+def test_search_never_reuses_full_message_headers_after_uid_generation_change(tmp_path):
+    client = MetadataOnlyIMAP(["Replacement"])
+    mail = service_with(client, cache=SQLiteICloudCalendarCache(tmp_path / "cache.sqlite3"))
+    seed_full_message_headers(mail, "1", "Old source")
+    client.uid_validity = "99"
+    result = mail.search_emails()
+    assert result[0]["subject"] == "Replacement"
+    assert [args[1] for command, args in client.calls if command == "FETCH"] == [mail._FETCH_HEADERS]
+
+
+def test_search_omits_cached_uid_that_vanishes_before_metadata_fetch(tmp_path):
+    class VanishingIMAP(MetadataOnlyIMAP):
+        def uid(self, command, *args):
+            if command == "FETCH" and args[1] == "(UID FLAGS INTERNALDATE)":
+                self.calls.append((command, args))
+                return "OK", [None]
+            return super().uid(command, *args)
+
+    mail = service_with(VanishingIMAP(["Vanishing"]), cache=SQLiteICloudCalendarCache(tmp_path / "cache.sqlite3"))
+    seed_full_message_headers(mail, "1", "Vanishing")
+    assert mail.search_emails() == []
 
 
 def test_complete_cache_at_limit_uses_internal_dates_and_uid_order(tmp_path) -> None:

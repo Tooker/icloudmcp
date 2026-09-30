@@ -9,6 +9,8 @@ from typing import Any, Iterator
 
 from pypdf import PdfReader
 
+from app.timing import timed_phase
+
 
 _extracting_pdf: ContextVar[bool] = ContextVar("extracting_mail_pdf", default=False)
 
@@ -69,6 +71,7 @@ def _text_chunks(part: Message, payload: bytes) -> Iterator[str]:
         raise _TextUnavailable("unsupported", "Text extraction is supported for PDF and text files; use format=base64 for this file.")
 
 
+@timed_phase("attachment_text_extract")
 def extract_attachment_text(part: Message, payload: bytes, offset: int, limit: int) -> dict[str, Any]:
     """Extract a bounded text window, reading PDF pages only as far as needed."""
 
