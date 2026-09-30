@@ -460,11 +460,11 @@ an unconfigured backend return a safe configuration error;
 | `sync_reminders` | Refresh the cache; `full=true` requests a full sync. |
 | `list_reminder_participants` | Read accepted collaborators, available contact details and permissions. |
 | `assign_reminder` | Assign/reassign by participant ID, or remove with `clear=true`. |
-<<<<<<< HEAD
 | `list_reminder_sections` | Discover native section headings and IDs in section order. |
 | `create_reminder_section` | Create a native section heading in an existing list. |
 | `move_reminder` | Indent/outdent, move into/out of sections, or place before/after a sibling; keep the subtree together. |
 | `reorder_reminders` | Set the manual order of every sibling in a list, section or parent, including completed reminders. |
+| `batch_update_reminders` | Preview or apply a complete tree with sections, new tasks, field changes and manual order. |
 
 ### Reminders sections, subtasks and ordering (1.1.0)
 
@@ -524,12 +524,6 @@ The release override explicitly selects the adjacent Go source; the main
 Compose file pins the published 1.1.0 backend commit. Use the same two Compose files
 when starting the locally built pair. Building images does not recreate the
 running services.
-=======
-| `list_reminder_sections` | Discover native section headings in their current order. |
-| `create_reminder_section` | Create a native section in an existing list. |
-| `move_reminder` | Change parent/section or place a subtree before/after a sibling. |
-| `reorder_reminders` | Set manual order with every sibling ID, including completed tasks. |
-| `batch_update_reminders` | Preview or apply a complete tree with sections, new tasks, field changes and manual order. |
 
 ### Declarative Reminders batches
 
@@ -581,7 +575,6 @@ structured result containing confirmed operations and their original MCP
 results, created IDs, the failed operation, and an indication that its write
 may be uncertain. Inspect current data and construct a fresh target before
 retrying; replaying a batch containing new tasks can duplicate them.
->>>>>>> codex/reminders-batch-update
 
 ### Recurring events
 

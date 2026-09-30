@@ -7,6 +7,8 @@
 - Tree views, section filters, inherited sections and native manual positions.
 - Move existing reminders between sections or under parents, and reorder
   siblings while preserving their subtrees.
+- Add declarative batch planning with a default read-only preview and bounded,
+  sequential application preserving progress and created IDs on failure.
 - Explain status, hierarchy, priority and ordering symbols in MCP instructions,
   tool descriptions, read results and the Go CLI's `list --legend`.
 - Preserve existing CloudKit metadata and shared-owner zones; refresh write
