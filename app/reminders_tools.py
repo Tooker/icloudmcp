@@ -12,6 +12,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import CallToolResult, ToolAnnotations
 
 from app.reminders import GoRemindersService, RemindersError
+from app.reminders_batch import ReminderNode, ReminderSection
 from app.timing import call_id, tool_trace
 
 
@@ -36,15 +37,19 @@ def register_reminders_tools(server: MCPServer, service: GoRemindersService | No
                     outcome = "not_configured"
                     raise ToolError("Reminders is not configured. Set REMINDERS_MCP_URL to the Go backend's private MCP endpoint.")
                 result = await service.call_tool(name, {key: value for key, value in arguments.items() if value is not None})
-                outcome = "ok"
+                outcome = "error" if result.is_error else "ok"
                 payload = result.structured_content
                 if isinstance(payload, dict):
-                    for key in ("reminders", "lists", "participants"):
+                    if name == "batch_update_reminders":
+                        outcome = payload.get("error", {}).get("code", outcome)
+                        count = payload.get("completed_operations")
+                    for key in ("reminders", "lists", "participants", "sections"):
                         if isinstance(payload.get(key), list):
                             count = len(payload[key])
                             break
                     else:
-                        count = 1
+                        if count is None:
+                            count = 1
                 return result
             except RemindersError as error:
                 outcome = error.code
@@ -66,14 +71,19 @@ def register_reminders_tools(server: MCPServer, service: GoRemindersService | No
 
     @server.tool(annotations=annotations(True), description=(
         "List current reminders, optionally filtering by exact list_id or parent_id, title query, "
-        "and completion. Pagination uses limit (1..500) and offset; due dates use YYYY-MM-DD."
+        "section and completion. view=tree adds nested subtasks for the returned page; parent_ref is the "
+        "authoritative parent even when filtered out. Manual list order is preserved; pagination uses "
+        "limit (1..500) and offset. Priority: 0=none, 9=low (!), 5=medium (!!), 1=high (!!!). "
+        "A drag handle (≡) changes manual order, not priority. •=pending, ✓=complete, ↳=subtask. "
+        "Use move_reminder or reorder_reminders with exact IDs to arrange tasks; never add these symbols to titles."
     ))
     async def list_reminders(
         list_id: str | None = None, parent_id: str | None = None, query: str | None = None,
         include_completed: bool = False, limit: int = 100, offset: int = 0,
+        section_id: str | None = None, view: Literal["flat", "tree"] = "flat",
     ) -> CallToolResult:
         return await call("list_reminders", list_id=list_id, parent_id=parent_id, query=query,
-                          include_completed=include_completed, limit=limit, offset=offset)
+                          include_completed=include_completed, limit=limit, offset=offset, section_id=section_id, view=view)
 
     @server.tool(annotations=annotations(True), description="Read one reminder by its exact ID, including notes and list/parent references.")
     async def get_reminder(id: str) -> CallToolResult:
@@ -81,15 +91,16 @@ def register_reminders_tools(server: MCPServer, service: GoRemindersService | No
 
     @server.tool(annotations=annotations(False, idempotent=False), description=(
         "Create a reminder in an existing list using its exact list_id; optionally set a parent_id "
-        "in the same list, a due date (YYYY-MM-DD), notes and priority. Never automatically retry an uncertain write."
+        "in the same list, a section_id from list_reminder_sections, a due date (YYYY-MM-DD), notes and priority. "
+        "Subtasks inherit their parent's section. Never automatically retry an uncertain write."
     ))
     async def create_reminder(
         title: str, list_id: str, due: str | None = None,
         priority: Literal["none", "low", "medium", "high"] | None = None,
-        notes: str | None = None, parent_id: str | None = None,
+        notes: str | None = None, parent_id: str | None = None, section_id: str | None = None,
     ) -> CallToolResult:
         return await call("create_reminder", title=title, list_id=list_id, due=due,
-                          priority=priority, notes=notes, parent_id=parent_id)
+                          priority=priority, notes=notes, parent_id=parent_id, section_id=section_id)
 
     @server.tool(annotations=annotations(False, destructive=True), description=(
         "Update specified nonempty reminder fields by exact ID. priority=none clears priority. "
@@ -133,3 +144,72 @@ def register_reminders_tools(server: MCPServer, service: GoRemindersService | No
     ))
     async def assign_reminder(id: str, participant_id: str | None = None, clear: bool = False) -> CallToolResult:
         return await call("assign_reminder", id=id, participant_id=participant_id, clear=clear)
+
+
+    @server.tool(annotations=annotations(True), description=(
+        "List native Apple Reminders sections in one exact list_id, in their section order. "
+        "Use the returned section IDs for creation, moving and filtering; section headings are not reminders."
+    ))
+    async def list_reminder_sections(list_id: str) -> CallToolResult:
+        return await call("list_reminder_sections", list_id=list_id)
+
+    @server.tool(annotations=annotations(False, idempotent=False), description=(
+        "Create a native section heading in an existing Reminders list. Use its exact list_id. "
+        "Returns an exact section ID. Never automatically retry an uncertain creation."
+    ))
+    async def create_reminder_section(list_id: str, title: str) -> CallToolResult:
+        return await call("create_reminder_section", list_id=list_id, title=title)
+
+    @server.tool(annotations=annotations(False, destructive=True), description=(
+        "Arrange an existing reminder within its current list. Set parent_id to indent under another reminder, "
+        "or clear_parent=true to make it top-level. Set section_id to move into a native section, or "
+        "clear_section=true to move out; subtasks inherit the parent's section. Omitted parent/section stays unchanged. "
+        "Use exactly one before_id or after_id to place beside a sibling; without an anchor append to the target "
+        "sibling group. The reminder's subtree stays together. IDs must come from the same list; cycles are rejected. "
+        "Inspect uncertain writes before retrying."
+    ))
+    async def move_reminder(
+        id: str, parent_id: str | None = None, clear_parent: bool = False,
+        section_id: str | None = None, clear_section: bool = False,
+        before_id: str | None = None, after_id: str | None = None,
+    ) -> CallToolResult:
+        return await call("move_reminder", id=id, parent_id=parent_id, clear_parent=clear_parent,
+                          section_id=section_id, clear_section=clear_section, before_id=before_id, after_id=after_id)
+
+    @server.tool(annotations=annotations(False, destructive=True), description=(
+        "Set the manual order of all siblings in one list, parent or section using reminder_ids in the desired "
+        "order. Supply every sibling exactly once, including completed reminders (discover with include_completed=true). "
+        "Omit parent_id for top-level reminders; omit section_id for the unsectioned group. "
+        "Each subtree stays together. This changes manual order only; priority and completion stay unchanged. "
+        "Inspect uncertain writes before retrying."
+    ))
+    async def reorder_reminders(
+        list_id: str, reminder_ids: list[str], parent_id: str | None = None, section_id: str | None = None,
+    ) -> CallToolResult:
+        return await call("reorder_reminders", list_id=list_id, reminder_ids=reminder_ids,
+                          parent_id=parent_id, section_id=section_id)
+
+    @server.tool(annotations=annotations(False, destructive=True, idempotent=False), description=(
+        "Apply a complete target structure to one existing Reminders list in one call. reminders contains "
+        "unsectioned top-level tasks; sections contains native sections with their top-level reminders. "
+        "Each task has nested subtasks in desired manual order. Include every existing reminder exactly once, "
+        "including completed tasks; use include_completed=true when reading. Existing tasks use exact id, "
+        "new tasks omit id and require title. Optional title/due/notes/priority update existing fields. "
+        "Include every existing section in current section order with id only; append new sections with title "
+        "and no id. Section renaming/reordering, deletion, completion changes and assignments are unsupported. "
+        "Maximum 500 total tasks, 100 sections and 20 task levels. dry_run=true (default) validates and previews "
+        "without writing; set dry_run=false to apply the approved structure. Writes are sequential, not atomic. "
+        "On failure the result preserves completed operations, created IDs and the uncertain operation. "
+        "Stop and inspect current data before retrying; never automatically replay a batch. "
+        "Requires a Go backend supporting native sections, moving and ordering."
+    ))
+    async def batch_update_reminders(
+        list_id: str, reminders: list[ReminderNode], sections: list[ReminderSection] | None = None,
+        dry_run: bool = True,
+    ) -> CallToolResult:
+        return await call(
+            "batch_update_reminders", list_id=list_id,
+            reminders=[node.model_dump(exclude_none=True) for node in reminders],
+            sections=[section.model_dump(exclude_none=True) for section in sections or []],
+            dry_run=dry_run,
+        )

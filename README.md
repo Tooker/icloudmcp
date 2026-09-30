@@ -15,7 +15,7 @@ one endpoint.
 | --- | --- |
 | **Calendar** | List calendars, search appointments, expand recurring events into their actual occurrences, create and update events, and delete one occurrence or an entire series. |
 | **Mail** | Search mailboxes, read messages without marking them read, retrieve original attachments, extract PDF/text content, prepare drafts with attachments, move messages and change read status. |
-| **Reminders** | Read lists and tasks, create reminders and subtasks, change dates, notes and priorities, complete or delete tasks, and assign reminders to accepted collaborators in shared lists. |
+| **Reminders** | Read lists and tasks, create native sections and subtasks, arrange manual order, apply a complete target tree in one batch, change dates, notes and priorities, complete or delete tasks, and assign reminders to accepted collaborators in shared lists. |
 | **Semantic search · optional** | Search cached mail bodies and PDF/text attachments by meaning, see matching excerpts, and retrieve the original message or file. |
 
 Typical requests to a connected assistant:
@@ -87,7 +87,7 @@ JSON-RPC over HTTP.
 | [app/mcp_server.py](app/mcp_server.py) | Calendar/Mail/search tools and MCP result handling. |
 | [app/icloud.py](app/icloud.py) | CalDAV operations and recurring-event handling. |
 | [app/imap.py](app/imap.py) | IMAP searches, message reads, drafts and mailbox operations. |
-| [app/reminders.py](app/reminders.py) · [app/reminders_tools.py](app/reminders_tools.py) | Asynchronous Go bridge and ten typed Reminders tools. |
+| [app/reminders.py](app/reminders.py) · [app/reminders_tools.py](app/reminders_tools.py) · [app/reminders_batch.py](app/reminders_batch.py) | Asynchronous Go bridge, typed Reminders tools and declarative batch planning. |
 | [app/icloud_cache.py](app/icloud_cache.py) | Persistent SQLite cache shared by Calendar and Mail. |
 | [app/semantic_search.py](app/semantic_search.py) · [app/batch_embeddings.py](app/batch_embeddings.py) | Optional mail/PDF indexing, embeddings and semantic queries. |
 | [app/mcp_resources.py](app/mcp_resources.py) | Private attachment snapshots served through MCP resources. |
@@ -327,6 +327,12 @@ For local backend development, an adjacent checkout can be selected in `.env`:
 REMINDERS_BUILD_CONTEXT=../icloud-reminders-cli
 ```
 
+Native sections, moving, ordering and `batch_update_reminders` require a Go
+backend with the structural tools; the current `f4d4803` pin predates them.
+Use an updated backend checkout via `REMINDERS_BUILD_CONTEXT` until a reviewed
+backend commit is pinned. Batch discovery checks the required tools and returns
+`backend_upgrade_required` before any writes when capabilities are missing.
+
 The Python bridge preserves native MCP results, uses a fresh session for each
 call, and bounds the total call to 210 seconds by default. Go serializes
 account operations and has a three-minute tool deadline. Reminders outages do
@@ -454,6 +460,62 @@ an unconfigured backend return a safe configuration error;
 | `sync_reminders` | Refresh the cache; `full=true` requests a full sync. |
 | `list_reminder_participants` | Read accepted collaborators, available contact details and permissions. |
 | `assign_reminder` | Assign/reassign by participant ID, or remove with `clear=true`. |
+| `list_reminder_sections` | Discover native section headings in their current order. |
+| `create_reminder_section` | Create a native section in an existing list. |
+| `move_reminder` | Change parent/section or place a subtree before/after a sibling. |
+| `reorder_reminders` | Set manual order with every sibling ID, including completed tasks. |
+| `batch_update_reminders` | Preview or apply a complete tree with sections, new tasks, field changes and manual order. |
+
+### Declarative Reminders batches
+
+`batch_update_reminders` accepts the desired tree for one existing list.
+`reminders` holds unsectioned top-level tasks; `sections` holds native headings
+and their top-level tasks. Each task's `subtasks` array defines its children
+in manual order. Existing tasks use their exact `id`; new tasks omit `id` and
+require `title`. Optional `title`, `due`, `notes` and `priority` change existing
+fields. Omitted fields preserve their values, completion and assignment.
+
+Read `list_reminders` with `include_completed=true` and include **every existing
+reminder exactly once**, including completed tasks. Include all existing
+sections in their current order with `id` only; append new sections with
+`title` and no `id`. Section renaming/reordering is unsupported. The batch never
+deletes tasks, changes completion or assigns participants. Input is bounded to
+500 total reminders, 100 sections and 20 task levels. Lists larger than the
+reminder bound must use individual tools.
+
+For a list with exactly two existing reminders and no existing sections:
+
+```json
+{
+  "list_id": "List/EXACT-LIST-ID",
+  "dry_run": true,
+  "reminders": [{"id": "Reminder/EXISTING-ONE"}],
+  "sections": [{
+    "title": "Project",
+    "reminders": [{
+      "id": "Reminder/EXISTING-TWO",
+      "priority": "high",
+      "subtasks": [{"title": "Prepare outline", "due": "2026-10-02"}]
+    }]
+  }]
+}
+```
+
+`dry_run=true` is the default: discovery and current data are read, the full
+structure is validated, and the planned operations are returned without writes.
+After approval, submit the same structure with `dry_run=false`; current data is
+checked again before applying it. New section/task IDs are resolved within the
+batch and returned in `ids`, keyed by their input paths.
+
+The Python batch uses one fresh Go MCP session and one total deadline for all
+steps. Its writes are **sequential, not atomic**; each backend operation retains
+its native zone and permission checks. The Go service serializes individual
+operations, so another client can change data between batch steps. No rollback
+or automatic retry is attempted. On error, `isError=true` accompanies a
+structured result containing confirmed operations and their original MCP
+results, created IDs, the failed operation, and an indication that its write
+may be uncertain. Inspect current data and construct a fresh target before
+retrying; replaying a batch containing new tasks can duplicate them.
 
 ### Recurring events
 
