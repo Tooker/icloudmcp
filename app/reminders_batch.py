@@ -6,13 +6,13 @@ from dataclasses import dataclass
 from datetime import date
 import json
 from typing import Any, Literal, TYPE_CHECKING
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from mcp_types import CallToolResult, TextContent
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.reminders import RemindersError
-from app.timing import measure_phase
+from app.timing import call_id, measure_phase
 
 if TYPE_CHECKING:
     from app.reminders import GoRemindersService
@@ -255,11 +255,15 @@ def _resolve(value: Any, identities: dict[str, str]) -> Any:
 
 
 async def run_batch(service: GoRemindersService, arguments: dict[str, Any]) -> CallToolResult:
+    request_id = call_id()
+    if request_id == "none":
+        request_id = uuid4().hex[:16]
     try:
         structure = BatchStructure.model_validate(arguments)
         nodes = _flatten(structure)
-    except ValidationError:
-        raise RemindersError("invalid_argument") from None
+    except (ValidationError, RemindersError):
+        raise RemindersError("invalid_argument", operation="batch_update_reminders",
+                             request_id=request_id, write_status="not_sent") from None
 
     operations: list[Operation] = []
     identities: dict[str, str] = {}
@@ -268,6 +272,7 @@ async def run_batch(service: GoRemindersService, arguments: dict[str, Any]) -> C
     failure: RemindersError | None = None
     try:
         async with service.tool_session() as session:
+            request_id = session.request_id
             # Discovery is read-only. Missing structural tools fail before writes.
             tools = await service.discover(session)
             names = set(tools)
@@ -322,6 +327,7 @@ async def run_batch(service: GoRemindersService, arguments: dict[str, Any]) -> C
         "ids": identities,
     }
     if failure:
+        failure.details.setdefault("request_id", request_id)
         failure.details.setdefault("operation", pending.tool if pending else "batch_update_reminders")
         failure.details.setdefault("write_status", "unknown" if pending else "not_sent")
         payload["error"] = {**failure.details, "code": failure.code, "message": str(failure)}

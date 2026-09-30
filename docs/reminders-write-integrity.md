@@ -157,3 +157,13 @@ removed. The normal running Compose services were not restarted by this work.
 
 The default backend deployment still needs the combined reviewed upstream
 changes. The local paired build does not publish or activate a new release.
+
+Combined-source verification on 2026-10-01: 307 Python tests passed and three
+opt-in live tests skipped; all Go tests passed, including native-section keyed
+recovery and 100 write lifecycles. After the final validation-diagnostics change,
+55 affected Python tests passed. Both local paired Docker images built. A private
+container contract check matched all fourteen Go input schemas and read/write
+annotations to Python, discovered the local batch tool, and verified that keyed
+create and batch authentication failures remain `not_sent`. No account session
+was mounted for that contract check and no live mutations were performed by it.
+The contract containers/network were removed; running services were not restarted.

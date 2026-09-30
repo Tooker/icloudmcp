@@ -426,3 +426,6 @@ def test_invalid_or_duplicate_creation_keys_fail_before_connecting(backend, keys
     arguments["reminders"].extend({"title": "New", "client_request_id": key} for key in keys)
     result = invoke(service, {**arguments, "dry_run": False})
     assert result.is_error and state["sessions"] == state["writes"] == 0
+    assert result.structured_content["write_status"] == "not_sent"
+    assert result.structured_content["operation"] == "batch_update_reminders"
+    assert result.structured_content["request_id"]
