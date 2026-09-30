@@ -1,10 +1,11 @@
 # Reminders write integrity fixes
 
-This work addresses the SmokeTest report independently of the concurrent work on
-native sections, parent changes and manual ordering. The existing Go checkout and
-running Compose services are left intact. The reviewable backend changes are in
-`patches/reminders-write-integrity.patch`, based on commit
-`f4d480349fa6a15d651e2c38444a40811c2d9233`.
+The SmokeTest fixes are merged into the adjacent Go checkout together with native
+sections, parent changes and manual ordering. The Python batch-update worktree
+is also merged, with safe per-step diagnostics and optional keyed creation.
+`docker-compose.release.yml` builds the combined local pair. The historical
+`patches/reminders-write-integrity.patch` reproduces the isolated fixes against
+`f4d480349fa6a15d651e2c38444a40811c2d9233`; it is not the combined source.
 
 ## Findings
 
@@ -98,12 +99,16 @@ existing behavior and must be inspected after an uncertain error.
 
 ## Integration with concurrent backend work
 
-Apply or merge the patch into the backend branch that implements native structure
-operations. In particular, retain the new structure fields in `CreateInput` and
-include them in the keyed request hash. Reparenting, sections and ordering remain
-that branch's responsibility. Successful keyed creates must reserve the same
-record identity before any multi-record structure writes; partial structure
-writes must continue to report an unknown outcome.
+The combined backend retains every structure field in `CreateInput`, including
+`section_id` in the keyed request hash. Organized creates use the reserved record
+identity in the atomic reminder/list metadata request. Recovery tests verify the
+section, exact title and a single manual-order entry after a lost response.
+Incomplete, mixed, duplicate or foreign record confirmations remain unknown.
+
+The Python batch uses the same session and diagnostics implementation as single
+calls, with one total deadline. It validates any creation keys and discovers all
+required capabilities before writing. Confirmed native results and created IDs
+survive a later failure; the failing step's commit evidence stays explicit.
 
 For reproducing these fixes against the pinned baseline, an explicit Compose
 overlay builds the upstream source with the local patch and runs its Go tests:
@@ -113,10 +118,10 @@ docker compose -f docker-compose.yml -f docker-compose.reminders-write-fixes.yml
 docker compose -p icloudmcp-write-verify -f docker-compose.yml -f docker-compose.reminders-write-fixes.yml build reminders icloud-cruncher
 ```
 
-This overlay pins the baseline intentionally and does not include the other
-agent's new backend structure tools. Merge both changes into a reviewed backend
-commit and update the normal Compose pin for the combined release. Do not replace
-the other agent's development backend with this baseline overlay.
+This overlay pins the historical baseline and excludes the native structure
+tools. Use `docker-compose.release.yml` for the combined source. The normal
+Compose pin remains the published native-structure 1.1.0 commit; publishing and
+pinning the newer combined backend is a separate release step.
 
 ## Verification
 
@@ -151,5 +156,4 @@ The temporary test containers, network and copied account session/cache were
 removed. The normal running Compose services were not restarted by this work.
 
 The default backend deployment still needs the combined reviewed upstream
-changes. The supplied overlay reproduces the isolated baseline fix; it does not
-publish or activate a combined native-structure release.
+changes. The local paired build does not publish or activate a new release.

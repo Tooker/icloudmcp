@@ -328,9 +328,10 @@ REMINDERS_BUILD_CONTEXT=../icloud-reminders-cli
 ```
 
 Native sections, moving, ordering and `batch_update_reminders` require a Go
-backend with the structural tools; the current `f4d4803` pin predates them.
-Use an updated backend checkout via `REMINDERS_BUILD_CONTEXT` until a reviewed
-backend commit is pinned. Batch discovery checks the required tools and returns
+backend with the structural tools, included in the published `f68c6f2` pin.
+The combined local source build also supplies the write-integrity fixes and
+optional keyed creation described in [the write-integrity notes](docs/reminders-write-integrity.md).
+Batch discovery checks the required tools and returns
 `backend_upgrade_required` before any writes when capabilities are missing.
 
 The Python bridge preserves native MCP results, uses a fresh session for each
@@ -460,10 +461,10 @@ an unconfigured backend return a safe configuration error;
 | `sync_reminders` | Refresh the cache; `full=true` requests a full sync. |
 | `list_reminder_participants` | Read accepted collaborators, available contact details and permissions. |
 | `assign_reminder` | Assign/reassign by participant ID, or remove with `clear=true`. |
-<<<<<<< HEAD
 | `list_reminder_sections` | Discover native section headings and IDs in section order. |
 | `create_reminder_section` | Create a native section heading in an existing list. |
 | `move_reminder` | Indent/outdent, move into/out of sections, or place before/after a sibling; keep the subtree together. |
+| `batch_update_reminders` | Preview or apply a complete tree with sections, new tasks, field changes and manual order. |
 | `reorder_reminders` | Set the manual order of every sibling in a list, section or parent, including completed reminders. |
 
 ### Reminders sections, subtasks and ordering (1.1.0)
@@ -524,13 +525,6 @@ The release override explicitly selects the adjacent Go source; the main
 Compose file pins the published 1.1.0 backend commit. Use the same two Compose files
 when starting the locally built pair. Building images does not recreate the
 running services.
-=======
-| `list_reminder_sections` | Discover native section headings in their current order. |
-| `create_reminder_section` | Create a native section in an existing list. |
-| `move_reminder` | Change parent/section or place a subtree before/after a sibling. |
-| `reorder_reminders` | Set manual order with every sibling ID, including completed tasks. |
-| `batch_update_reminders` | Preview or apply a complete tree with sections, new tasks, field changes and manual order. |
-
 ### Declarative Reminders batches
 
 `batch_update_reminders` accepts the desired tree for one existing list.
@@ -539,6 +533,10 @@ and their top-level tasks. Each task's `subtasks` array defines its children
 in manual order. Existing tasks use their exact `id`; new tasks omit `id` and
 require `title`. Optional `title`, `due`, `notes` and `priority` change existing
 fields. Omitted fields preserve their values, completion and assignment.
+New tasks may also supply a UUID `client_request_id` for keyed creation on the
+combined backend. Keys must be unique within the target and are checked against
+the backend schema before any writes. Preserve a key and its exact arguments
+when recovering its creation; a key does not make the entire batch atomic.
 
 Read `list_reminders` with `include_completed=true` and include **every existing
 reminder exactly once**, including completed tasks. Include all existing
@@ -579,9 +577,9 @@ operations, so another client can change data between batch steps. No rollback
 or automatic retry is attempted. On error, `isError=true` accompanies a
 structured result containing confirmed operations and their original MCP
 results, created IDs, the failed operation, and an indication that its write
-may be uncertain. Inspect current data and construct a fresh target before
+may be uncertain. The failed step retains safe `write_status`, `retry_class`,
+request correlation and available upstream diagnostics. Inspect current data and construct a fresh target before
 retrying; replaying a batch containing new tasks can duplicate them.
->>>>>>> codex/reminders-batch-update
 
 ### Recurring events
 

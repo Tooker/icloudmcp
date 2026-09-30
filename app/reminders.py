@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 import logging
 import re
 from typing import Any
@@ -13,7 +14,7 @@ from uuid import UUID, uuid4
 import httpx2
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
-from mcp_types import CallToolResult, TextContent
+from mcp_types import CallToolResult, PaginatedRequestParams, TextContent, Tool
 
 from app.config import RemindersConfig
 from app.timing import call_id, measure_phase
@@ -24,7 +25,7 @@ REMINDER_TOOLS = frozenset({
     "update_reminder", "complete_reminder", "delete_reminder", "sync_reminders",
     "list_reminder_participants", "assign_reminder",
     "list_reminder_sections", "create_reminder_section", "move_reminder", "reorder_reminders",
-<<<<<<< HEAD
+    "batch_update_reminders",
 })
 
 _PUBLIC_ERRORS = {
@@ -34,12 +35,7 @@ _PUBLIC_ERRORS = {
     "idempotency_conflict": "This client_request_id was already used with different creation arguments. Use the original arguments or a new ID.",
     "local_state_failed": "The creation succeeded but local request state could not be saved. Recover using the same client_request_id.",
     "unsupported_backend": "This Go backend does not support client_request_id. Upgrade it before making a keyed creation.",
-=======
-    "batch_update_reminders",
-})
-
-_PUBLIC_ERRORS = {
->>>>>>> codex/reminders-batch-update
+    "backend_upgrade_required": "The Go backend lacks tools required for this structure. Upgrade it before applying the batch. No write was attempted.",
     "not_found": "Reminder, list or section not found. Refresh the available lists and reminders and use their exact IDs.",
     "not_shared": "Only reminders in a shared list can be assigned to a participant.",
     "permission_denied": "The current participant cannot modify this shared list.",
@@ -48,14 +44,8 @@ _PUBLIC_ERRORS = {
         "Enable iCloud web data access, stop the Go backend, run reminders auth --approve-web-access "
         "with its data directory and approve on a trusted device, then start it again."
     ),
-<<<<<<< HEAD
-    "invalid_argument": "Reminders rejected the arguments. Check exact IDs, dates, priority, pagination, same-list parent/section references and ordering anchors; assignment needs one accepted participant ID from this list or clear=true.",
+    "invalid_argument": "Reminders rejected the arguments. Check exact IDs, dates, priority, pagination and same-list structure references. Batches require every existing reminder, including completed tasks, and every existing section in current order. Assignment needs one accepted participant ID from this list or clear=true.",
     "unsupported_structure": "This list uses an unsupported structure format. No write was attempted; refresh or inspect the list in Apple Reminders.",
-=======
-    "invalid_argument": "Reminders rejected the arguments. Check exact IDs, dates, priority, pagination, same-list parent/section references and ordering anchors. Batches require every existing reminder, including completed tasks, and all existing sections in current order, within the documented bounds. Assignment needs one accepted participant ID from this list or clear=true.",
-    "unsupported_structure": "This list uses an unsupported structure format. No write was attempted; refresh or inspect the list in Apple Reminders.",
-    "backend_upgrade_required": "The Go backend lacks tools required for this structure. Upgrade the backend before applying the batch. No write was attempted.",
->>>>>>> codex/reminders-batch-update
     "write_result_unknown": "iCloud did not confirm the complete write. Inspect current reminders and sections before retrying.",
     "icloud_write_failed": "iCloud rejected the write. Inspect current reminders and sections before retrying.",
     "request_timeout": "Request ended before completion. A write may have succeeded; inspect the reminder before retrying.",
@@ -135,7 +125,7 @@ def _upstream_error(result: CallToolResult, operation: str, request_id: str) -> 
     status = "unknown" if mutation else None
     retry = "retryable_after_read" if mutation else "retryable_safe"
     if code in {"invalid_argument", "not_found", "not_shared", "permission_denied", "unsupported_structure",
-                "idempotency_conflict"}:
+                "idempotency_conflict", "backend_upgrade_required", "unsupported_backend"}:
         status, retry = "not_sent" if mutation else None, "not_retryable"
     details = result.structured_content
     safe: dict[str, Any] = {}
@@ -190,58 +180,56 @@ def _contains_timeout(error: BaseException) -> bool:
     return False
 
 
-def _reminders_error_code(error: BaseException) -> str | None:
-    # AnyIO may wrap an application error thrown inside a live MCP session.
-    if isinstance(error, RemindersError):
-        return error.code
-    if isinstance(error, BaseExceptionGroup):
-        return next((code for item in error.exceptions if (code := _reminders_error_code(item))), None)
-    return None
+@dataclass
+class _RemindersSession:
+    request_id: str
+    operation: str
+    client: ClientSession | None = None
+    dispatched: bool = False
+    confirmed: bool = False
+    response_status: int | None = None
+    tools: dict[str, Tool] | None = None
 
 
 class GoRemindersService:
     def __init__(self, config: RemindersConfig) -> None:
         self.config = config
 
-    async def call_tool(self, name: str, arguments: dict[str, Any]) -> CallToolResult:
-        request_id = call_id()
-        if request_id == "none":
-            request_id = uuid4().hex[:16]
+    @staticmethod
+    def _validate(name: str, arguments: dict[str, Any], request_id: str) -> None:
         if name not in REMINDER_TOOLS:
-<<<<<<< HEAD
-            raise RemindersError("invalid_argument", operation=name, request_id=request_id)
+            raise RemindersError("invalid_argument", operation=name, request_id=request_id,
+                                 write_status="not_sent")
         if name == "create_reminder" and "client_request_id" in arguments:
             try:
                 UUID(arguments["client_request_id"])
             except (ValueError, TypeError, AttributeError):
                 raise RemindersError("invalid_argument", operation=name, request_id=request_id,
                                      write_status="not_sent") from None
-=======
-            raise RemindersError("invalid_argument")
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> CallToolResult:
+        self._validate(name, arguments, call_id())
         if name == "batch_update_reminders":
             from app.reminders_batch import run_batch
 
             return await run_batch(self, arguments)
-        async with self.tool_session() as session:
+        async with self.tool_session(operation=name) as session:
             return await self.invoke(session, name, arguments)
 
     @asynccontextmanager
-    async def tool_session(self):
+    async def tool_session(self, *, operation: str = "batch_update_reminders"):
         """One fresh session and one total deadline, including every batch step."""
->>>>>>> codex/reminders-batch-update
+        request_id = call_id()
+        if request_id == "none":
+            request_id = uuid4().hex[:16]
+        state = _RemindersSession(request_id, operation)
         headers = {"Authorization": f"Bearer {self.config.token}"} if self.config.token else {}
-        dispatched = False
-        response_status = None
 
         async def record_response(response: httpx2.Response) -> None:
-            nonlocal response_status
             if response.request.method == "POST" and response.status_code >= 400:
-                response_status = response.status_code
+                state.response_status = response.status_code
 
         try:
-            # A fresh MCP session per call survives backend restarts and avoids
-            # sharing AnyIO task groups across incoming request tasks. Go is
-            # stateless; neither a startup connection nor write retries are needed.
             with quiet_transport_logs():
                 async with asyncio.timeout(self.config.timeout_seconds):
                     async with httpx2.AsyncClient(
@@ -259,52 +247,64 @@ class GoRemindersService:
                             ) as session:
                                 with measure_phase("reminders_mcp_connect"):
                                     await session.initialize()
-<<<<<<< HEAD
-                                if name == "create_reminder" and arguments.get("client_request_id") is not None:
-                                    with measure_phase("reminders_mcp_capabilities"):
-                                        available = await session.list_tools()
-                                    create_tool = next((tool for tool in available.tools if tool.name == name), None)
-                                    if create_tool is None or "client_request_id" not in create_tool.input_schema.get("properties", {}):
-                                        raise RemindersError("unsupported_backend", operation=name, request_id=request_id,
-                                                             write_status="not_sent")
-                                with measure_phase("reminders_mcp_call"):
-                                    dispatched = True
-                                    result = await session.call_tool(name, arguments)
+                                state.client = session
+                                yield state
         except RemindersError:
             raise
         except Exception as error:
             known = next((item for item in _exceptions(error) if isinstance(item, RemindersError)), None)
             if known is not None:
                 raise known from None
-            status = response_status or _http_status(error)
+            status = state.response_status or _http_status(error)
             code = "request_timeout" if _contains_timeout(error) else "backend_unavailable"
             if status in {401, 403}:
                 code = "backend_auth_failed"
-            mutation = name not in READ_TOOLS
-            # Only a failure before tools/call proves the mutation wasn't sent.
-            write_status = ("unknown" if dispatched else "not_sent") if mutation else None
-            retry = "retryable_after_read" if mutation and dispatched else "retryable_safe"
+            mutation = state.operation not in READ_TOOLS
+            write_status = None
+            if mutation:
+                write_status = "succeeded" if state.confirmed else "unknown" if state.dispatched else "not_sent"
+            retry = "retryable_after_read" if mutation and state.dispatched else "retryable_safe"
             if code == "backend_auth_failed":
                 retry = "not_retryable"
-            raise RemindersError(code, operation=name, request_id=request_id, write_status=write_status,
-                                 retry_class=retry, http_status=status) from None
-=======
-                                yield session
-        except RemindersError:
-            raise
-        except Exception as error:
-            code = "request_timeout" if _contains_timeout(error) else _reminders_error_code(error) or "backend_unavailable"
-            raise RemindersError(code) from None
+            raise RemindersError(code, operation=state.operation, request_id=request_id,
+                                 write_status=write_status, retry_class=retry, http_status=status) from None
 
     @staticmethod
-    async def invoke(session: ClientSession, name: str, arguments: dict[str, Any]) -> CallToolResult:
+    async def discover(session: _RemindersSession) -> dict[str, Tool]:
+        if session.tools is not None:
+            return session.tools
+        available: dict[str, Tool] = {}
+        cursor = None
+        for _ in range(8):
+            with measure_phase("reminders_mcp_capabilities"):
+                page = await session.client.list_tools(params=PaginatedRequestParams(cursor=cursor) if cursor else None)
+            available.update({tool.name: tool for tool in page.tools})
+            cursor = page.next_cursor
+            if not cursor:
+                session.tools = available
+                return available
+        raise RemindersError("backend_protocol_error", operation=session.operation,
+                             request_id=session.request_id, write_status="not_sent")
+
+    async def invoke(self, session: _RemindersSession, name: str, arguments: dict[str, Any]) -> CallToolResult:
+        session.operation = name
+        session.dispatched = session.confirmed = False
+        session.response_status = None
+        self._validate(name, arguments, session.request_id)
+        if name == "create_reminder" and arguments.get("client_request_id") is not None:
+            available = await self.discover(session)
+            tool = available.get(name)
+            if tool is None or "client_request_id" not in tool.input_schema.get("properties", {}):
+                raise RemindersError("unsupported_backend", operation=name, request_id=session.request_id,
+                                     write_status="not_sent")
         with measure_phase("reminders_mcp_call"):
-            result = await session.call_tool(name, arguments)
->>>>>>> codex/reminders-batch-update
+            session.dispatched = True
+            result = await session.client.call_tool(name, arguments)
         if not isinstance(result, CallToolResult):
-            raise RemindersError("backend_protocol_error", operation=name, request_id=request_id,
+            raise RemindersError("backend_protocol_error", operation=name, request_id=session.request_id,
                                  write_status="unknown" if name not in READ_TOOLS else None,
                                  retry_class="retryable_after_read" if name not in READ_TOOLS else "retryable_safe")
         if result.is_error:
-            raise _upstream_error(result, name, request_id)
+            raise _upstream_error(result, name, session.request_id)
+        session.confirmed = True
         return result

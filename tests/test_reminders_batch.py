@@ -33,6 +33,7 @@ def backend(monkeypatch):
         "tools": set(REMINDER_TOOLS) - {"batch_update_reminders"},
         "calls": [], "sessions": 0, "writes": 0, "delay": 0,
         "fail_write": None, "failure_code": "icloud_write_failed", "bad_create_result": False,
+        "failure_details": None, "supports_key": False,
     }
 
     async def handle(request):
@@ -49,7 +50,8 @@ def backend(monkeypatch):
             payload = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
                        "serverInfo": {"name": "simulated-go", "version": "1"}}
         elif method == "tools/list":
-            payload = {"tools": [{"name": name, "inputSchema": {"type": "object", "properties": {}}}
+            payload = {"tools": [{"name": name, "inputSchema": {"type": "object", "properties":
+                                  {"client_request_id": {"type": "string"}} if name == "create_reminder" and state["supports_key"] else {}}}
                                  for name in sorted(state["tools"])]}
         else:
             assert method == "tools/call"
@@ -61,6 +63,8 @@ def backend(monkeypatch):
                 state["writes"] += 1
                 if state["writes"] == state["fail_write"]:
                     payload = {"isError": True, "content": [{"type": "text", "text": f'{state["failure_code"]}: {PRIVATE}'}]}
+                    if state["failure_details"] is not None:
+                        payload["structuredContent"] = state["failure_details"]
                     return httpx2.Response(200, json={"jsonrpc": "2.0", "id": message["id"], "result": payload})
             if name == "list_reminder_lists":
                 data = {"lists": [{"id": "list", "name": PRIVATE}]}
@@ -371,3 +375,54 @@ def test_mcp_schema_has_recursive_typed_nodes_and_write_annotations():
     assert tool.input_schema["$defs"]["ReminderNode"]["properties"]["subtasks"]["items"]["$ref"]
     assert tool.annotations.destructive_hint and not tool.annotations.idempotent_hint
     assert not tool.annotations.read_only_hint
+
+
+@pytest.mark.parametrize("write_status,retry_class", [("failed", "not_retryable"), ("unknown", "retryable_after_read"), ("not_sent", "retryable_safe")])
+def test_batch_preserves_step_commit_evidence_and_does_not_retry(backend, write_status, retry_class):
+    service, state = backend
+    state["fail_write"] = 4
+    state["failure_details"] = {
+        "error_code": "icloud_write_failed", "write_status": write_status,
+        "retry_class": retry_class, "upstream_status": 503,
+        "upstream_error_code": "SERVICE_UNAVAILABLE", "secret": PRIVATE,
+    }
+    result = invoke(service, {**new_tree(), "dry_run": False})
+    data = result.structured_content
+    assert result.is_error and data["completed_operations"] == 3
+    assert data["error"]["write_status"] == write_status
+    assert data["error"]["retry_class"] == retry_class
+    assert data["error"]["operation"] == "move_reminder"
+    assert data["error"]["upstream_status"] == 503
+    assert data["error"]["upstream_error_code"] == "SERVICE_UNAVAILABLE"
+    assert data["write_result_unknown"] is (write_status == "unknown")
+    assert data["inspect_before_retry"] and state["writes"] == 4
+    assert "secret" not in data["error"]
+
+
+@pytest.mark.parametrize("supports_key", [False, True])
+def test_keyed_batch_checks_backend_schema_before_creating_sections(backend, supports_key):
+    service, state = backend
+    state["supports_key"] = supports_key
+    arguments = new_tree()
+    key = "2512a2d6-fda4-45d1-9f64-06b6b329a704"
+    arguments["sections"][0]["reminders"][0]["client_request_id"] = key
+    result = invoke(service, {**arguments, "dry_run": False})
+    if supports_key:
+        assert not result.is_error
+        creates = [args for name, args in state["calls"] if name == "create_reminder"]
+        assert creates[0]["client_request_id"] == key
+        assert len(creates) == 2 and state["sessions"] == 1
+    else:
+        assert result.is_error
+        assert result.structured_content["error"]["error_code"] == "unsupported_backend"
+        assert result.structured_content["error"]["write_status"] == "not_sent"
+        assert state["writes"] == 0
+
+
+@pytest.mark.parametrize("keys", [["invalid"], ["2512a2d6-fda4-45d1-9f64-06b6b329a704"] * 2])
+def test_invalid_or_duplicate_creation_keys_fail_before_connecting(backend, keys):
+    service, state = backend
+    arguments = current_tree()
+    arguments["reminders"].extend({"title": "New", "client_request_id": key} for key in keys)
+    result = invoke(service, {**arguments, "dry_run": False})
+    assert result.is_error and state["sessions"] == state["writes"] == 0

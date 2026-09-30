@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Merge declarative `batch_update_reminders` with typed recursive tasks and
+  native sections, default preview, complete coverage validation and sequential
+  application through one bounded Go MCP session.
+- Preserve confirmed per-operation results and created IDs on partial failure,
+  including the failed step's safe write and retry diagnostics.
+- Support optional creation keys on new batch tasks; validate keys and backend
+  capabilities before any writes. Never automatically replay a batch.
+- Combine the local Go title/completion fixes, write confirmations and durable
+  keyed creation with the native section/order implementation.
+
 ## 1.1.0 — 2026-10-01
 
 - Native Reminders section discovery and creation through the Go backend and

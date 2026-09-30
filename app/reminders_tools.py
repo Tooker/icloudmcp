@@ -11,12 +11,8 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import CallToolResult, ToolAnnotations
 
-<<<<<<< HEAD
 from app.reminders import GoRemindersService, READ_TOOLS, RemindersError
-=======
-from app.reminders import GoRemindersService, RemindersError
 from app.reminders_batch import ReminderNode, ReminderSection
->>>>>>> codex/reminders-batch-update
 from app.timing import call_id, tool_trace
 
 
@@ -56,12 +52,11 @@ def register_reminders_tools(server: MCPServer, service: GoRemindersService | No
                 outcome = "error" if result.is_error else "ok"
                 payload = result.structured_content
                 if isinstance(payload, dict):
-<<<<<<< HEAD
-=======
                     if name == "batch_update_reminders":
-                        outcome = payload.get("error", {}).get("code", outcome)
+                        error = payload.get("error", {})
+                        outcome = error.get("code", outcome)
+                        diagnostic = error
                         count = payload.get("completed_operations")
->>>>>>> codex/reminders-batch-update
                     for key in ("reminders", "lists", "participants", "sections"):
                         if isinstance(payload.get(key), list):
                             count = len(payload[key])
@@ -110,12 +105,8 @@ def register_reminders_tools(server: MCPServer, service: GoRemindersService | No
         section_id: str | None = None, view: Literal["flat", "tree"] = "flat",
     ) -> CallToolResult:
         return await call("list_reminders", list_id=list_id, parent_id=parent_id, query=query,
-<<<<<<< HEAD
                           include_completed=include_completed, limit=limit, offset=offset, section_id=section_id,
                           view=None if view == "flat" else view)
-=======
-                          include_completed=include_completed, limit=limit, offset=offset, section_id=section_id, view=view)
->>>>>>> codex/reminders-batch-update
 
     @server.tool(annotations=annotations(True), description="Read one reminder by its exact ID, including notes and list/parent references.")
     async def get_reminder(id: str) -> CallToolResult:
@@ -124,29 +115,19 @@ def register_reminders_tools(server: MCPServer, service: GoRemindersService | No
     @server.tool(annotations=annotations(False, idempotent=False), description=(
         "Create a reminder in an existing list using its exact list_id; optionally set a parent_id "
         "in the same list, a section_id from list_reminder_sections, a due date (YYYY-MM-DD), notes and priority. "
-<<<<<<< HEAD
         "Subtasks inherit their parent's section. Optionally supply a UUID client_request_id for durable "
         "idempotency on an upgraded backend; recover an uncertain creation with the same ID and identical arguments. "
         "An older backend rejects keyed requests before writing. Never blindly retry an unkeyed uncertain write."
-=======
-        "Subtasks inherit their parent's section. Never automatically retry an uncertain write."
->>>>>>> codex/reminders-batch-update
     ))
     async def create_reminder(
         title: str, list_id: str, due: str | None = None,
         priority: Literal["none", "low", "medium", "high"] | None = None,
         notes: str | None = None, parent_id: str | None = None, section_id: str | None = None,
-<<<<<<< HEAD
         client_request_id: str | None = None,
     ) -> CallToolResult:
         return await call("create_reminder", title=title, list_id=list_id, due=due,
                           priority=priority, notes=notes, parent_id=parent_id, section_id=section_id,
                           client_request_id=client_request_id)
-=======
-    ) -> CallToolResult:
-        return await call("create_reminder", title=title, list_id=list_id, due=due,
-                          priority=priority, notes=notes, parent_id=parent_id, section_id=section_id)
->>>>>>> codex/reminders-batch-update
 
     @server.tool(annotations=annotations(False, destructive=True), description=(
         "Update specified nonempty reminder fields by exact ID. priority=none clears priority. "
@@ -191,10 +172,6 @@ def register_reminders_tools(server: MCPServer, service: GoRemindersService | No
     async def assign_reminder(id: str, participant_id: str | None = None, clear: bool = False) -> CallToolResult:
         return await call("assign_reminder", id=id, participant_id=participant_id, clear=clear)
 
-<<<<<<< HEAD
-=======
-
->>>>>>> codex/reminders-batch-update
     @server.tool(annotations=annotations(True), description=(
         "List native Apple Reminders sections in one exact list_id, in their section order. "
         "Use the returned section IDs for creation, moving and filtering; section headings are not reminders."
@@ -237,8 +214,6 @@ def register_reminders_tools(server: MCPServer, service: GoRemindersService | No
     ) -> CallToolResult:
         return await call("reorder_reminders", list_id=list_id, reminder_ids=reminder_ids,
                           parent_id=parent_id, section_id=section_id)
-<<<<<<< HEAD
-=======
 
     @server.tool(annotations=annotations(False, destructive=True, idempotent=False), description=(
         "Apply a complete target structure to one existing Reminders list in one call. reminders contains "
@@ -264,4 +239,3 @@ def register_reminders_tools(server: MCPServer, service: GoRemindersService | No
             sections=[section.model_dump(exclude_none=True) for section in sections or []],
             dry_run=dry_run,
         )
->>>>>>> codex/reminders-batch-update

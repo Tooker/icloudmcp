@@ -6,8 +6,9 @@ from dataclasses import dataclass
 from datetime import date
 import json
 from typing import Any, Literal, TYPE_CHECKING
+from uuid import UUID
 
-from mcp_types import CallToolResult, PaginatedRequestParams, TextContent
+from mcp_types import CallToolResult, TextContent
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.reminders import RemindersError
@@ -26,6 +27,7 @@ class ReminderNode(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
 
     id: str | None = Field(default=None, description="Exact existing reminder ID; omit to create a new reminder with title.")
+    client_request_id: str | None = Field(default=None, description="Optional UUID idempotency key for a new reminder; preserve it when recovering that creation.")
     title: str | None = Field(default=None, description="Required for a new reminder; changes an existing title when supplied.")
     due: str | None = Field(default=None, description="YYYY-MM-DD; omit to preserve an existing due date. Clearing is unsupported.")
     priority: Literal["none", "low", "medium", "high"] | None = None
@@ -83,6 +85,7 @@ def _flatten(structure: BatchStructure) -> list[tuple[str, ReminderNode, str, st
     nodes: list[tuple[str, ReminderNode, str, str]] = []
     ids: set[str] = set()
     section_ids: set[str] = set()
+    request_ids: set[UUID] = set()
 
     def visit(items: list[ReminderNode], prefix: str, parent: str, section: str, depth: int) -> None:
         if depth > MAX_DEPTH:
@@ -95,10 +98,20 @@ def _flatten(structure: BatchStructure) -> list[tuple[str, ReminderNode, str, st
             if node.id is None:
                 if node.title is None:
                     _invalid()
+                if node.client_request_id is not None:
+                    try:
+                        key = UUID(node.client_request_id)
+                    except ValueError:
+                        _invalid()
+                    if key in request_ids:
+                        _invalid()
+                    request_ids.add(key)
             elif not node.id.strip() or node.id in ids:
                 _invalid()
             else:
                 ids.add(node.id)
+                if node.client_request_id is not None:
+                    _invalid()
             if node.notes == "":
                 _invalid()
             if node.due is not None:
@@ -256,17 +269,8 @@ async def run_batch(service: GoRemindersService, arguments: dict[str, Any]) -> C
     try:
         async with service.tool_session() as session:
             # Discovery is read-only. Missing structural tools fail before writes.
-            names: set[str] = set()
-            cursor = None
-            for _ in range(8):
-                with measure_phase("reminders_mcp_discover"):
-                    tools = await session.list_tools(params=PaginatedRequestParams(cursor=cursor) if cursor else None)
-                names.update(tool.name for tool in tools.tools)
-                cursor = tools.next_cursor
-                if not cursor:
-                    break
-            else:
-                raise RemindersError("backend_unavailable")
+            tools = await service.discover(session)
+            names = set(tools)
             if not {"list_reminder_lists", "list_reminder_sections", "list_reminders"} <= names:
                 raise RemindersError("backend_upgrade_required")
             lists = _items(await service.invoke(session, "list_reminder_lists", {}), "lists")
@@ -283,6 +287,12 @@ async def run_batch(service: GoRemindersService, arguments: dict[str, Any]) -> C
                 operations, identities = _plan(structure, nodes, current, sections)
             if not {operation.tool for operation in operations} <= names:
                 raise RemindersError("backend_upgrade_required")
+            for operation in operations:
+                if operation.tool == "create_reminder" and "client_request_id" in operation.arguments:
+                    service._validate(operation.tool, operation.arguments, session.request_id)
+                    if "client_request_id" not in tools[operation.tool].input_schema.get("properties", {}):
+                        raise RemindersError("unsupported_backend", operation=operation.tool,
+                                             request_id=session.request_id, write_status="not_sent")
             if not structure.dry_run:
                 for operation in operations:
                     resolved = {key: _resolve(value, identities) for key, value in operation.arguments.items()}
@@ -292,7 +302,9 @@ async def run_batch(service: GoRemindersService, arguments: dict[str, Any]) -> C
                         data = result.structured_content
                         id = data.get("id") if isinstance(data, dict) else None
                         if not isinstance(id, str) or not id or id in identities.values():
-                            raise RemindersError("write_result_unknown")
+                            raise RemindersError("write_result_unknown", operation=operation.tool,
+                                                 request_id=session.request_id, write_status="unknown",
+                                                 retry_class="retryable_after_read")
                         identities[operation.target] = id
                     completed.append({**operation.summary(), "result": result.model_dump(by_alias=True, exclude_none=True)})
                     pending = None
@@ -310,9 +322,11 @@ async def run_batch(service: GoRemindersService, arguments: dict[str, Any]) -> C
         "ids": identities,
     }
     if failure:
-        payload["error"] = {"code": failure.code, "message": str(failure)}
+        failure.details.setdefault("operation", pending.tool if pending else "batch_update_reminders")
+        failure.details.setdefault("write_status", "unknown" if pending else "not_sent")
+        payload["error"] = {**failure.details, "code": failure.code, "message": str(failure)}
         payload["failed_operation"] = pending.summary() if pending else None
-        payload["write_result_unknown"] = pending is not None
+        payload["write_result_unknown"] = pending is not None and failure.details.get("write_status", "unknown") == "unknown"
         payload["inspect_before_retry"] = bool(completed) or pending is not None
     return CallToolResult(
         content=[TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))],
