@@ -551,6 +551,17 @@ writes to lists containing these records fail before dispatch with
 resolve ordering IDs to prefixed record names, so a matching JSON order alone
 cannot make malformed records visible. Recovery requires an explicit migration;
 the backend never renames or deletes them automatically.
+Check recovery on an Apple device as well as in CloudKit and the web app.
+In the SmokeTest recovery, retaining logical UUIDs while correcting record-name
+prefixes left old entries hidden on an iPhone, although the web app showed them.
+A newly created control group appeared on both clients; fresh logical UUIDs
+then restored an affected group on the iPhone. This suggests retained local
+identity/deletion state; the exact native-cache mechanism remains unconfirmed.
+Identity renewal is explicit recovery only: refresh the original owner zone and
+permissions, preserve text archives and metadata, and atomically replace
+records with their parent references and order positions. Keep reminders with
+attachments in place and update their parent references so attachment ownership
+survives. Never automatically replay, rename or renew user records.
 Ambiguous identities stop structural writes; missing positions report `-1`
 instead of a shared synthetic index. Legacy duplicate ordering entries retain
 their first position and do not get appended again under a different ID form.
