@@ -582,6 +582,14 @@ Updates refresh the original text archive and retain its CRDT replica history,
 character identities and deletion tombstones. They accept gzip and native
 zlib archives. Unsupported archives fail before dispatch with
 `unsupported_text_document` and `structure_field=TitleDocument|NotesDocument`.
+Replacing an existing archive with a freshly encoded document can discard
+deletion history. A native client retaining old character identities may then
+concatenate old and new titles even when CloudKit stores one correct string.
+Preserving the current archive prevents further history loss but cannot recover
+identities already absent from it. Recovery may require replacing the entire
+title in an Apple editor that still holds the merged history, then checking
+CloudKit and the device after reopening the list. Preserve the original
+reminder and its attachments; do not recreate it merely to repair its text.
 
 The authorized opt-in `tests/test_live_reminders_ordering.py` covers top-level
 and child reorders, before/after/append moves, and delta/full sync. Set
