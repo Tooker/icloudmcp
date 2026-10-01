@@ -2,7 +2,7 @@
 # docker compose -f docker-compose.yml -f docker-compose.release.yml --profile reminders build
 services:
   icloud-cruncher:
-    image: icloud-cruncher:1.1.0
+    image: icloud-cruncher:1.3.0
   reminders:
     image: icloud-reminders:1.1.0
     build:

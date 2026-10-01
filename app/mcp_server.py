@@ -70,7 +70,7 @@ def create_mcp_server(
             "Never blindly retry a failed or timed-out Reminders write; inspect current data first. "
             "Reminders authentication and device approval are separate administrative Go CLI operations."
         ),
-        version="1.1.0",
+        version="1.3.0",
     )
 
     async def call_service(
@@ -448,7 +448,7 @@ def create_mcp_server(
         description=(
             "Read an attachment using uid, mailbox and attachment_id from get_email. "
             "Default format=file returns the COMPLETE original attachment as an embedded "
-            "binary MCP resource and resource link, with filename and MIME type (up to 10 MB). "
+            "binary MCP resource and resource link, with filename and MIME type (up to 30 MB). "
             "File mode requires offset=0 and ignores limit; resource links can be read through "
             "resources/read for up to 15 minutes, until capacity eviction or service restart. "
             "Use format=text to extract readable PDF/text content; scanned PDFs without "

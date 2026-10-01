@@ -597,7 +597,7 @@ and child reorders, before/after/append moves, and delta/full sync. Set
 list where writes are authorized. It removes its own marked test reminders
 and verifies that the existing contents, hierarchy and relative order remain.
 
-### Building the paired 1.1.0 source checkouts
+### Building the paired Python 1.3.0 and Reminders 1.1.0 source checkouts
 
 Keep this repository beside the updated `icloud-reminders-cli` checkout and run:
 
@@ -606,11 +606,12 @@ docker compose -f docker-compose.yml -f docker-compose.release.yml --profile rem
 docker compose -f docker-compose.yml -f docker-compose.release.yml --profile reminders build
 ```
 
-This produces `icloud-cruncher:1.1.0` and `icloud-reminders:1.1.0` locally.
+This produces `icloud-cruncher:1.3.0` and `icloud-reminders:1.1.0` locally.
 The release override explicitly selects the adjacent Go source; the main
 Compose file pins the published 1.1.0 backend commit. Use the same two Compose files
 when starting the locally built pair. Building images does not recreate the
 running services.
+
 ### Declarative Reminders batches
 
 `batch_update_reminders` accepts the desired tree for one existing list.
@@ -709,7 +710,7 @@ Call `get_email` first to obtain attachment IDs, then call
 
 | Format | Result | Bounds |
 | --- | --- | --- |
-| `file` · default | Complete original binary resource plus a resource link with filename, MIME type and size. | Up to 10 MB; `offset=0`; `limit` never truncates the file. |
+| `file` · default | Complete original binary resource plus a resource link with filename, MIME type and size. | Up to 30 MB; `offset=0`; `limit` never truncates the file. |
 | `text` | Extracted PDF/text with `text_status` and pagination. | Files up to 10 MB; PDF page streams up to 5 MB. |
 | `base64` | Original bytes in chunks, including larger files. | Default chunk 20,000 bytes; maximum 100,000. |
 
@@ -718,7 +719,7 @@ Follow `next_offset` while `has_more` is true. Decode each base64 chunk
 separately before joining its bytes.
 
 Native file links refer to opaque MCP snapshots served by `resources/read`.
-Snapshots expire after at most 15 minutes, with bounds of 64 files and 25 MB
+Snapshots expire after at most 15 minutes, with bounds of 64 files and 30 MB
 total; eviction or service restarts can expire them earlier. Request the file
 again if a link expires. They are excluded from `resources/list` and have no
 public download route. Download/preview presentation depends on the client.

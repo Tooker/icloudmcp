@@ -58,7 +58,8 @@ class ICloudIMAPService:
     _MAX_LIMIT = 1000
     _MAX_BODY_CHARS = 100_000
     _MAX_DRAFT_BYTES = 25_000_000
-    _MAX_ATTACHMENT_BYTES = 10_000_000
+    _MAX_ATTACHMENT_BYTES = 30_000_000
+    _MAX_DRAFT_ATTACHMENT_BYTES = 10_000_000
     _HEADER_FETCH_BATCH_SIZE = 100
     _FETCH_HEADERS = (
         "(UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS "
@@ -746,7 +747,7 @@ class ICloudIMAPService:
             }
             if format == "file":
                 if len(payload) > self._MAX_ATTACHMENT_BYTES:
-                    raise ValueError("Attachment exceeds the 10 MB native file limit; use format=base64 for chunks.")
+                    raise ValueError("Attachment exceeds the 30 MB native file limit; use format=base64 for chunks.")
                 result.update({
                     "content_bytes": payload,
                     "returned_bytes": len(payload),
@@ -1274,7 +1275,7 @@ class ICloudIMAPService:
             payload = base64.b64decode(content_base64, validate=True)
         except (ValueError, TypeError) as exc:
             raise ValueError("attachment content_base64 is invalid") from exc
-        if len(payload) > self._MAX_ATTACHMENT_BYTES:
+        if len(payload) > self._MAX_DRAFT_ATTACHMENT_BYTES:
             raise ValueError("attachment is too large")
         if (
             not isinstance(content_type, str)

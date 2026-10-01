@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.3.0 — 2026-10-01
 
 - Merge declarative `batch_update_reminders` with typed recursive tasks and
   native sections, default preview, complete coverage validation and sequential
@@ -11,6 +11,8 @@
   capabilities before any writes. Never automatically replay a batch.
 - Combine the local Go title/completion fixes, write confirmations and durable
   keyed creation with the native section/order implementation.
+- Return complete iCloud Mail attachments up to 30 MB as native MCP resources,
+  with matching bounded resource snapshots.
 
 ## 1.1.0 — 2026-10-01
 
@@ -19,6 +21,8 @@
 - Tree views, section filters, inherited sections and native manual positions.
 - Move existing reminders between sections or under parents, and reorder
   siblings while preserving their subtrees.
+- Add declarative batch planning with a default read-only preview and bounded,
+  sequential application preserving progress and created IDs on failure.
 - Explain status, hierarchy, priority and ordering symbols in MCP instructions,
   tool descriptions, read results and the Go CLI's `list --legend`.
 - Preserve existing CloudKit metadata and shared-owner zones; refresh write

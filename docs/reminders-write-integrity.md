@@ -136,7 +136,7 @@ a separate explicit opt-in and exact authorized list ID:
 
 ```sh
 RUN_LIVE_REMINDERS_WRITE_TESTS=1 \
-LIVE_REMINDERS_WRITE_LIST_ID=List/3D03EB9A-3DEC-4737-94D7-3AEF5D4A851C \
+LIVE_REMINDERS_WRITE_LIST_ID=List/EXACT-AUTHORIZED-TEST-LIST-ID \
 LIVE_REMINDERS_WRITE_MCP_URL=http://127.0.0.1:18080/mcp \
 uv run pytest tests/test_live_reminders_writes.py -q -s
 ```

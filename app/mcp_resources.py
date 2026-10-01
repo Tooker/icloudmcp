@@ -40,7 +40,7 @@ class AttachmentMCPServer(MCPServer):
     _RESOURCE_PREFIX = "icloud-mail://attachments/"
     _RESOURCE_TTL_SECONDS = 900
     _MAX_RESOURCES = 64
-    _MAX_RESOURCE_BYTES = 25_000_000
+    _MAX_RESOURCE_BYTES = 30_000_000
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)

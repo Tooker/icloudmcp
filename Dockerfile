@@ -1,6 +1,6 @@
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 
-ARG VERSION=1.1.0
+ARG VERSION=1.3.0
 LABEL org.opencontainers.image.version=$VERSION
 
 WORKDIR /app
