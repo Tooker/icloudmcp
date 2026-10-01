@@ -14,8 +14,8 @@ from app.reminders import _PUBLIC_ERRORS
 
 WriteStatus = Literal["not_sent", "failed", "succeeded", "unknown"]
 RetryClass = Literal["retryable_safe", "retryable_after_read", "not_retryable"]
-StructureField = Literal["ReminderIDs", "ReminderIDsAsset", "MembershipsOfRemindersInSectionsAsData", "SectionIDsOrderingAsData", "ResolutionTokenMap"]
-StructureReason = Literal["too_large", "invalid_json", "invalid_version", "unsupported_version", "missing_entries", "invalid_entries", "metadata_unavailable"]
+StructureField = Literal["ReminderIDs", "ReminderIDsAsset", "MembershipsOfRemindersInSectionsAsData", "SectionIDsOrderingAsData", "ResolutionTokenMap", "TitleDocument", "NotesDocument"]
+StructureReason = Literal["too_large", "invalid_json", "invalid_version", "unsupported_version", "missing_entries", "invalid_entries", "metadata_unavailable", "non_native_record_id"]
 
 
 class ResponseModel(BaseModel):

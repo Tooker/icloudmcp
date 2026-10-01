@@ -166,6 +166,40 @@ def test_unconfirmed_deletion_and_missing_confirm_never_reach_go(monkeypatch):
     assert messages == []
 
 
+def test_non_native_ordering_diagnostic_is_typed_and_preserved_without_retry(monkeypatch):
+    backend, messages = simulated_go(monkeypatch, result={
+        "content": [{"type": "text", "text": PRIVATE}], "isError": True,
+        "structuredContent": {"error_code": "unsupported_structure", "write_status": "not_sent",
+                              "retry_class": "not_retryable", "list_id": "List/test",
+                              "record_type": "List", "structure_field": "ReminderIDs",
+                              "structure_reason": "non_native_record_id"},
+    })
+    server = create_mcp_server(None, reminders_service=backend)
+    result = asyncio.run(server._handle_call_tool(None, CallToolRequestParams(
+        name="move_reminder", arguments={"id": "legacy", "clear_parent": True})))
+    assert result.is_error and result.structured_content["structure_reason"] == "non_native_record_id"
+    assert result.structured_content["write_status"] == "not_sent"
+    assert PRIVATE not in str(result)
+    assert len([message for message in messages if message["method"] == "tools/call"]) == 1
+
+
+def test_unsupported_text_archive_diagnostic_is_private_and_retry_unsafe(monkeypatch):
+    backend, messages = simulated_go(monkeypatch, result={
+        "content": [{"type": "text", "text": PRIVATE}], "isError": True,
+        "structuredContent": {"error_code": "unsupported_text_document", "write_status": "not_sent",
+                              "retry_class": "not_retryable", "record_type": "Reminder",
+                              "structure_field": "TitleDocument", "structure_reason": "invalid_entries"},
+    })
+    server = create_mcp_server(None, reminders_service=backend)
+    result = asyncio.run(server._handle_call_tool(None, CallToolRequestParams(
+        name="update_reminder", arguments={"id": "exact-id", "title": PRIVATE})))
+    assert result.is_error and result.structured_content["error_code"] == "unsupported_text_document"
+    assert result.structured_content["structure_field"] == "TitleDocument"
+    assert result.structured_content["retry_class"] == "not_retryable"
+    assert PRIVATE not in str(result)
+    assert len([message for message in messages if message["method"] == "tools/call"]) == 1
+
+
 def test_timeout_and_cancellation_end_calls_without_retry(monkeypatch):
     backend, messages = simulated_go(monkeypatch, delay=60)
 

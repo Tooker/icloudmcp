@@ -46,6 +46,7 @@ _PUBLIC_ERRORS = {
     ),
     "invalid_argument": "Reminders rejected the arguments. Check exact IDs, dates, priority, pagination and same-list structure references. Batches require every existing reminder, including completed tasks, and every existing section in current order. Assignment needs one accepted participant ID from this list or clear=true.",
     "unsupported_structure": "This list uses an unsupported structure format. No write was attempted; refresh or inspect the list in Apple Reminders.",
+    "unsupported_text_document": "This reminder's text document cannot be updated safely. No write was attempted; inspect it in Apple Reminders.",
     "write_result_unknown": "iCloud did not confirm the complete write. Inspect current reminders and sections before retrying.",
     "icloud_write_failed": "iCloud rejected the write. Inspect current reminders and sections before retrying.",
     "upstream_mismatch": "iCloud accepted the write but its saved manual order differs from the requested order. Inspect current data before retrying.",
@@ -99,8 +100,8 @@ _UPSTREAM_CODES = frozenset({
     "CONFLICT", "SERVER_RECORD_CHANGED", "ZONE_NOT_FOUND", "QUOTA_EXCEEDED", "LIMIT_EXCEEDED",
     "THROTTLED", "SERVICE_UNAVAILABLE", "INTERNAL_ERROR", "BATCH_REQUEST_FAILED", "INVALID_FIELD_TYPE", "ATOMIC_FAILURE", "VALIDATING_REFERENCE_ERROR",
 })
-_STRUCTURE_FIELDS = frozenset({"ReminderIDs", "ReminderIDsAsset", "MembershipsOfRemindersInSectionsAsData", "SectionIDsOrderingAsData", "ResolutionTokenMap"})
-_STRUCTURE_REASONS = frozenset({"too_large", "invalid_json", "invalid_version", "unsupported_version", "missing_entries", "invalid_entries", "metadata_unavailable"})
+_STRUCTURE_FIELDS = frozenset({"ReminderIDs", "ReminderIDsAsset", "MembershipsOfRemindersInSectionsAsData", "SectionIDsOrderingAsData", "ResolutionTokenMap", "TitleDocument", "NotesDocument"})
+_STRUCTURE_REASONS = frozenset({"too_large", "invalid_json", "invalid_version", "unsupported_version", "missing_entries", "invalid_entries", "metadata_unavailable", "non_native_record_id"})
 
 
 def _exceptions(error: BaseException):

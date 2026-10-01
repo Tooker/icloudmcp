@@ -52,7 +52,11 @@ def test_live_ordering_top_level_and_children_survive_sync():
                         args = {"list_id": target, "title": marker + " " + label, "notes": marker, "client_request_id": str(uuid4())}
                         if parent:
                             args["parent_id"] = parent
-                        return (await invoke("create_reminder", args))["id"]
+                        rid = (await invoke("create_reminder", args))["id"]
+                        assert rid.startswith("Reminder/"), "Creation used a non-native CloudKit record name"
+                        fresh = (await invoke("get_reminder", {"id": rid}))["reminder"]
+                        assert fresh["title"] == args["title"]
+                        return rid
 
                     original = await page()
                     baseline = [r["id"] for r in original if not r.get("parent_ref") and not r.get("section_ref")]
@@ -60,9 +64,9 @@ def test_live_ordering_top_level_and_children_survive_sync():
                     before = {r["id"]: {k: r.get(k) for k in preserved_fields} for r in original}
                     parent = None
                     try:
-                        parent = await create("Parent")
+                        parent = await create("🧪 Parent ÄÖÜ ❤️")
                         roots = [await create(label) for label in ("A", "B", "C")]
-                        children = [await create("Child " + label, parent) for label in ("A", "B", "C")]
+                        children = [await create("Child 🥰 " + label, parent) for label in ("A", "B", "C")]
                         print("Ordering regression: own_reminders_created=7", flush=True)
                         a, b, c = roots
                         target_order = baseline + [parent, c, a, b]
@@ -82,6 +86,15 @@ def test_live_ordering_top_level_and_children_survive_sync():
                         await check(parent, [cc, ca, cb], full=True)
                         await check(None, target_order)
                         print("Ordering regression: children_reorder=true before=true after=true full_sync=true", flush=True)
+                        updated_title = marker + " 🥰 Updated ÄÖÜ ❤️"
+                        await invoke("update_reminder", {"id": ca.removeprefix("Reminder/"), "title": updated_title,
+                                                         "due": "2026-10-15", "priority": "high"})
+                        await invoke("complete_reminder", {"id": ca.removeprefix("Reminder/")})
+                        await invoke("sync_reminders", {"full": False})
+                        fresh = (await invoke("get_reminder", {"id": ca.removeprefix("Reminder/")}))["reminder"]
+                        assert fresh["id"] == ca and fresh["title"] == updated_title
+                        assert fresh["completed"] is True and fresh["due"] == "2026-10-15" and fresh["priority"] == 1
+                        print("Ordering regression: unicode_titles=true native_ids=true logical_id_aliases=true lifecycle=true", flush=True)
                     finally:
                         own = [r for r in await page() if r.get("notes") == marker]
                         own.sort(key=lambda r: r.get("depth", 0), reverse=True)

@@ -543,8 +543,14 @@ attachment) returns `write_status=failed`, `retry_class=not_retryable`, and
 intact; automatic dependent-record deletion is not supported.
 
 Ordering and section metadata IDs are resolved against the exact CloudKit
-record names in the same list and owner zone. Both bare UUID record names and
-`Reminder/UUID` records are supported without renaming existing records.
+record names in the same list and owner zone. New reminders use Apple's native
+`Reminder/UUID` record names. Bare UUID inputs resolve to an existing native
+record; malformed legacy bare records remain readable for recovery. Structural
+writes to lists containing these records fail before dispatch with
+`unsupported_structure`, `structure_reason=non_native_record_id`. Native clients
+resolve ordering IDs to prefixed record names, so a matching JSON order alone
+cannot make malformed records visible. Recovery requires an explicit migration;
+the backend never renames or deletes them automatically.
 Ambiguous identities stop structural writes; missing positions report `-1`
 instead of a shared synthetic index. Legacy duplicate ordering entries retain
 their first position and do not get appended again under a different ID form.
@@ -557,6 +563,14 @@ returns `write_verification_failed` with `order_verification=unavailable`.
 Both retain `write_status=succeeded` for the confirmed CloudKit commit and
 require inspection before retrying. The mutation is never replayed. Batch
 execution stops at this step and retains all earlier confirmed results.
+Verification confirms the stored CloudKit order, not rendering or completed
+synchronization on an iPhone. Text documents encode native UTF-16 code-unit
+lengths, including emoji surrogate pairs; title updates also advance the native
+field resolution tokens while preserving unrelated clocks and extensions.
+Updates refresh the original text archive and retain its CRDT replica history,
+character identities and deletion tombstones. They accept gzip and native
+zlib archives. Unsupported archives fail before dispatch with
+`unsupported_text_document` and `structure_field=TitleDocument|NotesDocument`.
 
 The authorized opt-in `tests/test_live_reminders_ordering.py` covers top-level
 and child reorders, before/after/append moves, and delta/full sync. Set
