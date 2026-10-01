@@ -42,6 +42,7 @@ class ReminderError(ResponseModel):
     http_status: int | None = Field(default=None, ge=100, le=599)
     upstream_status: int | None = Field(default=None, ge=100, le=599)
     upstream_error_code: str | None = None
+    order_verification: Literal["mismatch", "unavailable"] | None = None
     list_id: str | None = None
     record_type: str | None = None
     structure_field: StructureField | None = None
@@ -162,10 +163,12 @@ class CreateSectionResult(MutationResult):
 
 class MoveResult(MutationResult):
     status: Literal["moved"]
+    order_verification: Literal["verified"] | None = Field(default=None, description="Fresh iCloud metadata confirms the requested manual order; optional for older backends.")
 
 
 class ReorderResult(MutationResult):
     status: Literal["reordered", "unchanged"]
+    order_verification: Literal["verified"] | None = Field(default=None, description="Fresh iCloud metadata confirms the requested manual order; optional for older backends.")
 
 
 class BatchNativeResult(CallToolResult):

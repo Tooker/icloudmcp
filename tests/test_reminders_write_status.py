@@ -178,3 +178,26 @@ def test_native_reference_rejection_is_a_failed_delete_without_retry(monkeypatch
     assert not result.structured_content["retryable"]
     assert len([item for item in messages if item["method"] == "tools/call"]) == 1
     assert PRIVATE not in str(result)
+
+
+@pytest.mark.parametrize(("code", "verification"), [
+    ("upstream_mismatch", "mismatch"), ("write_verification_failed", "unavailable"),
+])
+@pytest.mark.parametrize("name", ["move_reminder", "reorder_reminders"])
+def test_order_verification_failure_keeps_commit_evidence_without_success_or_retry(monkeypatch, code, verification, name):
+    backend, messages = simulated_go(monkeypatch, result={
+        "isError": True, "content": [{"type": "text", "text": PRIVATE}],
+        "structuredContent": {"error_code": code, "write_status": "succeeded",
+                              "retry_class": "retryable_after_read", "order_verification": verification,
+                              "requested_order": PRIVATE, "actual_order": PRIVATE},
+    })
+    arguments = {"id": "exact-id", "before_id": "anchor"} if name == "move_reminder" else {"list_id": "list", "reminder_ids": ["exact-id"]}
+    result = call(backend, name=name, **arguments)
+    assert result.is_error
+    assert result.structured_content["error_code"] == code
+    assert result.structured_content["order_verification"] == verification
+    assert result.structured_content["write_status"] == "succeeded"
+    assert result.structured_content["retry_class"] == "retryable_after_read"
+    assert "status" not in result.structured_content
+    assert len([item for item in messages if item["method"] == "tools/call"]) == 1
+    assert PRIVATE not in str(result)

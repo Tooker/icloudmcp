@@ -542,6 +542,28 @@ attachment) returns `write_status=failed`, `retry_class=not_retryable`, and
 `upstream_error_code=VALIDATING_REFERENCE_ERROR`. The referencing records remain
 intact; automatic dependent-record deletion is not supported.
 
+Ordering and section metadata IDs are resolved against the exact CloudKit
+record names in the same list and owner zone. Both bare UUID record names and
+`Reminder/UUID` records are supported without renaming existing records.
+Ambiguous identities stop structural writes; missing positions report `-1`
+instead of a shared synthetic index. Legacy duplicate ordering entries retain
+their first position and do not get appended again under a different ID form.
+
+The combined backend verifies `move_reminder` and `reorder_reminders` using a
+fresh scoped list lookup before returning `moved`/`reordered` and
+`order_verification=verified`. A differing saved order returns the MCP error
+`upstream_mismatch` with `order_verification=mismatch`; an unavailable read-back
+returns `write_verification_failed` with `order_verification=unavailable`.
+Both retain `write_status=succeeded` for the confirmed CloudKit commit and
+require inspection before retrying. The mutation is never replayed. Batch
+execution stops at this step and retains all earlier confirmed results.
+
+The authorized opt-in `tests/test_live_reminders_ordering.py` covers top-level
+and child reorders, before/after/append moves, and delta/full sync. Set
+`RUN_LIVE_REMINDERS_WRITE_TESTS=1` and `LIVE_REMINDERS_WRITE_LIST_ID` only for a
+list where writes are authorized. It removes its own marked test reminders
+and verifies that the existing contents, hierarchy and relative order remain.
+
 ### Building the paired 1.1.0 source checkouts
 
 Keep this repository beside the updated `icloud-reminders-cli` checkout and run:

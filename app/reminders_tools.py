@@ -206,6 +206,7 @@ def register_reminders_tools(server: MCPServer, service: GoRemindersService | No
         "clear_section=true to move out; subtasks inherit the parent's section. Omitted parent/section stays unchanged. "
         "Use exactly one before_id or after_id to place beside a sibling; without an anchor append to the target "
         "sibling group. The reminder's subtree stays together. IDs must come from the same list; cycles are rejected. "
+        "order_verification=verified confirms a fresh iCloud read-back of the requested manual order. "
         "Inspect uncertain writes before retrying."
     ))
     async def move_reminder(
@@ -221,6 +222,7 @@ def register_reminders_tools(server: MCPServer, service: GoRemindersService | No
         "order. Supply every sibling exactly once, including completed reminders (discover with include_completed=true). "
         "Omit parent_id for top-level reminders; omit section_id for the unsectioned group. "
         "Each subtree stays together. This changes manual order only; priority and completion stay unchanged. "
+        "order_verification=verified confirms a fresh iCloud read-back of the requested manual order. "
         "Inspect uncertain writes before retrying."
     ))
     async def reorder_reminders(

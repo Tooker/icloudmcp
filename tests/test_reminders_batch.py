@@ -444,3 +444,22 @@ def test_structure_warning_blocks_only_affected_batch_before_writes(backend, aff
         assert result.structured_content["error"]["structure_field"] == "SectionIDsOrderingAsData"
     else:
         assert not result.is_error and state["writes"] > 0
+
+
+@pytest.mark.parametrize(("code", "verification"), [("upstream_mismatch", "mismatch"), ("write_verification_failed", "unavailable")])
+def test_batch_stops_on_unverified_order_and_keeps_confirmed_prior_results(backend, code, verification):
+    service, state = backend
+    state["fail_write"] = 4
+    state["failure_details"] = {
+        "error_code": code, "write_status": "succeeded", "retry_class": "retryable_after_read",
+        "order_verification": verification, "actual_order": PRIVATE,
+    }
+    result = invoke(service, {**new_tree(), "dry_run": False})
+    data = result.structured_content
+    assert result.is_error and data["completed_operations"] == 3 and state["writes"] == 4
+    assert data["error"]["code"] == code and data["error"]["order_verification"] == verification
+    assert data["error"]["write_status"] == "succeeded"
+    assert data["failed_operation"]["tool"] == "move_reminder"
+    assert data["ids"]["sections[0].reminders[0]"].startswith("new-reminder-")
+    assert data["inspect_before_retry"] and not data["write_result_unknown"]
+    assert "actual_order" not in data["error"]

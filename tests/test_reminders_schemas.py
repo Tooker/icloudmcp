@@ -33,6 +33,11 @@ def test_every_reminders_tool_publishes_success_and_error_contracts():
     assert "BatchNativeResult" in batch_defs
     assert "structuredContent" in batch_defs["BatchNativeResult"]["required"]
     assert "failed_operation" in batch_defs["BatchResult"]["properties"]
+    assert "order_verification" in tools["move_reminder"].output_schema["$defs"]["MoveResult"]["properties"]
+    assert "order_verification" in tools["reorder_reminders"].output_schema["$defs"]["ReorderResult"]["properties"]
+    for name in ("move_reminder", "reorder_reminders"):
+        VALIDATORS[name].validate_python(RemindersError("upstream_mismatch", write_status="succeeded",
+                                                       order_verification="mismatch", retry_class="retryable_after_read").details)
 
 
 def test_success_validation_preserves_future_fields_and_native_content(monkeypatch):

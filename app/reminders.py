@@ -48,6 +48,8 @@ _PUBLIC_ERRORS = {
     "unsupported_structure": "This list uses an unsupported structure format. No write was attempted; refresh or inspect the list in Apple Reminders.",
     "write_result_unknown": "iCloud did not confirm the complete write. Inspect current reminders and sections before retrying.",
     "icloud_write_failed": "iCloud rejected the write. Inspect current reminders and sections before retrying.",
+    "upstream_mismatch": "iCloud accepted the write but its saved manual order differs from the requested order. Inspect current data before retrying.",
+    "write_verification_failed": "iCloud accepted the write but its saved manual order could not be verified. Inspect current data before retrying.",
     "request_timeout": "Request ended before completion. A write may have succeeded; inspect the reminder before retrying.",
     "icloud_request_failed": "iCloud request failed. A write may have succeeded; inspect the reminder before retrying.",
     "backend_unavailable": "The Go Reminders backend could not complete the request. Check its service and bearer token. A write may have succeeded; inspect before retrying.",
@@ -64,7 +66,7 @@ class RemindersError(Exception):
         upstream_error_code: str | None = None,
         list_id: str | None = None, record_type: str | None = None,
         structure_field: str | None = None, structure_reason: str | None = None,
-        structure_version: int | None = None,
+        structure_version: int | None = None, order_verification: str | None = None,
     ) -> None:
         self.code = code if code in _PUBLIC_ERRORS else "backend_unavailable"
         self.details = {"error_code": self.code, "retry_class": retry_class,
@@ -75,6 +77,7 @@ class RemindersError(Exception):
             "upstream_error_code": upstream_error_code,
             "list_id": list_id, "record_type": record_type, "structure_field": structure_field,
             "structure_reason": structure_reason, "structure_version": structure_version,
+            "order_verification": order_verification,
         }.items():
             if value is not None:
                 self.details[key] = value
@@ -149,6 +152,8 @@ def _upstream_error(result: CallToolResult, operation: str, request_id: str) -> 
             safe["upstream_status"] = value
         if isinstance(details.get("upstream_error_code"), str) and details["upstream_error_code"] in _UPSTREAM_CODES:
             safe["upstream_error_code"] = details["upstream_error_code"]
+        if isinstance(details.get("order_verification"), str) and details["order_verification"] in {"mismatch", "unavailable"}:
+            safe["order_verification"] = details["order_verification"]
         for key, allowed in (("structure_field", _STRUCTURE_FIELDS), ("structure_reason", _STRUCTURE_REASONS), ("record_type", {"List", "ReminderList", "Reminder"})):
             value = details.get(key)
             if isinstance(value, str) and value in allowed:
