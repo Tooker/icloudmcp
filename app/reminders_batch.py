@@ -11,7 +11,7 @@ from uuid import UUID, uuid4
 from mcp_types import CallToolResult, TextContent
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from app.reminders import RemindersError
+from app.reminders import RemindersError, _upstream_error
 from app.timing import call_id, measure_phase
 
 if TYPE_CHECKING:
@@ -153,6 +153,14 @@ def _items(result: CallToolResult, key: str) -> list[dict[str, Any]]:
     return items
 
 
+def _require_structure(result: CallToolResult, list_id: str, request_id: str) -> None:
+    data = result.structured_content
+    for warning in data.get("structure_warnings", []) if isinstance(data, dict) else []:
+        if isinstance(warning, dict) and warning.get("list_id") == list_id:
+            raise _upstream_error(CallToolResult(is_error=True, content=[], structured_content={**warning, "error_code": "unsupported_structure"}),
+                                  "batch_update_reminders", request_id)
+
+
 def _plan(
     structure: BatchStructure, nodes: list[tuple[str, ReminderNode, str, str]],
     current: list[dict[str, Any]], sections: list[dict[str, Any]],
@@ -281,11 +289,14 @@ async def run_batch(service: GoRemindersService, arguments: dict[str, Any]) -> C
             lists = _items(await service.invoke(session, "list_reminder_lists", {}), "lists")
             if structure.list_id not in {item["id"] for item in lists}:
                 raise RemindersError("not_found")
-            sections = _items(await service.invoke(session, "list_reminder_sections", {"list_id": structure.list_id}), "sections")
+            headings = await service.invoke(session, "list_reminder_sections", {"list_id": structure.list_id})
+            _require_structure(headings, structure.list_id, request_id)
+            sections = _items(headings, "sections")
             page = await service.invoke(session, "list_reminders", {
                 "list_id": structure.list_id, "include_completed": True, "limit": MAX_REMINDERS, "offset": 0,
             })
             current = _items(page, "reminders")
+            _require_structure(page, structure.list_id, request_id)
             if page.structured_content.get("total") != len(current) or page.structured_content.get("next_offset") is not None:
                 _invalid()
             with measure_phase("reminders_batch_plan"):

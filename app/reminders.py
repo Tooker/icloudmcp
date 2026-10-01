@@ -33,7 +33,7 @@ _PUBLIC_ERRORS = {
     "backend_auth_failed": "The Go backend rejected authentication. Check REMINDERS_MCP_TOKEN on both services.",
     "backend_protocol_error": "The Go backend returned an invalid MCP response.",
     "idempotency_conflict": "This client_request_id was already used with different creation arguments. Use the original arguments or a new ID.",
-    "local_state_failed": "The creation succeeded but local request state could not be saved. Recover using the same client_request_id.",
+    "local_state_failed": "The write succeeded but local state could not be saved. Inspect current data; recover a keyed creation using the same client_request_id.",
     "unsupported_backend": "This Go backend does not support client_request_id. Upgrade it before making a keyed creation.",
     "backend_upgrade_required": "The Go backend lacks tools required for this structure. Upgrade it before applying the batch. No write was attempted.",
     "not_found": "Reminder, list or section not found. Refresh the available lists and reminders and use their exact IDs.",
@@ -62,6 +62,9 @@ class RemindersError(Exception):
         write_status: str | None = None, retry_class: str = "not_retryable",
         http_status: int | None = None, upstream_status: int | None = None,
         upstream_error_code: str | None = None,
+        list_id: str | None = None, record_type: str | None = None,
+        structure_field: str | None = None, structure_reason: str | None = None,
+        structure_version: int | None = None,
     ) -> None:
         self.code = code if code in _PUBLIC_ERRORS else "backend_unavailable"
         self.details = {"error_code": self.code, "retry_class": retry_class,
@@ -70,6 +73,8 @@ class RemindersError(Exception):
             "operation": operation, "request_id": request_id, "write_status": write_status,
             "http_status": http_status, "upstream_status": upstream_status,
             "upstream_error_code": upstream_error_code,
+            "list_id": list_id, "record_type": record_type, "structure_field": structure_field,
+            "structure_reason": structure_reason, "structure_version": structure_version,
         }.items():
             if value is not None:
                 self.details[key] = value
@@ -89,8 +94,10 @@ _WRITE_STATES = frozenset({"not_sent", "failed", "succeeded", "unknown"})
 _UPSTREAM_CODES = frozenset({
     "BAD_REQUEST", "AUTHENTICATION_REQUIRED", "ACCESS_DENIED", "NOT_FOUND", "UNKNOWN_ITEM",
     "CONFLICT", "SERVER_RECORD_CHANGED", "ZONE_NOT_FOUND", "QUOTA_EXCEEDED", "LIMIT_EXCEEDED",
-    "THROTTLED", "SERVICE_UNAVAILABLE", "INTERNAL_ERROR", "BATCH_REQUEST_FAILED",
+    "THROTTLED", "SERVICE_UNAVAILABLE", "INTERNAL_ERROR", "BATCH_REQUEST_FAILED", "INVALID_FIELD_TYPE", "ATOMIC_FAILURE", "VALIDATING_REFERENCE_ERROR",
 })
+_STRUCTURE_FIELDS = frozenset({"ReminderIDs", "ReminderIDsAsset", "MembershipsOfRemindersInSectionsAsData", "SectionIDsOrderingAsData", "ResolutionTokenMap"})
+_STRUCTURE_REASONS = frozenset({"too_large", "invalid_json", "invalid_version", "unsupported_version", "missing_entries", "invalid_entries", "metadata_unavailable"})
 
 
 def _exceptions(error: BaseException):
@@ -142,6 +149,20 @@ def _upstream_error(result: CallToolResult, operation: str, request_id: str) -> 
             safe["upstream_status"] = value
         if isinstance(details.get("upstream_error_code"), str) and details["upstream_error_code"] in _UPSTREAM_CODES:
             safe["upstream_error_code"] = details["upstream_error_code"]
+        for key, allowed in (("structure_field", _STRUCTURE_FIELDS), ("structure_reason", _STRUCTURE_REASONS), ("record_type", {"List", "ReminderList", "Reminder"})):
+            value = details.get(key)
+            if isinstance(value, str) and value in allowed:
+                safe[key] = value
+        version = details.get("structure_version")
+        if type(version) is int and 0 <= version <= 2**53:
+            safe["structure_version"] = version
+        list_id = details.get("list_id")
+        if isinstance(list_id, str) and list_id.startswith("List/"):
+            try:
+                UUID(list_id[5:])
+                safe["list_id"] = list_id
+            except ValueError:
+                pass
     return RemindersError(code, operation=operation, request_id=request_id,
                           write_status=status, retry_class=retry, **safe)
 

@@ -57,10 +57,21 @@ def simulated_go(monkeypatch, *, result=None, failure=None, delay=0, supports_ke
                     "jsonrpc": "2.0", "id": message["id"],
                     "error": {"code": -32603, "message": PRIVATE},
                 })
-            payload = result or {
-                "content": [{"type": "text", "text": PRIVATE}],
-                "structuredContent": {"reminders": [{"id": "exact-id", "title": PRIVATE}], "total": 1},
+            name = message["params"]["name"]
+            item = {"id": "exact-id", "title": PRIVATE, "completed": False, "priority": 0, "list_name": PRIVATE}
+            defaults = {
+                "list_reminder_lists": {"lists": [{"id": "exact-list", "name": PRIVATE}]},
+                "list_reminders": {"reminders": [item], "total": 1},
+                "get_reminder": {"reminder": item},
+                "sync_reminders": {"reminders": 1, "lists": 1},
+                "list_reminder_participants": {"list_id": "exact-list", "shared": True, "participants": []},
+                "list_reminder_sections": {"list_id": "exact-list", "sections": []},
             }
+            statuses = {"create_reminder": "created", "update_reminder": "updated", "complete_reminder": "completed",
+                        "delete_reminder": "deleted", "assign_reminder": "assigned", "create_reminder_section": "created",
+                        "move_reminder": "moved", "reorder_reminders": "reordered"}
+            data = defaults.get(name, {"id": "exact-id", "status": statuses.get(name, "created")})
+            payload = result or {"content": [{"type": "text", "text": PRIVATE}], "structuredContent": data}
         return httpx2.Response(200, json={"jsonrpc": "2.0", "id": message["id"], "result": payload})
 
     def client(**kwargs):
@@ -103,7 +114,7 @@ def test_python_tools_forward_through_real_mcp_client_once_and_keep_results_priv
     finally:
         logger.remove(sink)
     assert not result.is_error
-    assert result.structured_content["reminders"][0]["title"] == PRIVATE
+    assert result.structured_content is not None
     assert result.content[0].text == PRIVATE
     forwarded = [message["params"] for message in messages if message["method"] == "tools/call"]
     assert len(forwarded) == 1
@@ -183,8 +194,8 @@ def test_invalid_assignment_intent_never_reaches_go(monkeypatch, arguments):
 
 def test_participant_results_preserve_contact_details_without_logging_them(monkeypatch, caplog):
     payload = {"list_id": "exact-list", "shared": True, "participants": [
-        {"id": PRIVATE, "name": PRIVATE, "email": PRIVATE, "permission": "READ_WRITE", "is_current_user": True},
-        {"id": "another-person", "name": PRIVATE, "phone": PRIVATE, "permission": "READ_WRITE", "is_current_user": False},
+        {"id": PRIVATE, "name": PRIVATE, "email": PRIVATE, "role": "OWNER", "permission": "READ_WRITE", "is_current_user": True},
+        {"id": "another-person", "name": PRIVATE, "phone": PRIVATE, "role": "OWNER", "permission": "READ_WRITE", "is_current_user": False},
     ]}
     backend, _ = simulated_go(monkeypatch, result={
         "content": [{"type": "text", "text": json.dumps(payload)}], "structuredContent": payload,
@@ -293,9 +304,9 @@ def test_conflicting_move_intent_does_not_reach_go(monkeypatch, arguments):
 
 
 def test_native_sections_and_nested_results_survive_bridge_without_content_logs(monkeypatch, caplog):
-    payload = {"reminders": [{"id": "child", "title": PRIVATE, "parent_ref": "parent", "section_ref": "section", "depth": 1}],
-               "tree": [{"reminder": {"id": "parent", "title": PRIVATE}, "subtasks": [
-                   {"reminder": {"id": "child", "title": PRIVATE}, "subtasks": []},
+    payload = {"reminders": [{"id": "child", "title": PRIVATE, "completed": False, "priority": 0, "list_name": PRIVATE, "parent_ref": "parent", "section_ref": "section", "depth": 1}],
+               "tree": [{"reminder": {"id": "parent", "title": PRIVATE, "completed": False, "priority": 0, "list_name": PRIVATE}, "subtasks": [
+                   {"reminder": {"id": "child", "title": PRIVATE, "completed": False, "priority": 0, "list_name": PRIVATE}, "subtasks": []},
                ]}], "total": 1, "legend": {"≡": "Manual drag handle, not priority", "!!!": "High priority (1)"}}
     backend, _ = simulated_go(monkeypatch, result={"content": [{"type": "text", "text": json.dumps(payload)}],
                                                 "structuredContent": payload})

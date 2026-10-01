@@ -10,7 +10,9 @@ from loguru import logger
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import CallToolResult, ToolAnnotations
+from pydantic import ValidationError
 
+from app import reminders_schemas as schemas
 from app.reminders import GoRemindersService, READ_TOOLS, RemindersError
 from app.reminders_batch import ReminderNode, ReminderSection
 from app.timing import call_id, tool_trace
@@ -64,6 +66,16 @@ def register_reminders_tools(server: MCPServer, service: GoRemindersService | No
                     else:
                         if count is None:
                             count = 1
+                try:
+                    schemas.VALIDATORS[name].validate_python(payload)
+                except ValidationError:
+                    # Never expose a validation exception's input or lose write uncertainty.
+                    state = payload.get("write_status") if name not in READ_TOOLS and isinstance(payload, dict) else None
+                    if name not in READ_TOOLS and (not isinstance(state, str) or state not in {"not_sent", "failed", "succeeded", "unknown"}):
+                        state = "unknown"
+                    raise RemindersError("backend_protocol_error", operation=name, request_id=call_id(),
+                                         write_status=state if name not in READ_TOOLS else None,
+                                         retry_class="retryable_after_read" if state in {"unknown", "succeeded"} else "not_retryable") from None
                 return result
             except RemindersError as error:
                 outcome = error.code
@@ -88,7 +100,7 @@ def register_reminders_tools(server: MCPServer, service: GoRemindersService | No
                 )
 
     @server.tool(annotations=annotations(True), description="List iCloud Reminders lists and their exact IDs.")
-    async def list_reminder_lists() -> CallToolResult:
+    async def list_reminder_lists() -> schemas.ListsReply:
         return await call("list_reminder_lists")
 
     @server.tool(annotations=annotations(True), description=(
@@ -98,18 +110,20 @@ def register_reminders_tools(server: MCPServer, service: GoRemindersService | No
         "limit (1..500) and offset. Priority: 0=none, 9=low (!), 5=medium (!!), 1=high (!!!). "
         "A drag handle (≡) changes manual order, not priority. •=pending, ✓=complete, ↳=subtask. "
         "Use move_reminder or reorder_reminders with exact IDs to arrange tasks; never add these symbols to titles."
+        " structure_warnings identifies lists whose metadata could not be parsed; base tasks remain readable, "
+        "sort_index=-1 means unknown manual position, and structure writes to those lists must stop."
     ))
     async def list_reminders(
         list_id: str | None = None, parent_id: str | None = None, query: str | None = None,
         include_completed: bool = False, limit: int = 100, offset: int = 0,
         section_id: str | None = None, view: Literal["flat", "tree"] = "flat",
-    ) -> CallToolResult:
+    ) -> schemas.PageReply:
         return await call("list_reminders", list_id=list_id, parent_id=parent_id, query=query,
                           include_completed=include_completed, limit=limit, offset=offset, section_id=section_id,
                           view=None if view == "flat" else view)
 
     @server.tool(annotations=annotations(True), description="Read one reminder by its exact ID, including notes and list/parent references.")
-    async def get_reminder(id: str) -> CallToolResult:
+    async def get_reminder(id: str) -> schemas.GetReply:
         return await call("get_reminder", id=id)
 
     @server.tool(annotations=annotations(False, idempotent=False), description=(
@@ -124,7 +138,7 @@ def register_reminders_tools(server: MCPServer, service: GoRemindersService | No
         priority: Literal["none", "low", "medium", "high"] | None = None,
         notes: str | None = None, parent_id: str | None = None, section_id: str | None = None,
         client_request_id: str | None = None,
-    ) -> CallToolResult:
+    ) -> schemas.CreateReply:
         return await call("create_reminder", title=title, list_id=list_id, due=due,
                           priority=priority, notes=notes, parent_id=parent_id, section_id=section_id,
                           client_request_id=client_request_id)
@@ -137,31 +151,31 @@ def register_reminders_tools(server: MCPServer, service: GoRemindersService | No
         id: str, title: str | None = None, due: str | None = None,
         priority: Literal["none", "low", "medium", "high"] | None = None,
         notes: str | None = None,
-    ) -> CallToolResult:
+    ) -> schemas.UpdateReply:
         return await call("update_reminder", id=id, title=title, due=due, priority=priority, notes=notes)
 
     @server.tool(annotations=annotations(False), description="Mark a reminder complete by exact ID; an already completed reminder is unchanged.")
-    async def complete_reminder(id: str) -> CallToolResult:
+    async def complete_reminder(id: str) -> schemas.CompleteReply:
         return await call("complete_reminder", id=id)
 
     @server.tool(annotations=annotations(False, destructive=True, idempotent=False), description=(
         "Permanently delete a reminder by exact ID. Requires explicit confirm=true and the user's approval."
     ))
-    async def delete_reminder(id: str, confirm: bool) -> CallToolResult:
+    async def delete_reminder(id: str, confirm: bool) -> schemas.DeleteReply:
         return await call("delete_reminder", id=id, confirm=confirm)
 
     @server.tool(annotations=annotations(True), description=(
         "Refresh the Go Reminders cache; full=true performs a full sync, which can take several minutes. "
         "This does not change iCloud data."
     ))
-    async def sync_reminders(full: bool = False) -> CallToolResult:
+    async def sync_reminders(full: bool = False) -> schemas.SyncReply:
         return await call("sync_reminders", full=full)
 
     @server.tool(annotations=annotations(True), description=(
         "List accepted participants of one shared Reminders list, including exact IDs, names and "
         "permissions. Obtain list_id from list_reminder_lists. Private lists return shared=false."
     ))
-    async def list_reminder_participants(list_id: str) -> CallToolResult:
+    async def list_reminder_participants(list_id: str) -> schemas.ParticipantsReply:
         return await call("list_reminder_participants", list_id=list_id)
 
     @server.tool(annotations=annotations(False, destructive=True), description=(
@@ -169,21 +183,21 @@ def register_reminders_tools(server: MCPServer, service: GoRemindersService | No
         "from list_reminder_participants. To remove the assignment, set clear=true and omit participant_id. "
         "This changes iCloud data; inspect an uncertain write before retrying."
     ))
-    async def assign_reminder(id: str, participant_id: str | None = None, clear: bool = False) -> CallToolResult:
+    async def assign_reminder(id: str, participant_id: str | None = None, clear: bool = False) -> schemas.AssignmentReply:
         return await call("assign_reminder", id=id, participant_id=participant_id, clear=clear)
 
     @server.tool(annotations=annotations(True), description=(
         "List native Apple Reminders sections in one exact list_id, in their section order. "
         "Use the returned section IDs for creation, moving and filtering; section headings are not reminders."
     ))
-    async def list_reminder_sections(list_id: str) -> CallToolResult:
+    async def list_reminder_sections(list_id: str) -> schemas.SectionsReply:
         return await call("list_reminder_sections", list_id=list_id)
 
     @server.tool(annotations=annotations(False, idempotent=False), description=(
         "Create a native section heading in an existing Reminders list. Use its exact list_id. "
         "Returns an exact section ID. Never automatically retry an uncertain creation."
     ))
-    async def create_reminder_section(list_id: str, title: str) -> CallToolResult:
+    async def create_reminder_section(list_id: str, title: str) -> schemas.CreateSectionReply:
         return await call("create_reminder_section", list_id=list_id, title=title)
 
     @server.tool(annotations=annotations(False, destructive=True), description=(
@@ -198,7 +212,7 @@ def register_reminders_tools(server: MCPServer, service: GoRemindersService | No
         id: str, parent_id: str | None = None, clear_parent: bool = False,
         section_id: str | None = None, clear_section: bool = False,
         before_id: str | None = None, after_id: str | None = None,
-    ) -> CallToolResult:
+    ) -> schemas.MoveReply:
         return await call("move_reminder", id=id, parent_id=parent_id, clear_parent=clear_parent,
                           section_id=section_id, clear_section=clear_section, before_id=before_id, after_id=after_id)
 
@@ -211,7 +225,7 @@ def register_reminders_tools(server: MCPServer, service: GoRemindersService | No
     ))
     async def reorder_reminders(
         list_id: str, reminder_ids: list[str], parent_id: str | None = None, section_id: str | None = None,
-    ) -> CallToolResult:
+    ) -> schemas.ReorderReply:
         return await call("reorder_reminders", list_id=list_id, reminder_ids=reminder_ids,
                           parent_id=parent_id, section_id=section_id)
 
@@ -232,7 +246,7 @@ def register_reminders_tools(server: MCPServer, service: GoRemindersService | No
     async def batch_update_reminders(
         list_id: str, reminders: list[ReminderNode], sections: list[ReminderSection] | None = None,
         dry_run: bool = True,
-    ) -> CallToolResult:
+    ) -> schemas.BatchReply:
         return await call(
             "batch_update_reminders", list_id=list_id,
             reminders=[node.model_dump(exclude_none=True) for node in reminders],

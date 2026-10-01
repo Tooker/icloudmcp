@@ -511,6 +511,37 @@ Structure writes use fresh list metadata, current shared-list permissions and
 an atomic CloudKit record request. Unknown metadata is preserved; unsupported
 formats fail before record mutation. Writes are never automatically retried.
 
+Repeated IDs in legacy manual-order metadata are read using their first
+occurrence. An unsupported list does not prevent account discovery, flat
+reminder reads, reads of other lists, or full sync. Affected results include
+`structure_warnings` with `list_id`, `record_type`, `structure_field`,
+`structure_reason`, and optional `structure_version`. Base reminder contents
+and parent references remain available; `sort_index=-1` means that native
+manual position is unavailable. Section filters and structure writes requiring
+that metadata fail before writing. Batches reject warnings for their target
+list before any mutation.
+
+All 15 Python Reminders tools publish explicit MCP `outputSchema` contracts
+defined in [app/reminders_schemas.py](app/reminders_schemas.py). Schemas describe
+both success and error objects, recursive trees, warnings, native per-step MCP
+results, and batch partial failures. Existing wire payloads and native content
+are retained. Optional structural fields and optional success `write_status`
+support older backends; additional fields support newer backends. Invalid
+backend results produce a safe `backend_protocol_error`, preserving confirmed
+write status or uncertainty without replaying the mutation.
+
+Mutation errors expose `error_code`, `operation`, `request_id`, `retry_class`,
+`retryable`, and `write_status`, plus safe upstream HTTP/code diagnostics when
+available. `write_status` is `not_sent`, `failed`, `succeeded`, or `unknown`;
+`retry_class` is `retryable_safe`, `retryable_after_read`, or `not_retryable`.
+Read errors omit `write_status`. Structure diagnostics never contain raw
+metadata or asset URLs. A confirmed structure write schedules durable scoped
+read-backs and preserves account delta tokens instead of forcing a full sync.
+Native deletion blocked by an existing `VALIDATE` reference (for example an
+attachment) returns `write_status=failed`, `retry_class=not_retryable`, and
+`upstream_error_code=VALIDATING_REFERENCE_ERROR`. The referencing records remain
+intact; automatic dependent-record deletion is not supported.
+
 ### Building the paired 1.1.0 source checkouts
 
 Keep this repository beside the updated `icloud-reminders-cli` checkout and run:

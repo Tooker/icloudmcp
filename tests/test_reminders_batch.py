@@ -33,7 +33,7 @@ def backend(monkeypatch):
         "tools": set(REMINDER_TOOLS) - {"batch_update_reminders"},
         "calls": [], "sessions": 0, "writes": 0, "delay": 0,
         "fail_write": None, "failure_code": "icloud_write_failed", "bad_create_result": False,
-        "failure_details": None, "supports_key": False,
+        "failure_details": None, "supports_key": False, "structure_warnings": [],
     }
 
     async def handle(request):
@@ -130,6 +130,8 @@ def backend(monkeypatch):
                 data = {"id": "list", "status": "reordered"}
             else:
                 raise AssertionError("Batch called an unexpected tool")
+            if name in READS and state["structure_warnings"]:
+                data["structure_warnings"] = state["structure_warnings"]
             payload = {"content": [{"type": "text", "text": json.dumps(data)}], "structuredContent": data}
         return httpx2.Response(200, json={"jsonrpc": "2.0", "id": message["id"], "result": payload})
 
@@ -429,3 +431,16 @@ def test_invalid_or_duplicate_creation_keys_fail_before_connecting(backend, keys
     assert result.structured_content["write_status"] == "not_sent"
     assert result.structured_content["operation"] == "batch_update_reminders"
     assert result.structured_content["request_id"]
+
+
+@pytest.mark.parametrize("affected", ["list", "another-list"])
+def test_structure_warning_blocks_only_affected_batch_before_writes(backend, affected):
+    service, state = backend
+    state["structure_warnings"] = [{"list_id": affected, "error_code": "unsupported_structure", "structure_field": "SectionIDsOrderingAsData", "structure_reason": "unsupported_version", "structure_version": 99999999}]
+    result = invoke(service, {**new_tree(), "dry_run": False})
+    if affected == "list":
+        assert result.is_error and state["writes"] == 0
+        assert result.structured_content["error"]["write_status"] == "not_sent"
+        assert result.structured_content["error"]["structure_field"] == "SectionIDsOrderingAsData"
+    else:
+        assert not result.is_error and state["writes"] > 0

@@ -145,3 +145,36 @@ def test_keyed_creation_is_forwarded_once_when_backend_declares_support(monkeypa
     calls = [m for m in messages if m["method"] == "tools/call"]
     assert len(calls) == 1
     assert calls[0]["params"]["arguments"]["client_request_id"] == key
+
+
+def test_structure_parser_diagnostics_survive_without_raw_metadata(monkeypatch):
+    list_id = "List/3D03EB9A-3DEC-4737-94D7-3AEF5D4A851C"
+    backend, _ = simulated_go(monkeypatch, result={
+        "isError": True, "content": [{"type": "text", "text": PRIVATE}],
+        "structuredContent": {"error_code": "unsupported_structure", "write_status": "not_sent", "retry_class": "not_retryable",
+                              "list_id": list_id, "record_type": "List", "structure_field": "SectionIDsOrderingAsData",
+                              "structure_reason": "unsupported_version", "structure_version": 99999999, "raw": PRIVATE},
+    })
+    result = call(backend)
+    assert result.is_error and result.structured_content["write_status"] == "not_sent"
+    assert result.structured_content["list_id"] == list_id
+    assert result.structured_content["structure_field"] == "SectionIDsOrderingAsData"
+    assert result.structured_content["structure_reason"] == "unsupported_version"
+    assert result.structured_content["structure_version"] == 99999999
+    assert PRIVATE not in str(result)
+
+
+def test_native_reference_rejection_is_a_failed_delete_without_retry(monkeypatch):
+    backend, messages = simulated_go(monkeypatch, result={
+        "isError": True, "content": [{"type": "text", "text": PRIVATE}],
+        "structuredContent": {"error_code": "icloud_write_failed", "write_status": "failed",
+                              "retry_class": "not_retryable", "upstream_status": 200,
+                              "upstream_error_code": "VALIDATING_REFERENCE_ERROR", "reason": PRIVATE},
+    })
+    result = call(backend, name="delete_reminder", id="exact-id", confirm=True)
+    assert result.is_error
+    assert result.structured_content["upstream_error_code"] == "VALIDATING_REFERENCE_ERROR"
+    assert result.structured_content["write_status"] == "failed"
+    assert not result.structured_content["retryable"]
+    assert len([item for item in messages if item["method"] == "tools/call"]) == 1
+    assert PRIVATE not in str(result)
