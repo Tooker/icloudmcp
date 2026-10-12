@@ -1,9 +1,9 @@
 # iCloud MCP
 
-**Calendar, mail and shared reminders — available to your assistant through MCP.**
+**Calendar, mail, contacts, Drive files and shared reminders — available through MCP.**
 
 Look up appointments, find emails and original attachments, prepare drafts,
-and organise tasks, including assignments to people in shared lists. Optional
+read and create contacts, browse Drive files, and organise tasks, including assignments to people in shared lists. Optional
 semantic search finds information inside cached emails and PDFs by meaning.
 
 Self-host the service with Docker and connect a compatible MCP client to
@@ -15,6 +15,8 @@ one endpoint.
 | --- | --- |
 | **Calendar** | List calendars, search appointments, expand recurring events into their actual occurrences, create and update events, and delete one occurrence or an entire series. |
 | **Mail** | Search mailboxes, read messages without marking them read, retrieve original attachments, extract PDF/text content, prepare drafts with attachments, move messages and change read status. |
+| **Contacts** | Discover address books, list and search contacts, read labelled contact details and create contacts through CardDAV. |
+| **Drive · optional** | Browse folders, search file names and download files as native MCP resources or read PDF/text content. Read-only. |
 | **Reminders** | Read lists and tasks, create native sections and subtasks, arrange manual order, apply a complete target tree in one batch, change dates, notes and priorities, complete or delete tasks, and assign reminders to accepted collaborators in shared lists. |
 | **Semantic search · optional** | Search cached mail bodies and PDF/text attachments by meaning, see matching excerpts, and retrieve the original message or file. |
 
@@ -23,6 +25,7 @@ Typical requests to a connected assistant:
 - “What appointments do I have tomorrow?”
 - “Find the invoice in my emails and give me the original PDF.”
 - “Prepare a reply with this document attached.”
+- “Find Anne's phone number and create a contact for the new supplier.”
 - “Create a task in our shared list and assign it to a collaborator.”
 
 Writes change your iCloud data. MCP tool descriptions ask the client to obtain
@@ -30,12 +33,13 @@ approval before making changes; deletion also has explicit confirmation
 arguments. Drafts are uploaded to iCloud Mail so you can review and send them
 from your mail client.
 
-Calendar, Mail and Reminders can be configured independently. Clients connect
+Calendar, Mail, Contacts, Drive and Reminders can be configured independently. Clients connect
 to the same MCP endpoint regardless of which services are enabled.
 
 **Read next:** [Architecture](#architecture) · [Infrastructure](#infrastructure) ·
 [Docker setup](#docker-setup) ·
 [Go Reminders service](#go-reminders-service) ·
+[Drive setup](#drive-setup) ·
 [Semantic search](#semantic-search) · [Tool reference](#tool-reference) ·
 [Configuration](#configuration) · [Operations](#operations) ·
 [Development](#development)
@@ -51,6 +55,7 @@ flowchart TB
         Tunnel["openai-tunnel<br/>Optional remote access"]
         Python["icloud-cruncher<br/>Python · FastAPI + MCP"]
         Go["reminders<br/>Go · Reminders MCP"]
+        DriveBackend["drive<br/>Private read-only MCP"]
         SQLite[("SQLite<br/>Calendar and mail cache")]
         Qdrant[("Qdrant<br/>Optional search index")]
     end
@@ -61,7 +66,10 @@ flowchart TB
     Tunnel -->|"Private MCP · /mcp"| Python
     Python -->|"CalDAV · HTTPS"| Calendar["iCloud Calendar"]
     Python -->|"IMAP · TLS"| Mail["iCloud Mail"]
+    Python -->|"CardDAV · HTTPS"| Contacts["iCloud Contacts"]
     Python -->|"MCP Streamable HTTP"| Go
+    Python -->|"Private MCP + bearer token"| DriveBackend
+    DriveBackend -->|"Saved web session · HTTPS"| Drive["iCloud Drive"]
     Go -->|"CloudKit · HTTPS"| Reminders["iCloud Reminders"]
     Python <--> SQLite
     Python <--> Qdrant
@@ -71,7 +79,11 @@ flowchart TB
 The **Python service is the entry point** at `/mcp` and `/mcp/`. Calendar and
 Mail tools call their Python adapters in worker threads because CalDAV and
 IMAP are blocking. Reminders tools use an asynchronous MCP client to call the
-Go service at `http://reminders:8080/mcp`.
+Go service at `http://reminders:8080/mcp`. Contacts use asynchronous CardDAV
+requests directly from Python, with verified HTTPS and a total operation deadline.
+Drive uses its own optional private Python service, with an immutable session
+export created by the administrative login/approval CLI. Normal MCP operations
+never log in or request device approval.
 
 The tunnel reaches only Python. Its container initiates an outbound connection
 to OpenAI, retrieves queued requests and forwards them on the private network.
@@ -87,6 +99,9 @@ JSON-RPC over HTTP.
 | [app/mcp_server.py](app/mcp_server.py) | Calendar/Mail/search tools and MCP result handling. |
 | [app/icloud.py](app/icloud.py) | CalDAV operations and recurring-event handling. |
 | [app/imap.py](app/imap.py) | IMAP searches, message reads, drafts and mailbox operations. |
+| [app/contacts.py](app/contacts.py) · [app/contacts_tools.py](app/contacts_tools.py) · [app/contacts_schemas.py](app/contacts_schemas.py) | CardDAV discovery, bounded contact reads and structured contact creation. |
+| [app/drive.py](app/drive.py) · [app/drive_client.py](app/drive_client.py) · [app/drive_tools.py](app/drive_tools.py) | Read-only web protocol, private MCP bridge and Drive tools. |
+| [app/drive_backend.py](app/drive_backend.py) · [app/drive_writes.py](app/drive_writes.py) · Go `drive-export` | Private Drive reader/writer and administrative reuse of the Go login. |
 | [app/reminders.py](app/reminders.py) · [app/reminders_tools.py](app/reminders_tools.py) · [app/reminders_batch.py](app/reminders_batch.py) | Asynchronous Go bridge, typed Reminders tools and declarative batch planning. |
 | [app/icloud_cache.py](app/icloud_cache.py) | Persistent SQLite cache shared by Calendar and Mail. |
 | [app/semantic_search.py](app/semantic_search.py) · [app/batch_embeddings.py](app/batch_embeddings.py) | Optional mail/PDF indexing, embeddings and semantic queries. |
@@ -104,9 +119,10 @@ Compose builds that repository directly at a fixed commit.
 
 | Compose service | Enabled by | Purpose | Published host port |
 | --- | --- | --- | --- |
-| `icloud-cruncher` | Default | Common Python MCP endpoint, Calendar/Mail adapters and optional indexing. | `127.0.0.1:8080` |
+| `icloud-cruncher` | Default | Common Python MCP endpoint, Calendar/Mail/Contacts adapters and optional indexing. | `127.0.0.1:8080` |
 | `openai-tunnel` | Default service; requires tunnel configuration | Outbound access from supported OpenAI clients to the private Python endpoint. | None |
 | `reminders` | `reminders` profile | Go MCP backend for iCloud Reminders. | None |
+| `drive` | `drive` profile | Read-only Drive backend with its own `drive-data` session volume. | None |
 | `qdrant` | `search` profile | Vector index for optional semantic mail/PDF search. | None |
 
 All services communicate over the Compose network using service names.
@@ -447,6 +463,117 @@ an unconfigured backend return a safe configuration error;
 | `semantic_search_emails` | Search cached body/attachment text by meaning. |
 | `email_search_index_status` | Inspect local indexing progress without fetching iCloud data or calling OpenAI. |
 
+### Drive
+
+| Tool | Purpose |
+| --- | --- |
+| `drive_status` | Probe existing access, session state and capabilities without account details or approval requests. |
+| `list_drive_items` | Browse one folder with bounded pagination; omit `folder_id` for root. |
+| `search_drive_files` | Search filename substrings within bounded folder traversal. |
+| `get_drive_file` | Read a file as a native MCP resource, PDF/text or original base64 byte chunks. |
+| `create_drive_folder` | Create one folder, rejecting existing names. |
+| `upload_drive_file` | Upload original bytes, UTF-8 text or an issued Mail/Drive snapshot; reject existing names. |
+| `replace_drive_file` | Stage verified bytes, move the version-checked original to Trash, and replace its name; requires `confirm=true`. |
+
+Use exact opaque IDs from status/list/search;
+URLs and local server paths are not accepted. Search is case-insensitive by
+filename and does not index contents. `recursive=true`, `max_depth=3` and
+`max_nodes=1000` bound the default search; `limit` is 1–500.
+Check `coverage_complete` and `skipped_count` before concluding absence.
+Shared items, app libraries and document packages are skipped or explicitly
+rejected. Folder changes between calls can shift pages.
+
+Uploads and replacement accept exactly one of `content_base64`, `content_text`
+or `source_resource_uri`; the latter resolves only already-issued native Mail
+or Drive snapshots in the common endpoint. No external URLs or server file
+paths are accepted. The limit remains 30 MB per file. Writes refresh folder
+coverage and permissions and never replay automatically.
+
+Replacement additionally requires `expected_version` from a listing or read.
+It uploads and verifies a separate staging file first, checks the original
+again, moves it to native Trash using its etag, then renames the staging file
+using that file's etag. This is non-atomic and returns a new file ID. The old
+file remains in Trash. Failed calls preserve `write_status`, all known IDs,
+`confirmed_steps`, `uncertain_step` and `original_in_trash` (null if unknown).
+Partial operations may leave staging files; inspect them before another action.
+
+`get_drive_file(file_id=..., format="file")` returns a complete original file,
+resource link and embedded binary resource. Mail and Drive share a maximum
+of 64 snapshots and 30 MB total, expiring after at most 15 minutes. Drive
+resource URIs use `icloud-drive://files/`; `resources/read` serves them,
+`resources/list` excludes them, and no public download route exists.
+
+`format="text"` uses the existing PDF/text extractor; scanned PDFs need OCR.
+`format="base64"` returns original byte chunks. The default `limit` is 20000;
+text limits count characters (max 100000), base64 limits count bytes (max
+1000000). File downloads are bounded to `DRIVE_MAX_FILE_BYTES` (default and
+maximum 30 MB) in every format. Each call downloads and verifies the complete
+file before returning its window; this initial implementation has no Drive
+content cache.
+
+Pass the download's returned `version` as `expected_version` on further
+chunks/text pages; this is required for `offset>0`. Metadata is checked before
+and after download, and download versions include a full-content SHA-256.
+On `version_changed`, discard earlier chunks and start again. An initial
+request can also pass the item's metadata `version` from a listing.
+
+### Contacts
+
+| Tool | Purpose |
+| --- | --- |
+| `list_addressbooks` | Discover account-scoped address-book IDs, display names and current creation permissions. |
+| `list_contacts` | Read a bounded page of contacts from an address book. |
+| `search_contacts` | Search names, organization, email and phone using case-insensitive substrings; numeric phone queries ignore formatting. |
+| `get_contact` | Read supported details, UID and ETag by an exact contact ID. |
+| `create_contact` | Create a new vCard from structured fields; never overwrite or merge existing contacts. |
+
+Select an exact `addressbook_id` from `list_addressbooks`. It can be omitted
+when there is one suitable book or `CARDDAV_DEFAULT_ADDRESSBOOK` is configured.
+`writable=null` means the server did not report privileges; it does not confirm
+write access. Creation refreshes discovery and permissions before sending.
+Backend URLs and resource paths are not tool arguments.
+
+`create_contact` accepts a `contact` object containing `display_name`,
+`given_name`, `family_name`, `additional_name`, `name_prefix`, `name_suffix`,
+`organization`, `emails`, `phones`, `addresses`, `birthday` and `notes`.
+At least a name or organization is required. Email and phone entries use
+`{"value": "…", "label": "work"}`; addresses use `label`, `po_box`, `extended`,
+`street`, `city`, `region`, `postal_code` and `country`. Birthday must be a
+valid `YYYY-MM-DD`. Missing fields can be omitted.
+
+```json
+{
+  "contact": {
+    "given_name": "Anne",
+    "family_name": "Example",
+    "organization": "Example Company",
+    "emails": [{"value": "anne@example.com", "label": "work"}],
+    "phones": [{"value": "+49 30 123456", "label": "work"}]
+  },
+  "addressbook_id": "<exact ID from list_addressbooks>"
+}
+```
+
+Creation uses a fresh UID and `PUT` with `If-None-Match: *`, then reads back
+the stored card. `write_status=succeeded` confirms creation even if that
+readback fails. Errors preserve `write_status` (`not_sent`, `failed`, `unknown`
+or `succeeded`) and, once allocated, `contact_id`, `addressbook_id` and `uid`.
+Never automatically repeat an unknown or already successful creation; check
+`get_contact(contact_id=...)` first. A new call creates a fresh UID, so callers
+must not assume repeated requests are idempotent.
+
+Reads use fresh catalogues without a Contacts cache. `limit` is 1–500 and
+`next_offset` paginates resource entries for listing, matching entries for
+search. The catalogue is bounded by `CARDDAV_MAX_CONTACTS`; each DAV response
+is limited to 8 MiB, the total response budget to 32 MiB, and each vCard to
+256 KiB. Check `coverage_complete` and `skipped_count`; incomplete searches
+cannot establish absence. Catalogue changes between calls can shift pages.
+IDs survive restarts for the same account, endpoint and resource; removal or
+moving a card to another resource invalidates its previous ID.
+
+Contact IDs are unrelated to the exact shared-list participant IDs used by
+Reminders assignments.
+
 ### Reminders
 
 | Tool | Purpose |
@@ -724,6 +851,95 @@ total; eviction or service restarts can expire them earlier. Request the file
 again if a link expires. They are excluded from `resources/list` and have no
 public download route. Download/preview presentation depends on the client.
 
+## Drive setup
+
+Drive reuses the existing Go Reminders login. The extended Go CLI discovers
+Drive/document service endpoints and optionally requests Drive-specific
+trusted-device approval; no second Python web login is needed. Python only
+reads the protected exported session and provides the existing Drive/file tools.
+
+1. Add `drive` to existing `COMPOSE_PROFILES`, set
+   `DRIVE_MCP_URL=http://drive:8080/mcp`, and create a dedicated
+   `DRIVE_MCP_TOKEN` of at least 32 printable characters. Do not reuse Apple
+   credentials or the Reminders bearer token.
+2. The paired Go checkout must contain the new `drive-export` command.
+   `drive-auth` builds `../icloud-reminders-cli` by default; set
+   `DRIVE_AUTH_BUILD_CONTEXT` for a different checkout. Build the images:
+
+   ```bash
+   docker compose --profile drive --profile drive-admin build icloud-cruncher drive drive-auth
+   ```
+
+3. Stop Go before administrative operations, then reuse its saved login:
+
+   ```bash
+   docker compose stop reminders
+   docker compose --profile drive-admin run --rm --no-deps drive-auth drive-export --output /drive-data/session.json
+   docker compose up -d reminders
+   ```
+
+   The `drive-auth` service mounts `reminders-data` and `drive-data`; neither
+   volume is mounted into the common Python endpoint. Go owns the master login,
+   directory lease and session changes. Drive runtime mounts its export read-only.
+   The Drive volume must be writable by the Go image's UID 10001; an existing
+   root-owned volume needs its top-level directory assigned to that UID once.
+   Exported files are atomically replaced with mode 0600. Cookies retain
+   domain, host-only, secure and expiry scope; no primary password is exported.
+4. If Drive reports that approval is required, explicitly approve Drive using
+   the same login, while Go remains stopped:
+
+   ```bash
+   docker compose stop reminders
+   docker compose --profile drive-admin run --rm --no-deps drive-auth drive-export --output /drive-data/session.json --approve-web-access
+   docker compose up -d reminders
+   ```
+
+   Approve the trusted-device notification when prompted. Reminders and Drive
+   need their own service keys; a Reminders approval does not prove Drive access.
+   Apple documents [web access and temporary approval](https://support.apple.com/en-gb/108756).
+   Ordinary exports and MCP reads never request notifications.
+5. Start the Drive reader and common endpoint, then call `drive_status`:
+
+   ```bash
+   docker compose up -d drive icloud-cruncher
+   ```
+
+If the saved Go web login itself expired (for example, accountLogin HTTP 421),
+authenticate once with the existing Go `reminders auth --force` command;
+add `--approve-web-access` when Reminders needs device approval, then export
+Drive again. `--force` also renews a rejected web token when cached Reminders
+access still works. Go and Python never share a mutable
+session file: Go updates its master session, while Python reads a separate
+immutable export. Its encrypted-reference key survives exports for the same
+account. Administrative renewal/approval remains separate from MCP reads.
+
+To test an original file through the common endpoint:
+
+```bash
+RUN_LIVE_DRIVE_TESTS=1 uv run pytest tests/test_live_drive.py -q -s
+```
+
+This read-only smoke samples one owned file up to 1 MB from at most ten folder
+pages, verifies its native binary checksum and `resources/read` bytes, and
+prints counts only. Set `LIVE_DRIVE_FILE_ID` to select an exact issued file and
+`LIVE_DRIVE_MCP_URL` to change the default loopback endpoint. The initial tests
+use simulated Apple responses; live access must be checked for the real account.
+
+The separate, explicit write smoke creates a fresh test folder, uploads a
+new test file and replaces only that file. It checks original bytes and the
+native MCP resource; the test folder/file and original in Trash remain for
+inspection. It never retries, signs in or modifies pre-existing files:
+
+```bash
+RUN_LIVE_DRIVE_WRITE_TESTS=1 uv run pytest tests/test_live_drive_writes.py -q -s
+```
+
+The common tool catalogue keeps existing names and sorts tools by Calendar,
+Mail, Contacts, Drive and Reminders. Titles carry the service prefix, and
+`_meta["de.theinloth.icloud/service"]` records its stable service key. MCP
+clients choose their own presentation; custom group metadata does not force
+a grouped UI.
+
 ## Configuration
 
 Docker Compose reads `.env`. Local Python can use environment variables or an
@@ -733,9 +949,21 @@ See [.env.example](.env.example) and [config.example.yaml](config.example.yaml).
 
 | Setting | Default / role |
 | --- | --- |
-| `ICLOUD_USERNAME` · `ICLOUD_APP_PASSWORD` | Calendar account; also the Mail fallback. |
+| `ICLOUD_USERNAME` · `ICLOUD_APP_PASSWORD` | Calendar account; also the Mail and Contacts fallback. |
 | `ICLOUD_DEFAULT_CALENDAR` | Optional name/ID from `list_calendars`. |
 | `ICLOUD_TIMEZONE` | Application default `UTC`; Compose default `Europe/Berlin`. |
+| `CARDDAV_USERNAME` · `CARDDAV_APP_PASSWORD` | Optional dedicated Contacts credentials; use an Apple app-specific password. |
+| `CARDDAV_URL` | `https://contacts.icloud.com/`; HTTPS on port 443, with safe partition discovery. |
+| `CARDDAV_DEFAULT_ADDRESSBOOK` | Optional exact ID from `list_addressbooks`. |
+| `CARDDAV_TIMEOUT_SECONDS` | `60`; total Contacts operation deadline, range 1–300. |
+| `CARDDAV_MAX_CONTACTS` | `5000`; maximum catalogue entries, range 1–20000. |
+| `DRIVE_MCP_URL` | Empty disables Drive; Compose endpoint `http://drive:8080/mcp`. |
+| `DRIVE_MCP_TOKEN` | Dedicated 32–512-character bridge token; no Apple password/token reuse. |
+| `DRIVE_MCP_TIMEOUT_SECONDS` | `90`; total bridge deadline, maximum 300. |
+| `DRIVE_REQUEST_TIMEOUT_SECONDS` | `60`; total private read deadline, maximum 300. |
+| `DRIVE_MAX_FILE_BYTES` | `30000000`; maximum original file bytes, up to 30 MB. |
+| `DRIVE_MAX_FOLDER_ITEMS` | `2000`; per-folder metadata item cap, maximum 20000. |
+| `DRIVE_SESSION_PATH` | Local `secrets/icloud-drive/session.json`; private Compose backend `/data/session.json`. |
 | `IMAP_USERNAME` · `IMAP_APP_PASSWORD` | Optional dedicated Mail credentials. |
 | `IMAP_HOST` · `IMAP_PORT` | `imap.mail.me.com` · `993`. |
 | `IMAP_DEFAULT_MAILBOX` · `IMAP_DRAFTS_MAILBOX` | `INBOX` · `Drafts`. |
@@ -743,7 +971,7 @@ See [.env.example](.env.example) and [config.example.yaml](config.example.yaml).
 | `REMINDERS_MCP_TOKEN` | Optional private bearer token shared by Python and Go. |
 | `REMINDERS_MCP_TIMEOUT_SECONDS` | `210`; total bridge deadline. |
 | `REMINDERS_BUILD_CONTEXT` | Pinned Git context; optional development override. |
-| `COMPOSE_PROFILES` | `reminders`, `search`, or `search,reminders`. |
+| `COMPOSE_PROFILES` | Optional `reminders`, `search`, `drive` or a comma-separated combination. |
 | `CONTROL_PLANE_API_KEY` · `CONTROL_PLANE_TUNNEL_ID` | Required when running the tunnel. |
 | `TUNNEL_CLIENT_VERSION` · `QDRANT_VERSION` | Compose image defaults: `v0.0.15` · `v1.19.1`. |
 
@@ -898,9 +1126,10 @@ docker compose config --quiet
 docker compose build
 ```
 
-Normal tests use fake CalDAV/IMAP/Go services and skip real account access.
+Normal tests use fake CalDAV/CardDAV/IMAP/Drive/Go services and skip real account access.
 They cover recurring-event deletion, cache generations/invalidation, native
-attachments, semantic indexing and the Python-to-Go MCP bridge. The Go
+attachments, semantic indexing, CardDAV discovery/creation/uncertainty, Drive
+session isolation/download versions and the Python-to-Go MCP bridge. The Go
 repository separately tests shared-zone routing, permissions and
 assign/reassign/clear using simulated CloudKit responses.
 
@@ -935,5 +1164,10 @@ sync, local startup, tests and Compose commands.
 - Native attachment previews/downloads depend on the MCP client.
 - Reminders uses private iCloud web/CloudKit APIs and temporary device approval;
   Apple can change the protocol or expire access.
-- Calendar, Mail and Reminders are supported; Contacts, Notes and iCloud Drive
-  access are outside the current scope.
+- Contacts support reading, searching and creating. Updates, deletion, photos,
+  contact groups and additional Apple extension fields are not exposed.
+- Drive supports ordinary owned files/folders only. Writes, shared items,
+  app libraries, document packages and semantic Drive indexing are not exposed.
+  Web API compatibility and live account access require verification; session
+  renewal and ADP approval remain administrative operations.
+- Notes remain a planned extension.

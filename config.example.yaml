@@ -11,6 +11,15 @@ icloud:
   default_calendar: null
   timezone: "Europe/Berlin"
 
+# iCloud Contacts reuse the icloud credentials. Dedicated username and
+# app_specific_password fields can override them, like CARDDAV_* variables.
+contacts:
+  carddav_url: "https://contacts.icloud.com/"
+  # Exact ID from list_addressbooks; no display names or remote URLs.
+  default_addressbook: null
+  timeout_seconds: 60
+  max_contacts: 5000
+
 # iCloud Mail uses the same Apple Account credentials by default. Dedicated
 # IMAP_USERNAME and IMAP_APP_PASSWORD environment variables can override them.
 imap:

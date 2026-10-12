@@ -48,6 +48,11 @@ def test_streamable_http_mcp_endpoint_exposes_calendar_tools(tmp_path: Path, end
     assert '"name":"create_draft"' in tools_response.text
     assert '"name":"update_draft"' in tools_response.text
     assert '"name":"mark_email_read"' in tools_response.text
+    assert '"name":"list_addressbooks"' in tools_response.text
+    assert '"name":"get_contact"' in tools_response.text
+    assert '"name":"create_contact"' in tools_response.text
+    assert '"name":"list_drive_items"' in tools_response.text
+    assert '"name":"get_drive_file"' in tools_response.text
 
 
 @pytest.mark.parametrize("legacy_config", [False, True])

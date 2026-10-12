@@ -14,6 +14,16 @@ services:
       ICLOUD_APP_PASSWORD: ${ICLOUD_APP_PASSWORD:-}
       ICLOUD_DEFAULT_CALENDAR: ${ICLOUD_DEFAULT_CALENDAR:-}
       ICLOUD_TIMEZONE: ${ICLOUD_TIMEZONE:-Europe/Berlin}
+      # CardDAV Contacts reuse ICLOUD credentials unless overridden.
+      CARDDAV_USERNAME: ${CARDDAV_USERNAME:-}
+      CARDDAV_APP_PASSWORD: ${CARDDAV_APP_PASSWORD:-}
+      CARDDAV_URL: ${CARDDAV_URL:-https://contacts.icloud.com/}
+      CARDDAV_DEFAULT_ADDRESSBOOK: ${CARDDAV_DEFAULT_ADDRESSBOOK:-}
+      CARDDAV_TIMEOUT_SECONDS: ${CARDDAV_TIMEOUT_SECONDS:-60}
+      CARDDAV_MAX_CONTACTS: ${CARDDAV_MAX_CONTACTS:-5000}
+      DRIVE_MCP_URL: ${DRIVE_MCP_URL:-}
+      DRIVE_MCP_TOKEN: ${DRIVE_MCP_TOKEN:-}
+      DRIVE_MCP_TIMEOUT_SECONDS: ${DRIVE_MCP_TIMEOUT_SECONDS:-90}
       IMAP_USERNAME: ${IMAP_USERNAME:-}
       IMAP_APP_PASSWORD: ${IMAP_APP_PASSWORD:-}
       IMAP_HOST: ${IMAP_HOST:-imap.mail.me.com}
@@ -76,6 +86,37 @@ services:
       HEALTH_LISTEN_ADDR: :8081
     restart: unless-stopped
 
+  # Optional Drive backend; administrative Go owns the session export.
+  drive:
+    profiles: ["drive"]
+    build: .
+    command: ["uvicorn", "app.drive_backend:create_drive_app", "--factory", "--host", "0.0.0.0", "--port", "8080"]
+    volumes:
+      - drive-data:/data:ro
+    environment:
+      DRIVE_MCP_TOKEN: ${DRIVE_MCP_TOKEN:-}
+      DRIVE_SESSION_PATH: /data/session.json
+      DRIVE_REQUEST_TIMEOUT_SECONDS: ${DRIVE_REQUEST_TIMEOUT_SECONDS:-60}
+      DRIVE_MAX_FILE_BYTES: ${DRIVE_MAX_FILE_BYTES:-30000000}
+      DRIVE_MAX_FOLDER_ITEMS: ${DRIVE_MAX_FOLDER_ITEMS:-2000}
+    init: true
+    restart: unless-stopped
+
+  # Administrative reuse of the existing Go login; stop reminders before use.
+  drive-auth:
+    profiles: ["drive-admin"]
+    build:
+      context: ${DRIVE_AUTH_BUILD_CONTEXT:-../icloud-reminders-cli}
+    volumes:
+      - reminders-data:/data
+      - drive-data:/drive-data
+    environment:
+      ICLOUD_REMINDERS_DATA_DIR: /data
+    healthcheck:
+      disable: true
+    init: true
+    restart: "no"
+
   # Build the separately maintained Go project at a fixed, reviewed commit.
   # No published ports: only Python connects to its private MCP endpoint.
   reminders:
@@ -103,6 +144,7 @@ services:
     restart: unless-stopped
 
 volumes:
+  drive-data:
   icloud-cache:
   qdrant-storage:
   reminders-data:

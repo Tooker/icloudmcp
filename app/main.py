@@ -35,7 +35,11 @@ from app.config import (
     load_imap_config,
     load_icloud_config,
     load_reminders_config,
+    load_contacts_config,
 )
+from app.contacts import ICloudContactsService
+from app.drive_client import DriveBackendClient
+from app.drive_config import load_drive_config
 from app.icloud import ICloudCalendarService
 from app.icloud_cache import SQLiteICloudCalendarCache
 from app.imap import ICloudIMAPService
@@ -99,6 +103,8 @@ def create_app(
     imap_service: ICloudIMAPService | None = None,
     mail_search: SemanticMailSearch | None = None,
     reminders_service: GoRemindersService | None = None,
+    contacts_service: ICloudContactsService | None = None,
+    drive_service: DriveBackendClient | None = None,
 ) -> FastAPI:
     _configure_healthcheck_access_logging()
     icloud_config: ICloudConfig | None = load_icloud_config(config_path, environ)
@@ -144,7 +150,11 @@ def create_app(
                            bool(search_config.api_key), getattr(mail_service, "_cache", None) is not None)
     reminders_config = load_reminders_config(environ)
     reminders_backend = reminders_service or (GoRemindersService(reminders_config) if reminders_config else None)
-    mcp_server = create_mcp_server(service, mail_service, search_service, reminders_backend)
+    contacts_config = load_contacts_config(config_path, environ)
+    contacts_backend = contacts_service or (ICloudContactsService(contacts_config) if contacts_config else None)
+    drive_config = load_drive_config(environ)
+    drive_backend = drive_service or (DriveBackendClient(drive_config) if drive_config else None)
+    mcp_server = create_mcp_server(service, mail_service, search_service, reminders_backend, contacts_backend, drive_backend)
     mcp_http_app = mcp_server.streamable_http_app(
         streamable_http_path="/",
         host="0.0.0.0",
@@ -236,6 +246,8 @@ def create_app(
     app.state.imap_service = mail_service
     app.state.mail_search = search_service
     app.state.reminders_service = reminders_backend
+    app.state.contacts_service = contacts_backend
+    app.state.drive_service = drive_backend
     app.state.mcp_server = mcp_server
     if shared_cache is not None:
         logger.info(

@@ -12,6 +12,10 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import CallToolResult, TextContent, ToolAnnotations
 
 from app.icloud import ICloudCalendarService, ICloudServiceError
+from app.contacts import ICloudContactsService
+from app.contacts_tools import register_contacts_tools
+from app.drive_client import DriveBackendClient
+from app.drive_tools import register_drive_tools
 from app.imap import ICloudIMAPService, IMAPServiceError
 from app.mcp_resources import AttachmentMCPServer
 from app.reminders import GoRemindersService
@@ -47,12 +51,14 @@ def create_mcp_server(
     imap_service: ICloudIMAPService | None = None,
     mail_search: SemanticMailSearch | None = None,
     reminders_service: GoRemindersService | None = None,
+    contacts_service: ICloudContactsService | None = None,
+    drive_service: DriveBackendClient | None = None,
 ) -> MCPServer:
     server = AttachmentMCPServer(
         name="icloud-cruncher",
-        title="iCloud Calendar, Mail & Reminders",
+        title="iCloud Calendar, Mail, Contacts, Drive & Reminders",
         description=(
-            "Read and write iCloud Calendar and Mail through CalDAV/IMAP, and Reminders through the Go backend."
+            "Read and write iCloud Calendar, Mail and Contacts through CalDAV/IMAP/CardDAV, and Drive/Reminders through private backends."
         ),
         instructions=(
             "Use list_calendars before selecting a calendar when the calendar is unknown. "
@@ -60,6 +66,16 @@ def create_mcp_server(
             "Write and delete operations change the user's iCloud data; summarize the "
             "planned change and obtain user approval before calling them. Draft tools "
             "upload messages to IMAP but never send them; the user sends drafts manually. "
+            "Use list_addressbooks and exact account-scoped IDs for Contacts. Contacts creation never merges duplicates. "
+            "Never blindly retry a failed or timed-out create_contact: preserve write_status, contact_id and UID, "
+            "and inspect get_contact first. A succeeded status remains confirmed if readback fails. "
+            "Contacts IDs do not identify Reminders participants. "
+            "Tools are grouped by Calendar, Mail, Contacts, Drive and Reminders through titles and service metadata; tool names remain stable. "
+            "Start Drive with drive_status and list_drive_items; use issued opaque IDs. "
+            "Drive uploads reject existing names. replace_drive_file requires confirm=true and the expected version; it stages verified bytes, "
+            "moves the original to Trash and returns a new ID. It is non-atomic. Preserve all write state and never retry uncertain Drive writes. "
+            "Drive authentication/ADP approval happen only through the administrative CLI. Check search coverage. "
+            "Use the returned download version on subsequent Drive file chunks; discard chunks on version_changed. "
             "Use list_reminder_lists and list_reminders to get exact IDs before Reminders operations. "
             "Native section headings are separate from reminders. Use list_reminder_sections for section IDs. "
             "Use view=tree for nested subtasks, move_reminder for indentation/sections and reorder_reminders for manual order. "
@@ -647,4 +663,6 @@ def create_mcp_server(
         )
 
     register_reminders_tools(server, reminders_service)
+    register_contacts_tools(server, contacts_service)
+    register_drive_tools(server, drive_service)
     return server

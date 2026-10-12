@@ -29,6 +29,78 @@ DEFAULT_IMAP_EMAIL_CACHE_CRAWL_ENABLED = True
 DEFAULT_IMAP_EMAIL_CACHE_CRAWL_BATCH_SIZE = 25
 DEFAULT_IMAP_EMAIL_CACHE_CRAWL_INTERVAL_SECONDS = 0.1
 DEFAULT_IMAP_EMAIL_CACHE_MAX_MESSAGE_BYTES = 25_000_000
+DEFAULT_CARDDAV_URL = "https://contacts.icloud.com/"
+
+
+@dataclass(frozen=True)
+class ContactsConfig:
+    username: str = field(repr=False)
+    app_specific_password: str = field(repr=False)
+    carddav_url: str = DEFAULT_CARDDAV_URL
+    default_addressbook: str | None = None
+    timeout_seconds: int = 60
+    max_contacts: int = 5000
+
+
+def load_contacts_config(
+    config_path: Path = DEFAULT_CONFIG_PATH,
+    environ: dict[str, str] | None = None,
+) -> ContactsConfig | None:
+    """Optional CardDAV settings, with shared iCloud credentials as fallback."""
+    env = os.environ if environ is None else environ
+    raw = _load_yaml(config_path) if config_path.exists() else {}
+    contacts = raw.get("contacts", {})
+    icloud = raw.get("icloud", {})
+    contacts = {} if contacts is None else contacts
+    icloud = {} if icloud is None else icloud
+    if not isinstance(contacts, dict) or not isinstance(icloud, dict):
+        raise ValueError("config.yaml 'contacts' and 'icloud' must be objects")
+
+    def credential(key: str, env_key: str, aliases: tuple[str, ...]) -> str | None:
+        shared_key = "ICLOUD_" + env_key.removeprefix("CARDDAV_")
+        return _first_non_empty(
+            env.get(env_key), *(contacts.get(item) for item in (key, *aliases)),
+            env.get(shared_key), env.get("ICLOUDCRUNCHER." + shared_key),
+            env.get("ICLOUD_CRUNCHER_" + shared_key),
+            *(icloud.get(item) for item in (key, *aliases)),
+        )
+
+    username = credential("username", "CARDDAV_USERNAME", ("apple_id",))
+    password = credential("app_specific_password", "CARDDAV_APP_PASSWORD", ("password",))
+    if username is None and password is None:
+        return None
+    if username is None or password is None:
+        raise ValueError("CardDAV configuration must define both username and app_specific_password")
+    endpoint = _first_non_empty(env.get("CARDDAV_URL"), contacts.get("carddav_url")) or DEFAULT_CARDDAV_URL
+    try:
+        parsed = urlsplit(endpoint)
+        valid = (
+            parsed.scheme == "https" and bool(parsed.hostname) and parsed.port in (None, 443)
+            and parsed.username is None and parsed.password is None
+            and not parsed.query and not parsed.fragment
+            and not any(ord(char) <= 32 or char == "\\" for char in endpoint)
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ValueError("CARDDAV_URL must be an HTTPS URL on port 443 without credentials, query or fragment")
+
+    def bounded_setting(key: str, env_key: str, default: int, maximum: int) -> int:
+        value = env.get(env_key) or contacts.get(key, default)
+        try:
+            number = int(value)
+        except (ValueError, TypeError):
+            raise ValueError(f"{env_key} must be an integer from 1 to {maximum}") from None
+        if isinstance(value, bool) or str(number) != str(value) or not 1 <= number <= maximum:
+            raise ValueError(f"{env_key} must be an integer from 1 to {maximum}")
+        return number
+
+    return ContactsConfig(
+        username, password, endpoint.rstrip("/") + "/",
+        _first_non_empty(env.get("CARDDAV_DEFAULT_ADDRESSBOOK"), contacts.get("default_addressbook")),
+        bounded_setting("timeout_seconds", "CARDDAV_TIMEOUT_SECONDS", 60, 300),
+        bounded_setting("max_contacts", "CARDDAV_MAX_CONTACTS", 5000, 20000),
+    )
 
 
 @dataclass(frozen=True)
