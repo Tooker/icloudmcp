@@ -5,13 +5,13 @@ import hmac
 import os
 
 from fastapi import FastAPI
-from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.responses import JSONResponse
 
 from app.drive import ICloudDriveService
 from app.drive_config import drive_token, load_drive_backend_config
 from app.drive_tools import register_drive_tools
+from app.tool_contracts import DescribedMCPServer
 
 
 class _Bearer:
@@ -42,7 +42,8 @@ def create_drive_app(environ=None, *, service=None):
     env = os.environ if environ is None else environ
     token = drive_token(env)
     backend = service or ICloudDriveService(load_drive_backend_config(env))
-    server = MCPServer("icloud-drive", instructions="Drive read/write access. Preserve write state; never retry uncertain mutations. Authentication and approval use the shared administrative Go CLI.")
+    server = DescribedMCPServer("icloud-drive", instructions="Drive read/write access. Preserve write state; never retry uncertain mutations. Authentication and approval use the shared administrative Go CLI.")
+    server.private_backend = True
     register_drive_tools(server, backend, native_files=False)
     http = server.streamable_http_app(
         streamable_http_path="/", json_response=True, stateless_http=True,

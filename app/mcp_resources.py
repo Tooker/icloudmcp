@@ -9,7 +9,6 @@ from typing import Any
 from uuid import uuid4
 
 from loguru import logger
-from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ResourceNotFoundError
 from mcp.server.mcpserver.server import ReadResourceContents
 from mcp_types import (
@@ -22,6 +21,7 @@ from mcp_types import (
 )
 
 from app.mcp_groups import grouped_tools
+from app.tool_contracts import DescribedMCPServer
 
 
 @dataclass(frozen=True)
@@ -31,7 +31,7 @@ class _AttachmentSnapshot:
     expires_at: float
 
 
-class AttachmentMCPServer(MCPServer):
+class AttachmentMCPServer(DescribedMCPServer):
     """Native mail/Drive files sharing bounded, private resource snapshots.
 
     Snapshots preserve exactly the file returned by the tool, even if a UID
@@ -129,7 +129,7 @@ class AttachmentMCPServer(MCPServer):
         templates = await super().list_resource_templates()
         return [*templates, ResourceTemplate(
             name="mail_attachment",
-            title="iCloud Mail attachment",
+            title="Mail attachment",
             uri_template=self._RESOURCE_PREFIX + "{resource_id}",
             description=(
                 "Original attachment snapshots returned by get_email_attachment(format=file). "

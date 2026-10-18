@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import imaplib
 import json
 from functools import partial
 from time import perf_counter
@@ -8,15 +9,16 @@ from typing import Any, Callable, Literal, TypeVar
 
 from loguru import logger
 from mcp.server.mcpserver import MCPServer
-from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import CallToolResult, TextContent, ToolAnnotations
 
-from app.icloud import ICloudCalendarService, ICloudServiceError
+from app.icloud import ICloudCalendarService, ICloudServiceError, CalendarNotFoundError, EventNotFoundError
 from app.contacts import ICloudContactsService
 from app.contacts_tools import register_contacts_tools
 from app.drive_client import DriveBackendClient
 from app.drive_tools import register_drive_tools
-from app.imap import ICloudIMAPService, IMAPServiceError
+from app.imap import ICloudIMAPService, IMAPServiceError, MailboxNotFoundError, EmailNotFoundError, AttachmentNotFoundError
+from app.mcp_errors import ToolFailure
+from app.mail_schemas import DraftAttachment
 from app.mcp_resources import AttachmentMCPServer
 from app.reminders import GoRemindersService
 from app.reminders_tools import register_reminders_tools
@@ -37,6 +39,9 @@ WRITE_ANNOTATIONS = ToolAnnotations(
     destructiveHint=False,
     idempotentHint=False,
     openWorldHint=False,
+)
+REPLACE_ANNOTATIONS = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False,
 )
 DELETE_ANNOTATIONS = ToolAnnotations(
     readOnlyHint=False,
@@ -66,6 +71,11 @@ def create_mcp_server(
             "Write and delete operations change the user's iCloud data; summarize the "
             "planned change and obtain user approval before calling them. Draft tools "
             "upload messages to IMAP but never send them; the user sends drafts manually. "
+            "Before mail writes use mail_account_info and list_mailboxes; select an exact existing mailbox, "
+            "prefer its native Drafts special-use flag. Folder names do not prove the provider. "
+            "Draft body_format accepts only plain or html, never text. Never infer a sender name from a signature; "
+            "report only returned From header fields. A configured username is not verified send-as authorization. "
+            "After a failed draft write inspect the mailbox before retrying; creation/replacement may have partially succeeded. "
             "Use list_addressbooks and exact account-scoped IDs for Contacts. Contacts creation never merges duplicates. "
             "Never blindly retry a failed or timed-out create_contact: preserve write_status, contact_id and UID, "
             "and inspect get_contact first. A succeeded status remains confirmed if readback fails. "
@@ -88,6 +98,11 @@ def create_mcp_server(
         ),
         version="1.3.0",
     )
+    contact_offset_max = getattr(getattr(contacts_service, "config", None), "max_contacts", 5000)
+    server.numeric_bound_overrides = {
+        (tool, "offset"): {"ge": 0, "le": contact_offset_max}
+        for tool in ("list_contacts", "search_contacts")
+    }
 
     async def call_service(
         target: Any | None,
@@ -100,7 +115,7 @@ def create_mcp_server(
             logger.info("mcp_tool_start tool={} call_id={}", operation, call_id())
             if target is None:
                 _log_tool_complete(operation, started, "not_configured")
-                raise ToolError(missing_message)
+                raise ToolFailure("not_configured", message=missing_message, details={"write_status": "not_sent"})
             try:
                 queued = perf_counter()
 
@@ -124,7 +139,11 @@ def create_mcp_server(
                     "validation_error",
                     error_type=exc.__class__.__name__,
                 )
-                raise ToolError(str(exc)) from None
+                details = getattr(exc, "details", {})
+                code = getattr(exc, "code", None)
+                if code is None:
+                    code = "mailbox_unavailable" if isinstance(exc, MailboxNotFoundError) else "not_found" if isinstance(exc, (CalendarNotFoundError, EventNotFoundError, EmailNotFoundError, AttachmentNotFoundError)) else "invalid_argument" if isinstance(exc, ValueError) else "service_error"
+                raise ToolFailure(code, details=details, phase=details.get("phase", "service")) from None
             except Exception as exc:
                 # Client exceptions can contain request details. Keep them out of
                 # the MCP response and log only a stable exception class.
@@ -138,7 +157,8 @@ def create_mcp_server(
                 # The SDK logs unexpected exceptions with their entire chain.
                 # An expected ToolError with no cause keeps private client details
                 # out of both the response and the SDK's logs.
-                raise ToolError("iCloud service request failed") from None
+                code = "timeout" if isinstance(exc, TimeoutError) else "protocol_error" if isinstance(exc, imaplib.IMAP4.error) else "backend_unavailable"
+                raise ToolFailure(code) from None
 
     def _log_tool_complete(
         operation: str,
@@ -178,10 +198,7 @@ def create_mcp_server(
         annotations=READ_ANNOTATIONS,
     )
     async def list_calendars() -> list[dict[str, Any]]:
-        if service is None:
-            logger.info("mcp_tool tool=list_calendars outcome=not_configured")
-            return []
-        return await call_service(service, "list_calendars", service.list_calendars, calendar_missing)
+        return await call_service(service, "list_calendars", service.list_calendars if service else lambda: [], calendar_missing)
 
     @server.tool(
         name="list_events",
@@ -203,14 +220,11 @@ def create_mcp_server(
         query: str | None = None,
         limit: int = 50,
     ) -> list[dict[str, Any]]:
-        if service is None:
-            logger.info("mcp_tool tool=list_events outcome=not_configured")
-            return []
         return await call_service(
             service,
             "list_events",
             partial(
-                service.list_events,
+                service.list_events if service else lambda **_: [],
                 calendar=calendar,
                 start=start,
                 end=end,
@@ -331,7 +345,7 @@ def create_mcp_server(
         recurrence_id: str | None = None,
     ) -> dict[str, Any]:
         if not confirm:
-            raise ValueError("delete_event requires confirm=true")
+            raise ToolFailure("confirmation_required", phase="input_validation", details={"write_status": "not_sent"})
         return await call_service(
             service,
             "delete_event",
@@ -341,8 +355,13 @@ def create_mcp_server(
 
     @server.tool(
         name="list_mailboxes",
-        title="List iCloud Mail mailboxes",
-        description="List IMAP mailboxes available in the configured iCloud Mail account.",
+        title="List mailboxes in the connected account",
+        description=(
+            "List exact available IMAP mailbox names, delimiter and native flags in the connected account. "
+            "Prefer a folder marked with the Drafts special-use flag for drafts. If no such flag exists, "
+            "select a verified folder name; never assume Drafts exists. Folder labels such as Gmail do not "
+            "prove the provider or sender identity; inspect mail_account_info for the configured endpoint."
+        ),
         annotations=READ_ANNOTATIONS,
     )
     async def list_mailboxes() -> list[dict[str, Any]]:
@@ -355,9 +374,9 @@ def create_mcp_server(
 
     @server.tool(
         name="search_emails",
-        title="Search iCloud Mail",
+        title="Search the connected mail account",
         description=(
-            "Search iCloud Mail by sender, recipient, subject, text, ISO dates, or unread "
+            "Search the connected IMAP account by sender, recipient, subject, text, ISO dates, or unread "
             "status. Results contain headers only; use get_email to read a message body."
         ),
         annotations=READ_ANNOTATIONS,
@@ -400,7 +419,7 @@ def create_mcp_server(
             "the local Qdrant index. This covers cached mail only, not a live or complete IMAP "
             "search. Results include mailbox, uid, uid_validity, score, source and attachment_id. "
             "Use get_email/get_email_attachment to retrieve the current original; snapshots may "
-            "be older than iCloud. source may be body or attachment. Scans need OCR and are skipped. "
+            "be older than the live mailbox. source may be body or attachment. Scans need OCR and are skipped. "
             "The response includes indexing progress and omitted/truncated source counts."
         ),
         annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True),
@@ -430,7 +449,7 @@ def create_mcp_server(
 
     @server.tool(
         name="get_email",
-        title="Read an iCloud Mail message",
+        title="Read a message from the connected mail account",
         description=(
             "Read one email by its mailbox-local IMAP UID. The message is fetched with "
             "BODY.PEEK so reading it does not mark it read. Attachments include metadata and "
@@ -460,7 +479,7 @@ def create_mcp_server(
 
     @server.tool(
         name="get_email_attachment",
-        title="Read an iCloud Mail attachment",
+        title="Read an attachment from the connected mail account",
         description=(
             "Read an attachment using uid, mailbox and attachment_id from get_email. "
             "Default format=file returns the COMPLETE original attachment as an embedded "
@@ -507,12 +526,33 @@ def create_mcp_server(
         )
 
     @server.tool(
-        name="create_draft",
-        title="Create an iCloud Mail draft",
+        name="mail_account_info",
+        title="Inspect configured mail account",
         description=(
-            "Create a draft in the configured iCloud Mail Drafts mailbox. Supports plain text "
-            "or HTML and optional base64-encoded attachments. The draft is uploaded but never "
-            "sent; send it manually from a mail client."
+            "Read the configured IMAP endpoint, account, default mailbox, configured draft folder and default From header. "
+            "No network request is made; configured folder names do not prove that those folders exist. "
+            "Use list_mailboxes to discover exact available folders and native special-use flags before draft writes. "
+            "An IMAP mirror may expose folders from another provider: neither folder names nor the From address prove the upstream provider. "
+            "Credentials are never returned. This service stores drafts but cannot send mail or verify send-as permissions."
+        ),
+        annotations=READ_ANNOTATIONS,
+    )
+    async def mail_account_info() -> dict[str, Any]:
+        return await call_service(
+            imap_service, "mail_account_info",
+            imap_service.account_info if imap_service else lambda: {}, imap_missing,
+        )
+
+    @server.tool(
+        name="create_draft",
+        title="Create a draft in the connected mail account",
+        description=(
+            "Create a draft in the connected IMAP account. First inspect mail_account_info and list_mailboxes, "
+            "then pass the exact existing draft mailbox name, preferably marked with the native Drafts special-use flag. "
+            "body_format is exactly plain or html (not text). Optional attachments are structured base64 objects. "
+            "The returned from_header/from_address/from_name describe the MIME header actually submitted; body signatures "
+            "do not set sender identity, and send-as authorization is not verified. Never claim a provider based on folder names. "
+            "Nothing is sent. A failure after submission can leave a draft behind: inspect the mailbox before any retry."
         ),
         annotations=WRITE_ANNOTATIONS,
     )
@@ -523,8 +563,8 @@ def create_mcp_server(
         cc: list[str] | None = None,
         bcc: list[str] | None = None,
         mailbox: str | None = None,
-        body_format: str = "plain",
-        attachments: list[dict[str, str]] | None = None,
+        body_format: Literal["plain", "html"] = "plain",
+        attachments: list[DraftAttachment] | None = None,
         from_address: str | None = None,
     ) -> dict[str, Any]:
         return await call_service(
@@ -539,7 +579,7 @@ def create_mcp_server(
                 bcc=bcc,
                 mailbox=mailbox,
                 body_format=body_format,
-                attachments=attachments,
+                attachments=[item.model_dump() for item in attachments] if attachments is not None else None,
                 from_address=from_address,
             ),
             imap_missing,
@@ -547,13 +587,17 @@ def create_mcp_server(
 
     @server.tool(
         name="update_draft",
-        title="Update an iCloud Mail draft",
+        title="Replace a draft in the connected mail account",
         description=(
             "Replace an existing draft with new recipients, subject, body, and optional "
             "base64-encoded attachments. The old draft is marked deleted when safe. Nothing "
-            "is sent; send the resulting draft manually from a mail client."
+            "is sent; send the resulting draft manually from a mail client. This is a complete replacement, "
+            "not a partial patch: supply all recipients, subject, body and desired attachments. First discover "
+            "the exact mailbox and UID with list_mailboxes/search_emails/get_email. body_format accepts plain or html. "
+            "An append may succeed before deleting the old draft fails; never blindly retry. Inspect the mailbox first. "
+            "Returned From fields describe the submitted MIME header; body signatures do not set the sender name."
         ),
-        annotations=WRITE_ANNOTATIONS,
+        annotations=REPLACE_ANNOTATIONS,
     )
     async def update_draft(
         uid: str,
@@ -563,8 +607,8 @@ def create_mcp_server(
         cc: list[str] | None = None,
         bcc: list[str] | None = None,
         mailbox: str | None = None,
-        body_format: str = "plain",
-        attachments: list[dict[str, str]] | None = None,
+        body_format: Literal["plain", "html"] = "plain",
+        attachments: list[DraftAttachment] | None = None,
         from_address: str | None = None,
     ) -> dict[str, Any]:
         return await call_service(
@@ -580,7 +624,7 @@ def create_mcp_server(
                 bcc=bcc,
                 mailbox=mailbox,
                 body_format=body_format,
-                attachments=attachments,
+                attachments=[item.model_dump() for item in attachments] if attachments is not None else None,
                 from_address=from_address,
             ),
             imap_missing,
@@ -588,7 +632,7 @@ def create_mcp_server(
 
     @server.tool(
         name="mark_email_read",
-        title="Mark an iCloud Mail message read or unread",
+        title="Mark a message read or unread",
         description="Change the Seen flag of one email. This changes external mail state.",
         annotations=WRITE_ANNOTATIONS,
     )
@@ -611,12 +655,12 @@ def create_mcp_server(
 
     @server.tool(
         name="move_email",
-        title="Move an iCloud Mail message",
+        title="Move a message in the connected mail account",
         description=(
             "Copy an email to another mailbox and mark the source for deletion. This changes "
             "external mail state and requires client approval."
         ),
-        annotations=WRITE_ANNOTATIONS,
+        annotations=REPLACE_ANNOTATIONS,
     )
     async def move_email(
         uid: str,
@@ -637,7 +681,7 @@ def create_mcp_server(
 
     @server.tool(
         name="delete_email",
-        title="Delete an iCloud Mail message",
+        title="Delete a message from the connected mail account",
         description=(
             "Delete one email by marking it Deleted and expunging it when safe. This is "
             "destructive and requires confirm=true in addition to the client's approval flow."
@@ -650,7 +694,7 @@ def create_mcp_server(
         mailbox: str | None = None,
     ) -> dict[str, Any]:
         if not confirm:
-            raise ValueError("delete_email requires confirm=true")
+            raise ToolFailure("confirmation_required", phase="input_validation", details={"write_status": "not_sent"})
         return await call_service(
             imap_service,
             "delete_email",

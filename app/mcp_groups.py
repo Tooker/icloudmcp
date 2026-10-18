@@ -12,7 +12,7 @@ def service_for_tool(name):
         return "reminders"
     if "contact" in name or name == "list_addressbooks":
         return "contacts"
-    if "email" in name or "mailbox" in name or name in {"create_draft", "update_draft"}:
+    if "email" in name or "mailbox" in name or name in {"create_draft", "update_draft", "mail_account_info"}:
         return "mail"
     if "calendar" in name or "event" in name:
         return "calendar"

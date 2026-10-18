@@ -141,6 +141,7 @@ class DriveWrites:
 
     async def _write_json(self, state, journal, step, url, *, extra_params=None, **kwargs):
         from app.drive import MAX_METADATA_BYTES, safe_apple_url
+        journal["phase"] = step
         journal["uncertain_step"] = step
         async with state.client.stream("POST", safe_apple_url(url), params={**state.session.params, **(extra_params or {})}, **kwargs) as response:
             if response.status_code in (400, 401, 403, 404, 409, 412, 421, 429, 450):
@@ -212,6 +213,7 @@ class DriveWrites:
     async def _send_upload(self, state, journal, url, filename, data):
         from app.drive import MAX_METADATA_BYTES, safe_apple_url
         url = safe_apple_url(url, asset=True)
+        journal["phase"] = "upload_bytes"
         journal["uncertain_step"] = "upload_bytes"
         # Content hosts outside icloud.com never receive account cookies or
         # headers. Account-service uploads retain the authoritative jar scope.

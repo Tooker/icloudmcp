@@ -30,8 +30,33 @@ Typical requests to a connected assistant:
 
 Writes change your iCloud data. MCP tool descriptions ask the client to obtain
 approval before making changes; deletion also has explicit confirmation
-arguments. Drafts are uploaded to iCloud Mail so you can review and send them
+arguments. Drafts are uploaded to the configured IMAP account so you can review and send them
 from your mail client.
+
+The [complete MCP tool reference](docs/mcp-tools.md) lists every parameter,
+JSON type, required field, default, enum and nested input object. These contracts
+are also included in `tools/list`, alongside field descriptions in `inputSchema`.
+Each tool description explains discovery prerequisites, the intended workflow,
+what returned fields establish, limits on conclusions and failure/recovery behavior.
+Unknown parameter names are rejected; validation errors explain the expected
+contract without exposing input values.
+
+All tools also publish typed `outputSchema` contracts and validate successful
+replies. Input validation uses strict JSON types and declared numeric bounds:
+`true` is a boolean, while `"true"` is a string and is rejected for `confirm`.
+Every tool error uses the [shared error contract](docs/mcp-errors.md), preserving
+native backend fields, content, created IDs and confirmed partial writes.
+Mail writes record confirmed steps and any uncertain step; affected caches are
+invalidated after failed or uncertain write attempts as well as successful ones.
+
+For drafts, use `mail_account_info` and `list_mailboxes` first, then pass the exact
+existing draft folder. `body_format` accepts `plain` or `html`, never `text`.
+The configured IMAP endpoint may be a mirror; folder names do not prove its
+upstream provider. Draft results report the submitted `from_header`,
+`from_address`, `from_name` and `sent=false`. A body signature does not set a
+sender name, and storing a From header does not verify send-as permissions.
+Inspect the mailbox after a failed write before retrying: replacement can leave
+both the new and old drafts present.
 
 Calendar, Mail, Contacts, Drive and Reminders can be configured independently. Clients connect
 to the same MCP endpoint regardless of which services are enabled.
@@ -1166,7 +1191,8 @@ sync, local startup, tests and Compose commands.
   Apple can change the protocol or expire access.
 - Contacts support reading, searching and creating. Updates, deletion, photos,
   contact groups and additional Apple extension fields are not exposed.
-- Drive supports ordinary owned files/folders only. Writes, shared items,
+- Drive supports reading, folder creation, uploads and non-atomic replacement
+  of ordinary owned files/folders only. Shared items,
   app libraries, document packages and semantic Drive indexing are not exposed.
   Web API compatibility and live account access require verification; session
   renewal and ADP approval remain administrative operations.

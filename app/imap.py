@@ -5,6 +5,7 @@ import imaplib
 import re
 import ssl
 import threading
+from copy import deepcopy
 from contextlib import contextmanager
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -12,7 +13,7 @@ from datetime import date, datetime, timedelta, timezone
 from email import policy
 from email.message import EmailMessage, Message
 from email.parser import BytesParser
-from email.utils import parsedate_to_datetime
+from email.utils import parsedate_to_datetime, parseaddr
 from loguru import logger
 from queue import LifoQueue
 from time import perf_counter, sleep
@@ -26,6 +27,13 @@ from app.timing import measure_phase, measured_lock, timed_phase
 
 class IMAPServiceError(RuntimeError):
     """A safe, user-facing IMAP operation error."""
+
+
+class IMAPWriteError(IMAPServiceError):
+    def __init__(self, code: str, details: dict[str, Any]):
+        self.code = code
+        self.details = deepcopy(details)
+        super().__init__("IMAP write could not be completed; preserve confirmed steps and inspect before retrying")
 
 
 class MailboxNotFoundError(IMAPServiceError):
@@ -158,9 +166,12 @@ class ICloudIMAPService:
             self._enable_utf8(client, operation)
         except imaplib.IMAP4.error as exc:
             self._close_connection(client)
-            raise IMAPServiceError(
-                "IMAP login failed; check the iCloud Mail address and app-specific password"
-            ) from exc
+            failure = IMAPServiceError(
+                "IMAP login failed; check the configured IMAP account and credentials"
+            )
+            failure.code = "authentication_failed"
+            failure.details = {"phase": "authentication", "write_status": "not_sent"}
+            raise failure from None
         except Exception:
             self._close_connection(client)
             raise
@@ -1068,6 +1079,90 @@ class ICloudIMAPService:
         )
         return stats
 
+    def account_info(self) -> dict[str, Any]:
+        """Read configuration only; never guess the upstream behind an IMAP mirror."""
+        return {
+            "protocol": "imap", "host": self.config.host, "port": self.config.port,
+            "account": self.config.username,
+            "default_mailbox": self.config.default_mailbox,
+            "configured_drafts_mailbox": self.config.drafts_mailbox,
+            "default_from_header": self.config.username,
+            "mailbox_existence_verified": False,
+            "upstream_provider_verified": False,
+            "send_as_permissions_verified": False, "can_send": False,
+        }
+
+    @staticmethod
+    def _draft_header_result(message: EmailMessage, body_format: str) -> dict[str, Any]:
+        header = str(message["From"])
+        name, address = parseaddr(header)
+        return {
+            "from_header": header, "from_address": address, "from_name": name,
+            "body_format": body_format.strip().casefold(), "sent": False,
+            "send_as_permissions_verified": False,
+        }
+
+    @staticmethod
+    def _journal(operation: str, **details) -> dict[str, Any]:
+        return {"operation": operation, "phase": "connect", "write_status": "not_sent",
+                "confirmed_steps": [], "uncertain_step": None, **details}
+
+    @contextmanager
+    def _write_operation(self, operation, journal, *mailboxes):
+        failed = False
+        try:
+            with self._connected(operation) as client:
+                yield client
+            if journal["uncertain_step"] is not None:
+                raise IMAPWriteError("write_uncertain", journal)
+            if journal["write_status"] != "partial":
+                journal["write_status"] = "succeeded"
+            journal["phase"] = "complete"
+        except Exception as exc:
+            failed = True
+            if journal["uncertain_step"] is not None:
+                journal["write_status"] = "unknown"
+                code = "write_uncertain"
+            elif journal["confirmed_steps"]:
+                journal["write_status"] = "partial"
+                code = "write_failed"
+            else:
+                code = "write_failed" if journal["write_status"] == "failed" else getattr(exc, "code", None) or ("mailbox_unavailable" if isinstance(exc, MailboxNotFoundError) else "not_found" if isinstance(exc, EmailNotFoundError) else "timeout" if isinstance(exc, TimeoutError) else "service_error")
+                if code == "authentication_failed":
+                    journal["phase"] = "authentication"
+            if isinstance(exc, IMAPServiceError) and not isinstance(exc, IMAPWriteError) and journal["write_status"] == "not_sent":
+                exc.code = code
+                exc.details = deepcopy(journal)
+                raise exc from None
+            raise IMAPWriteError(code, journal) from None
+        finally:
+            # Failed/uncertain steps can still change remote state. Invalidate
+            # both folders after any write attempt, not just a successful return.
+            if journal["confirmed_steps"] or journal["uncertain_step"] or journal["write_status"] == "failed":
+                try:
+                    self._invalidate_email_cache(operation, *mailboxes)
+                except Exception:
+                    if not failed:
+                        journal["phase"] = "cache_invalidation"
+                        raise IMAPWriteError("local_state_failed", journal) from None
+
+    def _write_step(self, journal, step, function):
+        journal["phase"] = step
+        journal["uncertain_step"] = step
+        status, data = function()
+        if not self._is_ok(status):
+            if str(status.decode("ascii", errors="ignore") if isinstance(status, bytes) else status).upper() in {"NO", "BAD"}:
+                journal["uncertain_step"] = None
+                journal["write_status"] = "failed"
+                field = {"append_draft": "created", "copy_message": "copied", "mark_old_draft_deleted": "old_draft_marked_deleted",
+                         "mark_source_deleted": "source_marked_deleted", "mark_message_deleted": "marked_deleted"}.get(step)
+                if field:
+                    journal[field] = False
+            raise IMAPWriteError("write_failed", journal)
+        journal["confirmed_steps"].append(step)
+        journal["uncertain_step"] = None
+        return data
+
     def create_draft(
         self,
         to: list[str],
@@ -1092,15 +1187,17 @@ class ICloudIMAPService:
             from_address=from_address,
         )
 
-        with self._connected("create_draft") as client:
-            uid = self._append_draft(client, selected_mailbox, message)
-        self._invalidate_email_cache("create_draft", selected_mailbox)
+        journal = self._journal("create_draft", mailbox=selected_mailbox, uid=None, created=False, sent=False)
+        with self._write_operation("create_draft", journal, selected_mailbox) as client:
+            uid = self._append_draft(client, selected_mailbox, message, journal)
         return {
+            **journal,
             "created": True,
             "mailbox": selected_mailbox,
             "uid": uid,
             "subject": subject.strip(),
             "attachment_count": attachment_count,
+            **self._draft_header_result(message, body_format),
         }
 
     def update_draft(
@@ -1129,15 +1226,22 @@ class ICloudIMAPService:
             from_address=from_address,
         )
 
-        with self._connected("update_draft") as client:
+        journal = self._journal("update_draft", mailbox=selected_mailbox, old_uid=uid, uid=None,
+                                created=False, old_draft_marked_deleted=False, old_draft_expunged=False, sent=False)
+        with self._write_operation("update_draft", journal, selected_mailbox) as client:
+            journal["phase"] = "select"
             self._select(client, selected_mailbox, readonly=False, operation="update_draft")
+            journal["phase"] = "validate_draft"
             self._require_draft(client, uid)
-            new_uid = self._append_draft(client, selected_mailbox, message)
-            status, _ = client.uid("STORE", uid, "+FLAGS.SILENT", r"(\Deleted)")
-            self._ensure_ok(status, "IMAP draft replacement failed")
-            old_expunged = self._expunge_uid_safely(client, uid)
-        self._invalidate_email_cache("update_draft", selected_mailbox)
+            new_uid = self._append_draft(client, selected_mailbox, message, journal)
+            journal["old_draft_marked_deleted"] = None
+            self._write_step(journal, "mark_old_draft_deleted", lambda: client.uid("STORE", uid, "+FLAGS.SILENT", r"(\Deleted)"))
+            journal["old_draft_marked_deleted"] = True
+            journal["old_draft_expunged"] = None
+            old_expunged = self._expunge_uid_safely(client, uid, journal, "expunge_old_draft")
+            journal["old_draft_expunged"] = old_expunged
         return {
+            **journal,
             "updated": True,
             "mailbox": selected_mailbox,
             "old_uid": uid,
@@ -1146,6 +1250,7 @@ class ICloudIMAPService:
             "old_draft_expunged": old_expunged,
             "subject": subject.strip(),
             "attachment_count": attachment_count,
+            **self._draft_header_result(message, body_format),
         }
 
     def _require_draft(self, client: Any, uid: str) -> None:
@@ -1163,6 +1268,17 @@ class ICloudIMAPService:
                 raise IMAPServiceError("Only an existing, non-deleted draft can be updated")
             return
         raise EmailNotFoundError(f"Draft not found: {uid}")
+
+    def _require_message(self, client, uid):
+        status, fetched = client.uid("FETCH", uid, "(UID FLAGS)")
+        self._ensure_ok(status, "IMAP message lookup failed")
+        for item in fetched or []:
+            metadata = item[0] if isinstance(item, tuple) and item else item
+            if isinstance(metadata, bytes):
+                match = re.search(rb"\bUID\s+(\d+)\b", metadata)
+                if match and int(match.group(1)) == int(uid):
+                    return
+        raise EmailNotFoundError("Message is no longer available; refresh the mailbox before writing")
 
     def _draft_mailbox(self, mailbox: str | None) -> str:
         return self._mailbox(mailbox or self.config.drafts_mailbox)
@@ -1289,15 +1405,25 @@ class ICloudIMAPService:
         client: Any,
         mailbox: str,
         message: EmailMessage,
+        journal: dict[str, Any] | None = None,
     ) -> str | None:
-        status, data = client.append(
+        submit = lambda: client.append(
             self._quote_mailbox(mailbox, utf8_enabled=getattr(client, "utf8_enabled", False)),
             r"(\Draft)",
             imaplib.Time2Internaldate(datetime.now(timezone.utc)),
             message.as_bytes(),
         )
-        self._ensure_ok(status, "IMAP draft creation failed")
-        return self._append_uid(data)
+        if journal is None:
+            status, data = submit()
+            self._ensure_ok(status, "IMAP server rejected draft APPEND; verify the mailbox and write permissions.")
+        else:
+            journal["created"] = None
+            data = self._write_step(journal, "append_draft", submit)
+            journal["created"] = True
+        uid = self._append_uid(data)
+        if journal is not None:
+            journal["uid"] = uid
+        return uid
 
     @staticmethod
     def _append_uid(data: Any) -> str | None:
@@ -1319,17 +1445,19 @@ class ICloudIMAPService:
         selected_mailbox = self._mailbox(mailbox)
         operation = "+FLAGS.SILENT" if read else "-FLAGS.SILENT"
 
-        with self._connected("mark_email_read") as client:
+        journal = self._journal("mark_email_read", uid=uid, mailbox=selected_mailbox)
+        with self._write_operation("mark_email_read", journal, selected_mailbox) as client:
+            journal["phase"] = "select"
             self._select(client, selected_mailbox, readonly=False, operation="mark_email_read")
-            status, _ = client.uid("STORE", uid, operation, r"(\Seen)")
-            self._ensure_ok(status, "IMAP flag update failed")
+            journal["phase"] = "validate_message"
+            self._require_message(client, uid)
+            self._write_step(journal, "set_read_flag", lambda: client.uid("STORE", uid, operation, r"(\Seen)"))
             result = {
                 "uid": uid,
                 "mailbox": selected_mailbox,
                 "read": read,
             }
-        self._invalidate_email_cache("mark_email_read", selected_mailbox)
-        return result
+        return {**journal, **result}
 
     def move_email(
         self,
@@ -1343,16 +1471,26 @@ class ICloudIMAPService:
         if source.casefold() == destination.casefold():
             raise ValueError("source_mailbox and destination_mailbox must differ")
 
-        with self._connected("move_email") as client:
+        journal = self._journal("move_email", uid=uid, source_mailbox=source, destination_mailbox=destination,
+                                copied=False, destination_uid=None, source_marked_deleted=False, source_expunged=False)
+        with self._write_operation("move_email", journal, source, destination) as client:
+            journal["phase"] = "select"
             self._select(client, source, readonly=False, operation="move_email")
-            status, _ = client.uid(
+            journal["phase"] = "validate_message"
+            self._require_message(client, uid)
+            journal["copied"] = None
+            data = self._write_step(journal, "copy_message", lambda: client.uid(
                 "COPY", uid,
                 self._quote_mailbox(destination, utf8_enabled=getattr(client, "utf8_enabled", False)),
-            )
-            self._ensure_ok(status, "IMAP copy failed")
-            status, _ = client.uid("STORE", uid, "+FLAGS.SILENT", r"(\Deleted)")
-            self._ensure_ok(status, "IMAP source flag update failed")
-            expunged = self._expunge_uid_safely(client, uid)
+            ))
+            journal["copied"] = True
+            journal["destination_uid"] = self._copy_uid(data, uid)
+            journal["source_marked_deleted"] = None
+            self._write_step(journal, "mark_source_deleted", lambda: client.uid("STORE", uid, "+FLAGS.SILENT", r"(\Deleted)"))
+            journal["source_marked_deleted"] = True
+            journal["source_expunged"] = None
+            expunged = self._expunge_uid_safely(client, uid, journal)
+            journal["source_expunged"] = expunged
             result = {
                 "uid": uid,
                 "source_mailbox": source,
@@ -1361,8 +1499,7 @@ class ICloudIMAPService:
                 "source_marked_deleted": True,
                 "source_expunged": expunged,
             }
-        self._invalidate_email_cache("move_email", source, destination)
-        return result
+        return {**journal, **result}
 
     def delete_email(self, mailbox: str | None, uid: str) -> dict[str, Any]:
         """Mark one message deleted and expunge it when that is safe.
@@ -1374,11 +1511,18 @@ class ICloudIMAPService:
 
         uid = self._uid(uid)
         selected_mailbox = self._mailbox(mailbox)
-        with self._connected("delete_email") as client:
+        journal = self._journal("delete_email", uid=uid, mailbox=selected_mailbox, marked_deleted=False, expunged=False)
+        with self._write_operation("delete_email", journal, selected_mailbox) as client:
+            journal["phase"] = "select"
             self._select(client, selected_mailbox, readonly=False, operation="delete_email")
-            status, _ = client.uid("STORE", uid, "+FLAGS.SILENT", r"(\Deleted)")
-            self._ensure_ok(status, "IMAP delete flag update failed")
-            expunged = self._expunge_uid_safely(client, uid)
+            journal["phase"] = "validate_message"
+            self._require_message(client, uid)
+            journal["marked_deleted"] = None
+            self._write_step(journal, "mark_message_deleted", lambda: client.uid("STORE", uid, "+FLAGS.SILENT", r"(\Deleted)"))
+            journal["marked_deleted"] = True
+            journal["expunged"] = None
+            expunged = self._expunge_uid_safely(client, uid, journal)
+            journal["expunged"] = expunged
             result = {
                 "uid": uid,
                 "mailbox": selected_mailbox,
@@ -1386,8 +1530,16 @@ class ICloudIMAPService:
                 "marked_deleted": True,
                 "expunged": expunged,
             }
-        self._invalidate_email_cache("delete_email", selected_mailbox)
-        return result
+        return {**journal, **result}
+
+    @staticmethod
+    def _copy_uid(data, expected_uid):
+        for item in data or []:
+            if isinstance(item, bytes):
+                match = re.search(rb"\[COPYUID\s+\d+\s+(\d+)\s+(\d+)\]", item)
+                if match and int(match.group(1)) == int(expected_uid):
+                    return match.group(2).decode("ascii")
+        return None
 
     def _invalidate_email_cache(self, tool: str, *mailboxes: str) -> None:
         if self._cache is not None:
@@ -1406,15 +1558,28 @@ class ICloudIMAPService:
                 invalidated_messages,
             )
 
-    def _expunge_uid_safely(self, client: Any, uid: str) -> bool:
+    def _expunge_uid_safely(self, client: Any, uid: str, journal=None, step="expunge_source") -> bool | None:
         """Expunge only the requested UID; never use mailbox-wide EXPUNGE."""
 
+        if journal is not None:
+            journal["phase"] = step
+            journal["uncertain_step"] = step
         try:
             status, _ = client.uid("EXPUNGE", uid)
             if self._is_ok(status):
+                if journal is not None:
+                    journal["confirmed_steps"].append(step)
+                    journal["uncertain_step"] = None
                 return True
+            if journal is not None:
+                if str(status.decode("ascii", errors="ignore") if isinstance(status, bytes) else status).upper() not in {"NO", "BAD"}:
+                    raise IMAPWriteError("write_uncertain", journal)
+                journal["uncertain_step"] = None
+                journal["write_status"] = "partial"
         except Exception:
-            pass
+            if journal is not None:
+                raise IMAPWriteError("write_uncertain", journal) from None
+            return False
 
         # A SEARCH followed by EXPUNGE cannot isolate a deletion: another
         # connection may mark additional messages deleted between commands.

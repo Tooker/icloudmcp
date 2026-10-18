@@ -14,7 +14,7 @@ from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 from app.config import IMAPConfig
-from app.imap import AttachmentNotFoundError, EmailNotFoundError, ICloudIMAPService, IMAPServiceError
+from app.imap import AttachmentNotFoundError, EmailNotFoundError, ICloudIMAPService, IMAPServiceError, IMAPWriteError
 from app.icloud_cache import SQLiteICloudCalendarCache
 
 
@@ -341,7 +341,7 @@ def test_unknown_uid_generation_disables_content_cache_reuse(tmp_path) -> None:
 def test_login_failure_is_safe_and_actionable() -> None:
     mail = service_with(FailingLoginIMAP())
 
-    with pytest.raises(IMAPServiceError, match="iCloud Mail address and app-specific password"):
+    with pytest.raises(IMAPServiceError, match="configured IMAP account and credentials"):
         mail.list_mailboxes()
 
 
@@ -875,6 +875,15 @@ def test_unsupported_uid_expunge_never_uses_mailbox_wide_expunge(outcome: str) -
             raise AssertionError("mailbox-wide EXPUNGE must never be sent")
 
     client = NoUIDExpungeIMAP()
+    if outcome == "abort":
+        with pytest.raises(IMAPWriteError) as failure:
+            service_with(client).delete_email("INBOX", "42")
+        assert failure.value.details["marked_deleted"] is True
+        assert failure.value.details["expunged"] is None
+        assert failure.value.details["write_status"] == "unknown"
+        assert failure.value.details["uncertain_step"] == "expunge_source"
+        assert not any(call[0] == "SEARCH" for call in client.calls)
+        return
     result = service_with(client).delete_email("INBOX", "42")
     assert result["marked_deleted"] is True
     assert result["expunged"] is False

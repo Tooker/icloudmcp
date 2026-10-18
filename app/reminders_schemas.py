@@ -32,8 +32,7 @@ class StructureWarning(ResponseModel):
 
 
 class ReminderError(ResponseModel):
-    error_code: str = Field(description="Application-owned error code; never raw upstream exception text.",
-                            json_schema_extra={"enum": sorted(_PUBLIC_ERRORS)})
+    error_code: Literal[tuple(sorted(_PUBLIC_ERRORS))] = Field(description="Application-owned error code; never raw upstream exception text.")
     retry_class: RetryClass
     retryable: bool
     operation: str | None = None

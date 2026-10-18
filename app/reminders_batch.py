@@ -32,7 +32,7 @@ class ReminderNode(BaseModel):
     due: str | None = Field(default=None, description="YYYY-MM-DD; omit to preserve an existing due date. Clearing is unsupported.")
     priority: Literal["none", "low", "medium", "high"] | None = None
     notes: str | None = Field(default=None, description="Nonempty notes; omit to preserve existing notes.")
-    subtasks: list[ReminderNode] = Field(default_factory=list, description="Children in desired manual order; section is inherited.")
+    subtasks: list[ReminderNode] = Field(default_factory=list, max_length=500, description="Children in desired manual order; section is inherited. Maximum 500 tasks in the complete tree.")
 
 
 class ReminderSection(BaseModel):
@@ -40,7 +40,7 @@ class ReminderSection(BaseModel):
 
     id: str | None = Field(default=None, description="Exact existing section ID; omit to create a new section with title.")
     title: str | None = Field(default=None, description="Heading for a new section. Renaming existing sections is unsupported.")
-    reminders: list[ReminderNode] = Field(default_factory=list, description="Top-level reminders in this section, in desired order.")
+    reminders: list[ReminderNode] = Field(default_factory=list, max_length=500, description="Top-level reminders in this section, in desired order. Maximum 500 tasks in the complete tree.")
 
 
 class BatchStructure(BaseModel):

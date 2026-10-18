@@ -15,6 +15,7 @@ from pydantic import ValidationError
 from app import reminders_schemas as schemas
 from app.reminders import GoRemindersService, READ_TOOLS, RemindersError
 from app.reminders_batch import ReminderNode, ReminderSection
+from app.mcp_errors import error_result
 from app.timing import call_id, tool_trace
 
 
@@ -73,9 +74,16 @@ def register_reminders_tools(server: MCPServer, service: GoRemindersService | No
                     state = payload.get("write_status") if name not in READ_TOOLS and isinstance(payload, dict) else None
                     if name not in READ_TOOLS and (not isinstance(state, str) or state not in {"not_sent", "failed", "succeeded", "unknown"}):
                         state = "unknown"
-                    raise RemindersError("backend_protocol_error", operation=name, request_id=call_id(),
-                                         write_status=state if name not in READ_TOOLS else None,
-                                         retry_class="retryable_after_read" if state in {"unknown", "succeeded"} else "not_retryable") from None
+                    outcome = "backend_protocol_error"
+                    diagnostic = {"write_status": state, "retry_class": "retryable_after_read" if state in {"unknown", "succeeded"} else "not_retryable"}
+                    # Import lazily: result schemas also include the native
+                    # Reminders models. Unknown malformed data is not evidence.
+                    from app.result_schemas import safe_evidence
+                    evidence = safe_evidence(name, payload)
+                    evidence.setdefault("error_code", outcome)
+                    evidence.setdefault("write_status", state if name not in READ_TOOLS else None)
+                    evidence.setdefault("retry_class", diagnostic["retry_class"])
+                    return error_result(name, outcome, details=evidence, phase="response_validation", write=name not in READ_TOOLS)
                 return result
             except RemindersError as error:
                 outcome = error.code

@@ -21,7 +21,7 @@ PAYLOAD = b"%PDF-1.7\n" + bytes(range(256)) * 100
 
 def file_result(payload: bytes = PAYLOAD, filename: str | None = "Rechnung März.pdf") -> dict:
     return {
-        "uid": "42", "mailbox": "Private/Übersicht", "attachment_id": "1",
+        "uid": "42", "mailbox": "Private/Übersicht", "uid_validity": "7", "attachment_id": "1",
         "filename": filename, "content_type": "application/pdf", "size": len(payload),
         "format": "file", "offset": 0, "content_bytes": payload,
         "returned_bytes": len(payload), "has_more": False, "next_offset": None,

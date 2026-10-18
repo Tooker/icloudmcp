@@ -160,7 +160,11 @@ def test_attachment_tool_forwards_options_in_worker_and_returns_content(options)
         def get_email_attachment(self, **arguments):
             assert threading.current_thread() is not threading.main_thread()
             self.arguments = arguments
-            return {"text": "Invoice total: 42 EUR", "text_status": "ok"}
+            return {"uid": arguments["uid"], "mailbox": arguments["mailbox"], "uid_validity": "7",
+                    "attachment_id": arguments["attachment_id"], "filename": "invoice.txt",
+                    "content_type": "text/plain", "size": 21, "format": arguments["format"],
+                    "offset": arguments["offset"], "has_more": False, "next_offset": None,
+                    "text": "Invoice total: 42 EUR", "text_status": "ok"}
 
     service = MailService()
     server = create_mcp_server(None, service)

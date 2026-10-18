@@ -100,6 +100,8 @@ class DriveBackendClient:
         if isinstance(payload.get("write_status"), str) and payload["write_status"] in {"not_started", "failed", "partial", "uncertain", "succeeded"}:
             details["write_status"] = payload["write_status"]
         steps = {"create_folder", "reserve_upload", "upload_bytes", "commit_file", "rename_upload", "trash_original", "rename_replacement", "backend_call"}
+        if isinstance(payload.get("phase"), str) and payload["phase"] in steps:
+            details["phase"] = payload["phase"]
         value = payload.get("confirmed_steps")
         if isinstance(value, list) and len(value) <= 16 and all(isinstance(step, str) and step in steps for step in value):
             details["confirmed_steps"] = value

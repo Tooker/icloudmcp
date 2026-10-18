@@ -21,6 +21,11 @@ def call_id() -> str:
 
 @contextmanager
 def tool_trace(tool: str) -> Iterator[None]:
+    if _trace.get() is not None and _trace.get()[0] == tool:
+        # The common dispatcher owns the request ID; service-specific wrappers
+        # join it so standardized errors correlate with existing phase logs.
+        yield
+        return
     token = _trace.set((tool, uuid4().hex[:16]))
     parent = _span.set(None)
     try:
