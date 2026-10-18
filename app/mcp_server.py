@@ -96,7 +96,7 @@ def create_mcp_server(
             "Never blindly retry a failed or timed-out Reminders write; inspect current data first. "
             "Reminders authentication and device approval are separate administrative Go CLI operations."
         ),
-        version="1.3.0",
+        version="1.4.0",
     )
     contact_offset_max = getattr(getattr(contacts_service, "config", None), "max_contacts", 5000)
     server.numeric_bound_overrides = {

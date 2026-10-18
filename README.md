@@ -749,7 +749,7 @@ and child reorders, before/after/append moves, and delta/full sync. Set
 list where writes are authorized. It removes its own marked test reminders
 and verifies that the existing contents, hierarchy and relative order remain.
 
-### Building the paired Python 1.3.0 and Reminders 1.1.0 source checkouts
+### Building the paired Python 1.4.0 and Reminders 1.1.0 source checkouts
 
 Keep this repository beside the updated `icloud-reminders-cli` checkout and run:
 
@@ -758,7 +758,7 @@ docker compose -f docker-compose.yml -f docker-compose.release.yml --profile rem
 docker compose -f docker-compose.yml -f docker-compose.release.yml --profile reminders build
 ```
 
-This produces `icloud-cruncher:1.3.0` and `icloud-reminders:1.1.0` locally.
+This produces `icloud-cruncher:1.4.0` and `icloud-reminders:1.1.0` locally.
 The release override explicitly selects the adjacent Go source; the main
 Compose file pins the published 1.1.0 backend commit. Use the same two Compose files
 when starting the locally built pair. Building images does not recreate the

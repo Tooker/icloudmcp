@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.4.0 — 2026-10-18
+
+- Add Contacts discovery, search, reads and creation through CardDAV, with
+  bounded catalogues and preserved confirmed or uncertain write state.
+- Add optional private iCloud Drive access for browsing, search, downloads,
+  folder creation, uploads and version-checked, non-atomic file replacement.
+  Reuse the Go administrative session export for authentication and ADP access.
+- Group tools by service while preserving tool names, schemas and metadata.
+- Publish strict parameter contracts, typed response schemas, workflow guidance
+  and a generated reference for all 45 MCP tools.
+- Standardize safe tool errors while preserving valid native fields, known IDs,
+  confirmed writes and uncertain steps without automatic retries.
+- Journal IMAP mutation steps, verify source UIDs and invalidate affected caches
+  after successful, failed or uncertain writes. Add configuration-only
+  `mail_account_info` and clarify draft folder and submitted From-header behavior.
+
 ## 1.3.0 — 2026-10-01
 
 - Merge declarative `batch_update_reminders` with typed recursive tasks and
