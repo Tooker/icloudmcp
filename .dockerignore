@@ -4,6 +4,9 @@ __pycache__
 .ruff_cache
 config.yaml
 .env
+.env.*
+.github
+output
 secrets
 .git
 
