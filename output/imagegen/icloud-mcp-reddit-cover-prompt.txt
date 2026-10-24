@@ -1,0 +1,10 @@
+Use case: ads-marketing.
+Asset type: finished landscape Reddit showcase cover image, approximately 3:2 aspect ratio, readable at thumbnail size.
+Primary request: Create a striking, polished cover for an independent open-source iCloud MCP server running in Docker on Linux. The central visual metaphor is iCloud meeting Linux on a small self-hosted server.
+Scene and composition: midnight navy background with subtle atmospheric blue light, generous clean spacing. Upper third contains a very large, beautifully typeset white headline. Lower center: a charming, high-quality sculptural 3D Linux Tux penguin sitting beside a compact matte-black server, with a luminous soft azure cloud floating above them. Five small translucent glass tiles connect to the cloud via elegant thin light paths, with simple recognizable icons for an envelope, calendar, contact card, checklist and folder. Thoughtful balance between editorial graphic design and dimensional illustration; crisp silhouettes, refined soft light, realistic materials, strong visual hierarchy. Restrained blue and cyan with Tux's warm yellow feet providing contrast. This should feel like a lovingly made developer project showcase, with bold confident typography, not a generic enterprise advertisement.
+Text, rendered exactly and legibly:
+Main headline: "iCloud. On Linux."
+Smaller subheading: "Self-hosted MCP. No Mac required."
+A clean compact service line: "Mail · Calendar · Contacts · Reminders · Drive"
+Small but legible footer: "github.com/Tooker/icloudmcp"
+Constraints: four exact text elements only, no additional words, no fake UI screenshots, no watermarks, no Apple logo or implied official Apple endorsement. All typography inside safe margins. Make headline and hero illustration visually dominant. Solid opaque background.

@@ -1,5 +1,8 @@
 # iCloud MCP
 
+GitHub Actions builds `ghcr.io/tooker/icloudmcp:latest` for AMD64 and ARM64.
+See [Docker images](docs/docker-images.md) for published tags and updates.
+
 **Calendar, mail, contacts, Drive files and shared reminders — available through MCP.**
 
 Look up appointments, find emails and original attachments, prepare drafts,
@@ -218,7 +221,8 @@ explain the supported username formats.
 
 ```bash
 docker compose config --quiet
-docker compose up -d --build icloud-cruncher
+docker compose pull icloud-cruncher
+docker compose up -d --no-build icloud-cruncher
 docker compose ps icloud-cruncher
 curl http://127.0.0.1:8080/healthz
 ```

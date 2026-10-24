@@ -3,6 +3,7 @@ services:
     container_name: icloud-cruncher-mcp
     stop_grace_period: 45s
     build: .
+    image: ghcr.io/tooker/icloudmcp:latest
     ports:
       # Keep the write-capable MCP endpoint local. The tunnel reaches it over
       # the private Compose network; do not bind this to 0.0.0.0 without auth.
@@ -90,6 +91,7 @@ services:
   drive:
     profiles: ["drive"]
     build: .
+    image: ghcr.io/tooker/icloudmcp:latest
     command: ["uvicorn", "app.drive_backend:create_drive_app", "--factory", "--host", "0.0.0.0", "--port", "8080"]
     volumes:
       - drive-data:/data:ro
